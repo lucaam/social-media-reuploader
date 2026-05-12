@@ -28,3 +28,18 @@ jobs:
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           publish_dir: ./site
+      - name: Ensure GitHub Pages site is configured
+        env:
+          REPO: ${{ github.repository }}
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          echo "Checking GitHub Pages site for $REPO"
+          status=$(curl -s -o /dev/null -w "%{http_code}" -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/pages" || true)
+          if [ "$status" = "404" ]; then
+            echo "Pages site not found — creating using gh-pages branch"
+            curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/pages" -d '{"source":{"branch":"gh-pages","path":"/"}}' || true
+          else
+            echo "Pages site exists (HTTP $status) — fetching details"
+            curl -s -H "Authorization: Bearer $TOKEN" -H "Accept: application/vnd.github+json" "https://api.github.com/repos/$REPO/pages"
+          fi
