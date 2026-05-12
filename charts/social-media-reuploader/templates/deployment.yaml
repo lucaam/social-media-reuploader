@@ -16,13 +16,11 @@ spec:
       securityContext:
         runAsNonRoot: true
         fsGroup: 1000
-      {{- if .Values.resources }}
-      {{- $profile := index .Values.resourceProfiles .Values.resourceProfile }}
-      terminationGracePeriodSeconds: {{ .Values.resources.terminationGracePeriodSeconds | default $profile.terminationGracePeriodSeconds }}
-      {{- else }}
-      {{- $profile := index .Values.resourceProfiles .Values.resourceProfile }}
-      terminationGracePeriodSeconds: {{ $profile.terminationGracePeriodSeconds }}
+      {{- if not (hasKey .Values.resourceProfiles .Values.resourceProfile) }}
+      {{- fail (printf "unknown resourceProfile: %s" .Values.resourceProfile) }}
       {{- end }}
+      {{- $profile := index .Values.resourceProfiles .Values.resourceProfile }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default $profile.terminationGracePeriodSeconds }}
       containers:
         - name: social-media-reuploader
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
@@ -68,6 +66,9 @@ spec:
           {{- if .Values.resources }}
           resources: {{ toYaml .Values.resources | nindent 12 }}
           {{- else }}
+          {{- if not (hasKey .Values.resourceProfiles .Values.resourceProfile) }}
+          {{- fail (printf "unknown resourceProfile: %s" .Values.resourceProfile) }}
+          {{- end }}
           {{- $profile := index .Values.resourceProfiles .Values.resourceProfile }}
           resources: {{ toYaml (dict "requests" $profile.requests "limits" $profile.limits) | nindent 12 }}
           {{- end }}

@@ -39,7 +39,7 @@ resources:
 terminationGracePeriodSeconds: 180
 ```
 
-The `terminationGracePeriodSeconds` ensures ffmpeg subprocess processes complete gracefully before pod termination (critical during video recompression).
+The `terminationGracePeriodSeconds` ensures ffmpeg subprocesses complete gracefully before pod termination (critical during video recompression).
 
 Checklist before push:
 - Ensure `.gitignore` excludes `data/` and local artifacts.
