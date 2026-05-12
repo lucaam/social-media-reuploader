@@ -1,0 +1,10 @@
+/* Small visual polish for MkDocs site */
+body {
+  font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial;
+}
+.md-content {
+  max-width: 960px;
+}
+.md-nav__title {
+  font-weight: 700;
+}

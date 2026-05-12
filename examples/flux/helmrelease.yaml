@@ -1,0 +1,29 @@
+apiVersion: helm.toolkit.fluxcd.io/v2beta1
+kind: HelmRelease
+metadata:
+  name: social-media-reuploader
+  namespace: default
+spec:
+  interval: 5m
+  chart:
+    # Use the chart path inside the same repository
+    spec:
+      chart: ./charts/social-media-reuploader
+      sourceRef:
+        kind: GitRepository
+        name: social-media-reuploader-repo
+        namespace: flux-system
+  install:
+    createNamespace: true
+  upgrade:
+    remediation:
+      retries: 2
+  values:
+    replicaCount: 1
+    env:
+      BOT_TOKEN: "" # set via Kubernetes Secret / external secret
+      ADMIN_TOKEN: ""
+      SECRET_KEY: ""
+    image:
+      repository: ghcr.io/lucaam/social-media-reuploader
+      tag: "latest"

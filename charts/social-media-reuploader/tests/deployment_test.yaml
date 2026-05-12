@@ -1,0 +1,17 @@
+suite: GUI deployment
+templates:
+  - templates/gui-deployment.yaml
+tests:
+  - it: should render deployment when gui.enabled true
+    set:
+      gui.enabled: true
+      gui.port: 8081
+    asserts:
+      - isKind:
+          of: Deployment
+      - equal:
+          path: spec.template.spec.containers[0].name
+          value: social-media-reuploader-gui
+      - equal:
+          path: spec.template.spec.containers[0].ports[0].containerPort
+          value: 8081

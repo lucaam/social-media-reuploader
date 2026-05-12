@@ -1,0 +1,20 @@
+# Files to exclude from Docker build context
+.git
+.gitignore
+venv/
+env/
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+dist/
+build/
+node_modules/
+data/
+*.log
+tests/
+site/
+docs/
+.vscode/
+*.md

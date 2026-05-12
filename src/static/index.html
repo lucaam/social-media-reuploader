@@ -1,0 +1,360 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Social media reuploader — Admin</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    <style>
+      body { padding-top: 1rem; }
+      .card { margin-bottom: 1rem }
+      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Roboto Mono", "Courier New", monospace }
+    </style>
+  </head>
+  <body class="bg-light">
+    <div class="container">
+      <div class="d-flex justify-content-between align-items-center mb-3">
+        <h2>Social media reuploader — Admin</h2>
+        <div>
+          <input id="tokenInput" class="form-control d-inline-block" style="width:280px" placeholder="Admin token (optional)" />
+          <button id="saveToken" class="btn btn-sm btn-primary">Save</button>
+        </div>
+      </div>
+
+      <div class="row">
+        <div class="col-md-6">
+          <div class="card">
+            <div class="card-body">
+              <h5 class="card-title">Requests by status</h5>
+              <canvas id="statusChart" height="160"></canvas>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-6">
+          <div class="card">
+            <div class="card-body">
+              <h5 class="card-title">Overall Stats</h5>
+              <div class="d-flex justify-content-between align-items-center">
+                <div>
+                  <div class="text-muted small">Avg original</div>
+                  <div id="statAvgOrig" class="h5">—</div>
+                </div>
+                <div>
+                  <div class="text-muted small">Avg final</div>
+                  <div id="statAvgFinal" class="h5">—</div>
+                </div>
+                <div>
+                  <div class="text-muted small">Avg processing</div>
+                  <div id="statAvgProc" class="h5">—</div>
+                </div>
+                <div>
+                  <div class="text-muted small">Needed processing</div>
+                  <div id="statNeedProc" class="h5">—</div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+        <div class="col-md-6">
+          <div class="card">
+            <div class="card-body">
+              <h5 class="card-title">Recent updates (raw)</h5>
+              <div style="max-height:320px; overflow:auto; font-size:12px"><pre id="updates" class="mono"></pre></div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="card">
+        <div class="card-body">
+          <div class="d-flex justify-content-between mb-2">
+            <h5 class="card-title">Recent Requests</h5>
+            <div class="d-flex gap-2">
+              <input id="searchInput" class="form-control form-control-sm" placeholder="Search URL or chat id" style="width:280px" />
+              <select id="pageSize" class="form-select form-select-sm" style="width:100px">
+                <option value="5">5</option>
+                <option value="10" selected>10</option>
+                <option value="25">25</option>
+              </select>
+            </div>
+          </div>
+          <div class="table-responsive">
+            <table class="table table-striped" id="requestsTable">
+              <thead>
+                <tr><th>ID</th><th>Chat ID</th><th>URL</th><th>Status</th><th>Orig MB</th><th>Final MB</th><th>Compressed</th><th>Proc(s)</th><th>Created</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+          <nav>
+            <ul id="pagination" class="pagination pagination-sm"></ul>
+          </nav>
+        </div>
+      </div>
+    </div>
+
+    <script>
+    const saveBtn = document.getElementById('saveToken')
+    const tokenInput = document.getElementById('tokenInput')
+    const requestsTable = document.querySelector('#requestsTable tbody')
+    const updatesEl = document.getElementById('updates')
+    const searchInput = document.getElementById('searchInput')
+    const pageSizeSelect = document.getElementById('pageSize')
+    const paginationEl = document.getElementById('pagination')
+    const statusCtx = document.getElementById('statusChart')
+
+    let timeSeriesChart = null
+
+    // load stored token
+    tokenInput.value = localStorage.getItem('admin_token') || ''
+    saveBtn.onclick = () => {
+      localStorage.setItem('admin_token', tokenInput.value)
+      alert('Token saved to localStorage')
+      loadAll()
+    }
+
+    function authHeaders() {
+      const token = localStorage.getItem('admin_token')
+      if (token) return { 'Authorization': 'Bearer ' + token }
+      return {}
+    }
+
+    async function loadRequests(page = 1) {
+      try {
+        const limit = parseInt(pageSizeSelect.value, 10)
+        const offset = (page - 1) * limit
+        const q = `/requests?limit=${limit}&offset=${offset}`
+        const resp = await fetch(q, { headers: authHeaders() })
+        if (!resp.ok) throw new Error('unauthorized')
+        const data = await resp.json()
+        return data
+      } catch (err) {
+        requestsTable.innerHTML = '<tr><td colspan="5">Could not fetch requests (invalid token?)</td></tr>'
+        return { items: [], total: 0, offset: 0, limit: parseInt(pageSizeSelect.value, 10) }
+      }
+    }
+
+    async function loadUpdates(page = 1) {
+      try {
+        const limit = 50
+        const offset = (page - 1) * limit
+        const resp = await fetch(`/api/updates?limit=${limit}&offset=${offset}`, { headers: authHeaders() })
+        if (!resp.ok) throw new Error('unauthorized')
+        const data = await resp.json()
+        updatesEl.textContent = data.items.slice(0,50).map(u => `${u.created_at}\n${u.raw}\n---`).join('\n')
+        return data
+      } catch (err) {
+        updatesEl.textContent = 'Could not fetch updates (invalid token?)'
+        return { items: [] }
+      }
+    }
+
+    let statusChart = null
+
+    function renderStatusChart(counts) {
+      const labels = Object.keys(counts)
+      const values = Object.values(counts)
+      if (!statusChart) {
+        statusChart = new Chart(statusCtx.getContext('2d'), {
+          type: 'doughnut',
+          data: { labels, datasets: [{ data: values, backgroundColor: ['#0d6efd','#198754','#ffc107','#dc3545','#6c757d'] }] },
+          options: { responsive: true }
+        })
+      } else {
+        statusChart.data.labels = labels
+        statusChart.data.datasets[0].data = values
+        statusChart.update()
+      }
+    }
+
+    function computeTimeSeries(reqs, hours = 24) {
+      const now = Date.now()
+      const buckets = new Array(hours).fill(0)
+      const labels = []
+      for (let i = hours - 1; i >= 0; i--) {
+        const t = new Date(now - i * 3600 * 1000)
+        labels.push(t.getHours() + ':' + String(t.getMinutes()).padStart(2, '0'))
+      }
+      for (const r of reqs) {
+        try {
+          const ts = new Date(r.created_at).getTime()
+          const diffHours = Math.floor((now - ts) / (3600 * 1000))
+          if (diffHours >= 0 && diffHours < hours) {
+            buckets[hours - 1 - diffHours] += 1
+          }
+        } catch (e) {
+          // ignore parse errors
+        }
+      }
+      return { labels, buckets }
+    }
+
+    function renderTimeSeries(reqs) {
+      const series = computeTimeSeries(reqs, 24)
+      if (!timeSeriesChart) {
+        const ctx = document.createElement('canvas')
+        ctx.id = 'timeSeriesChart'
+        ctx.height = 160
+        document.querySelector('.row').insertAdjacentElement('beforeend', document.createElement('div'))
+        const container = document.querySelector('.row').children[2] || document.querySelector('.row')
+        // append to first column for now
+        document.querySelector('.col-md-6').insertAdjacentHTML('beforeend', '<div class="card"><div class="card-body"><h5 class="card-title">Requests over time (last 24h)</h5><canvas id="timeSeriesChart" height="160"></canvas></div></div>')
+        const c = document.getElementById('timeSeriesChart').getContext('2d')
+        timeSeriesChart = new Chart(c, {
+          type: 'line',
+          data: { labels: series.labels, datasets: [{ label: 'Requests', data: series.buckets, borderColor: '#0d6efd', backgroundColor: 'rgba(13,110,253,0.1)', fill: true }] },
+          options: { responsive: true, scales: { x: { ticks: { maxRotation: 0 } } } }
+        })
+      } else {
+        timeSeriesChart.data.labels = series.labels
+        timeSeriesChart.data.datasets[0].data = series.buckets
+        timeSeriesChart.update()
+      }
+    }
+
+    // server-side pagination & search (search handled server-side later)
+    let currentPage = 1
+
+    async function renderTablePage(page = 1) {
+      const limit = parseInt(pageSizeSelect.value, 10)
+      const data = await loadRequests(page)
+      const total = data.total || 0
+      const items = data.items || []
+      requestsTable.innerHTML = ''
+      for (const r of items) {
+        const tr = document.createElement('tr')
+        const orig = r.original_size_mb !== null && r.original_size_mb !== undefined ? r.original_size_mb + ' MB' : ''
+        const fin = r.final_size_mb !== null && r.final_size_mb !== undefined ? r.final_size_mb + ' MB' : ''
+        const comp = r.compressed ? 'yes' : (r.compressed === false ? 'no' : '')
+        const proc = r.processing_duration_seconds ? (r.processing_duration_seconds.toFixed(1) + 's') : ''
+        const eventsSummary = (r.events || []).map(e => `${e.type}${e.duration_seconds ? `:${e.duration_seconds.toFixed(1)}s` : ''}`).join(', ')
+        tr.innerHTML = `<td>${r.id}</td><td>${r.chat_id}</td><td><a href="${r.url}" target="_blank">${r.url}</a></td><td>${r.status}</td><td>${orig}</td><td>${fin}</td><td>${comp}</td><td>${proc}</td><td>${r.created_at}</td>`
+        if (eventsSummary) tr.title = eventsSummary
+        requestsTable.appendChild(tr)
+      }
+      // render pagination using server total
+      const totalPages = Math.max(1, Math.ceil(total / limit))
+      paginationEl.innerHTML = ''
+      const makeLi = (text, disabled, cb) => {
+        const li = document.createElement('li')
+        li.className = 'page-item' + (disabled ? ' disabled' : '')
+        const a = document.createElement('a')
+        a.className = 'page-link'
+        a.href = '#'
+        a.textContent = text
+        a.onclick = (e) => { e.preventDefault(); if (!disabled) cb(); }
+        li.appendChild(a)
+        return li
+      }
+      paginationEl.appendChild(makeLi('«', page === 1, () => { currentPage = 1; renderTablePage(1) }))
+      paginationEl.appendChild(makeLi('‹', page === 1, () => { currentPage = Math.max(1, page - 1); renderTablePage(currentPage) }))
+      const startPage = Math.max(1, page - 2)
+      const endPage = Math.min(totalPages, startPage + 4)
+      for (let p = startPage; p <= endPage; p++) {
+        const li = makeLi(String(p), false, () => { currentPage = p; renderTablePage(p) })
+        if (p === page) li.classList.add('active')
+        paginationEl.appendChild(li)
+      }
+      paginationEl.appendChild(makeLi('›', page === totalPages, () => { currentPage = Math.min(totalPages, page + 1); renderTablePage(currentPage) }))
+      paginationEl.appendChild(makeLi('»', page === totalPages, () => { currentPage = totalPages; renderTablePage(totalPages) }))
+    }
+
+    async function loadAll() {
+      await renderTablePage(currentPage)
+      await loadUpdates()
+      await loadStats()
+      // optionally compute chart from current page (best-effort)
+      const data = await loadRequests(currentPage)
+      const items = data.items || []
+      renderStatusChart(items.reduce((acc, r) => { acc[r.status] = (acc[r.status] || 0) + 1; return acc }, {}))
+      renderTimeSeries(items)
+    }
+
+    async function loadStats() {
+      try {
+        const resp = await fetch('/stats', { headers: authHeaders() })
+        if (!resp.ok) return
+        const s = await resp.json()
+        document.getElementById('statAvgOrig').textContent = s.avg_original_size_mb ? (s.avg_original_size_mb + ' MB') : '—'
+        document.getElementById('statAvgFinal').textContent = s.avg_final_size_mb ? (s.avg_final_size_mb + ' MB') : '—'
+        document.getElementById('statAvgProc').textContent = s.avg_processing_seconds ? (s.avg_processing_seconds.toFixed(1) + ' s') : '—'
+        document.getElementById('statNeedProc').textContent = s.requests_need_processing !== undefined ? String(s.requests_need_processing) : '—'
+      } catch (e) {
+        // ignore
+      }
+    }
+
+    // search events
+    let searchTimeout = null
+    searchInput.addEventListener('input', () => { currentPage = 1; clearTimeout(searchTimeout); searchTimeout = setTimeout(() => renderTable(allRequests), 250) })
+    pageSizeSelect.addEventListener('change', () => { currentPage = 1; renderTable(allRequests) })
+
+    // display login if oauth configured
+    async function initAuth() {
+      try {
+        const cfg = await (await fetch('/config')).json()
+        const me = await (await fetch('/api/me')).json()
+        if (cfg.oauth_configured) {
+          const btn = document.createElement('a')
+          btn.href = '/login'
+          btn.className = 'btn btn-sm btn-outline-primary ms-2'
+          btn.textContent = me.user && me.user.login ? ('Logout ' + (me.user.login || '')) : 'Login with OAuth'
+          document.querySelector('.d-flex.justify-content-between').appendChild(btn)
+        }
+      } catch (e) {
+        // ignore
+      }
+    }
+
+    // WebSocket for realtime updates with polling fallback
+    let ws = null
+    function wsUrl() {
+      const token = localStorage.getItem('admin_token') || ''
+      const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
+      return `${proto}//${location.host}/ws/updates${token ? '?token=' + encodeURIComponent(token) : ''}`
+    }
+
+    function setupWs() {
+      try {
+        ws = new WebSocket(wsUrl())
+      } catch (e) {
+        console.debug('WebSocket not available', e)
+        return
+      }
+      ws.onopen = () => { console.debug('ws open') }
+      ws.onmessage = (ev) => {
+        try {
+          const msg = JSON.parse(ev.data)
+          if (msg.type === 'initial') {
+            if (msg.requests) {
+              currentPage = 1
+              renderTablePage(1)
+            }
+            if (msg.updates) loadUpdates()
+          } else if (msg.type === 'request_created' || msg.type === 'request_started' || msg.type === 'request_finished' || msg.type === 'request_event') {
+            // refresh current page on request lifecycle changes
+            renderTablePage(currentPage)
+          } else if (msg.type === 'update_created') {
+            loadUpdates()
+          }
+        } catch (e) {
+          console.debug('ws message parse error', e)
+        }
+      }
+      ws.onclose = () => { console.debug('ws closed, will fallback to polling') }
+      ws.onerror = (e) => { console.debug('ws error', e) }
+    }
+
+    loadAll()
+    initAuth()
+    setupWs()
+    // fallback polling every 10s if ws not available or closed
+    setInterval(async () => {
+      if (!ws || ws.readyState !== WebSocket.OPEN) {
+        await loadAll()
+      }
+    }, 10000)
+    </script>
+  </body>
+</html>
