@@ -12,7 +12,7 @@ spec:
       labels:
         app: {{ include "social-media-reuploader.name" . | default "social-media-reuploader" }}
     spec:
-      serviceAccountName: {{- if .Values.serviceAccount.name }}{{ .Values.serviceAccount.name }}{{- else if .Values.serviceAccount.create }}{{ include "social-media-reuploader.fullname" . }}-sa{{- end }}
+      serviceAccountName: '{{ if .Values.serviceAccount.name }}{{ .Values.serviceAccount.name }}{{ else if .Values.serviceAccount.create }}{{ include "social-media-reuploader.fullname" . }}-sa{{ else }}{{ "" }}{{ end }}'
       securityContext:
         runAsNonRoot: true
         fsGroup: 1000
