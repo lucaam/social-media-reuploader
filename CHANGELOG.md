@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.1.0 (2026-05-12)
+
+
+### Bug Fixes
+
+* **ci:** accept RELEASE_PLEASE_TOKEN fallback for release-please action ([b6dce06](https://github.com/lucaam/social-media-reuploader/commit/b6dce061d6df42ecc8eacb00cc010e331375ac35))
+* **ci:** bump upload-pages-artifact to v2; quote serviceAccountName to avoid YAML parse issues ([78314a1](https://github.com/lucaam/social-media-reuploader/commit/78314a186c3b26da72f1f25fddec7d69b96debde))
+* **ci:** give release-please write permissions (contents,pull-requests,pages) ([6f6f540](https://github.com/lucaam/social-media-reuploader/commit/6f6f540260288f0d535395a72ef94e4317b24c4c))
+* **ci:** make tests importable (PYTHONPATH); fix gui helm template; docs deploy permissions ([110a867](https://github.com/lucaam/social-media-reuploader/commit/110a867e51fce7942fa901717bbb0e0e53c5251b))
+* **docs:** ensure GitHub Pages site configured after deploy ([29b6d4e](https://github.com/lucaam/social-media-reuploader/commit/29b6d4e50ab3c70b4338a4a4bf2627d6066c4b04))
+* **docs:** use upload-pages-artifact + deploy-pages (first-party) ([8701696](https://github.com/lucaam/social-media-reuploader/commit/8701696305b8157b24217525cb60c8df9b562bec))
+* **docs:** use upload-pages-artifact@v3 (uses upload-artifact@v4) ([0d652f4](https://github.com/lucaam/social-media-reuploader/commit/0d652f461f2aeee60cd944bf49b197117a061d8e))
+* **helm:** preserve YAML spacing for serviceAccountName and ServiceAccount name ([99e5fd5](https://github.com/lucaam/social-media-reuploader/commit/99e5fd55fa3ddce0d8d12ed559c28f8b468b0b73))
+* **helm:** remove backslash escapes in deployment env defaults ([e24ade7](https://github.com/lucaam/social-media-reuploader/commit/e24ade7c2663c5a68391cd64e7aeadf6b9230148))
+
 ## 0.1.0 - Initial release
 
 - Initial import: Social media reuploader bot (aiogram) with background workers using `yt-dlp` + `ffmpeg`.
@@ -7,6 +22,3 @@
 - SQLite diagnostics (`request_events`) and admin GUI (`src/gui.py`).
 - Helm chart under `charts/social-media-reuploader` and Dockerfile for container builds.
 - Metrics and basic observability integrated.
-
-
-
