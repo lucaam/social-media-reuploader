@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.2.0](https://github.com/lucaam/social-media-reuploader/compare/0.1.0...v0.2.0) (2026-05-12)
+
+
+### Features
+
+* add k8s resource profiles for video workloads ([#4](https://github.com/lucaam/social-media-reuploader/issues/4)) ([f37cf03](https://github.com/lucaam/social-media-reuploader/commit/f37cf03588dcd5c71d64b63af9532f71dce8ab72))
+* support gui.secrets in chart for OAuth and admin token configur… ([#2](https://github.com/lucaam/social-media-reuploader/issues/2)) ([0b265b5](https://github.com/lucaam/social-media-reuploader/commit/0b265b5eb9695d3fd1e531d012508a722e69d8d2))
+
 ## 0.1.0 (2026-05-12)
 
 
