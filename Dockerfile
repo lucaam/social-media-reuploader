@@ -23,7 +23,6 @@ RUN apt-get update \
 	&& python -m pip install --no-cache-dir -r requirements.txt
 
 COPY src/ ./src/
-COPY README.md ./
 
 # Create a non-root user and set ownership
 RUN useradd --create-home --shell /usr/sbin/nologin appuser \
@@ -33,14 +32,5 @@ USER appuser
 
 ENV PYTHONUNBUFFERED=1
 EXPOSE 8080
-
-# Healthcheck using the application's /health endpoint
-HEALTHCHECK --interval=30s --timeout=3s --start-period=10s --retries=3 \
-  CMD python -c "import urllib.request,sys
-try:
-	r=urllib.request.urlopen('http://127.0.0.1:8080/health',timeout=3)
-	sys.exit(0 if getattr(r, 'status', 200)==200 else 1)
-except Exception:
-	sys.exit(1)"
 
 CMD ["python", "-m", "src.bot"]
