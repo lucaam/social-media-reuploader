@@ -43,11 +43,12 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 3
+{{- $hasSecrets := or .Values.gui.secrets.adminToken .Values.gui.secrets.secretKey .Values.gui.secrets.oauthClientId .Values.gui.secrets.oauthClientSecret .Values.gui.secrets.oauthAuthorizeUrl .Values.gui.secrets.oauthTokenUrl .Values.gui.secrets.oauthUserinfoUrl -}}
 {{- if .Values.gui.useSecret }}
           envFrom:
             - secretRef:
                 name: {{ if .Values.gui.secretName }}{{ .Values.gui.secretName }}{{ else }}{{ include "social-media-reuploader.fullname" . }}-gui-secret{{ end }}
-{{- else }}
+{{- else if $hasSecrets }}
           env:
             {{- if .Values.gui.secrets.adminToken }}
             - name: ADMIN_TOKEN
