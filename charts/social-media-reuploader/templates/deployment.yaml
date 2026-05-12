@@ -29,15 +29,15 @@ spec:
                   name: {{ if .Values.secret.name }}{{ .Values.secret.name }}{{ else }}{{ include "social-media-reuploader.fullname" . }}-secret{{ end }}
                   key: {{ default "BOT_TOKEN" .Values.secret.botTokenKey }}
             - name: MODE
-              value: "{{ .Values.env.MODE | default \"webhook\" }}"
+              value: '{{ .Values.env.MODE | default "webhook" }}'
             - name: WEBHOOK_URL
-              value: "{{ .Values.env.WEBHOOK_URL | default \"\" }}"
+              value: '{{ .Values.env.WEBHOOK_URL | default "" }}'
             - name: TMP_DIR
-              value: "{{ .Values.env.TMP_DIR | default \"/tmp/telegram_downloader\" }}"
+              value: '{{ .Values.env.TMP_DIR | default "/tmp/telegram_downloader" }}'
             - name: TELEGRAM_MAX_FILE_SIZE
-              value: "{{ .Values.env.TELEGRAM_MAX_FILE_SIZE | default 52428800 }}"
+              value: '{{ .Values.env.TELEGRAM_MAX_FILE_SIZE | default 52428800 }}'
             - name: WORKERS
-              value: "{{ .Values.env.WORKERS | default \"2\" }}"
+              value: '{{ .Values.env.WORKERS | default "2" }}'
           securityContext:
             runAsUser: 1000
             runAsNonRoot: true
