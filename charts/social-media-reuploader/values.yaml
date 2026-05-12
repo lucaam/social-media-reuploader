@@ -22,13 +22,54 @@ ingress:
       paths: ["/"]
   tls: []
 
-resources:
+# Resource profiles for different video workloads
+# Choose: small, medium, large, or custom
+resourceProfile: medium
+
+# Predefined resource profiles
+resourceProfiles:
+  small:
+    # For videos ≤50MB (light processing)
+    requests:
+      cpu: 100m
+      memory: 256Mi
+    limits:
+      cpu: 300m
+      memory: 512Mi
+    terminationGracePeriodSeconds: 60
+  
+  medium:
+    # For videos ≤100MB (standard processing + recompress)
+    requests:
+      cpu: 200m
+      memory: 512Mi
+    limits:
+      cpu: 1000m
+      memory: 1Gi
+    terminationGracePeriodSeconds: 120
+  
+  large:
+    # For videos ≤500MB (heavy processing, multiple compress attempts)
+    requests:
+      cpu: 500m
+      memory: 1Gi
+    limits:
+      cpu: 2000m
+      memory: 2Gi
+    terminationGracePeriodSeconds: 300
+
+# Override resourceProfile by setting resources directly
+resources: null
+
+# GUI Resources (separate from bot processing)
+guiResources:
   requests:
-    cpu: 100m
+    cpu: 50m
     memory: 128Mi
   limits:
-    cpu: 500m
-    memory: 512Mi
+    cpu: 200m
+    memory: 256Mi
+terminationGracePeriodSeconds: null
 
 # Secret handling: create or reference an existing Secret for the bot token
 secret:
