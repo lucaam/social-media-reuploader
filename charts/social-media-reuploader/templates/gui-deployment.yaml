@@ -65,10 +65,11 @@ spec:
               value: "{{ .Values.env.OAUTH_USERINFO_URL | default "" }}"
 {{- end }}
           resources: {{ toYaml .Values.resources | nindent 10 }}
-{{- if .Values.db.pvc.enabled }}
+          {{- if .Values.db.pvc.enabled }}
           volumeMounts:
             - name: data
               mountPath: {{ .Values.db.pvc.mountPath | default "/app/data" }}
+          {{- end }}
       {{- if .Values.db.pvc.enabled }}
       volumes:
         - name: data
