@@ -56,12 +56,19 @@ gui:
     tag: latest
     pullPolicy: IfNotPresent
   port: 8081
-  # OAuth and admin token settings are provided via env secrets
-  env: {}
   # if true, create a Kubernetes Secret and mount it into the GUI pod
   useSecret: false
   # custom secret name (optional). If empty, chart will use "<fullname>-gui-secret"
   secretName: ""
+  # GUI secret values (only used if useSecret=true)
+  secrets:
+    adminToken: ""
+    secretKey: ""
+    oauthClientId: ""
+    oauthClientSecret: ""
+    oauthAuthorizeUrl: ""
+    oauthTokenUrl: ""
+    oauthUserinfoUrl: ""
 
 # Database / persistence for GUI
 db:
