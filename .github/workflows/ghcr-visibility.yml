@@ -1,0 +1,40 @@
+name: Make GHCR package public
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  make-public:
+    name: Make GHCR container package public
+    runs-on: ubuntu-latest
+    steps:
+      - name: Make GHCR package public (org or user)
+        uses: actions/github-script@v6
+        with:
+          script: |
+            const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
+            const packageName = repo;
+            const packageType = 'container';
+            console.log(`Repository: ${process.env.GITHUB_REPOSITORY}, package: ${packageName}`);
+            try {
+              await github.request('PUT /orgs/{org}/packages/{package_type}/{package_name}/visibility', {
+                org: owner,
+                package_type: packageType,
+                package_name: packageName,
+                visibility: 'public'
+              });
+              console.log('GHCR package visibility set to public (org endpoint).');
+            } catch (err) {
+              console.log('Org endpoint failed, trying user endpoint:', err && err.message ? err.message : err);
+              await github.request('PUT /user/packages/{package_type}/{package_name}/visibility', {
+                package_type: packageType,
+                package_name: packageName,
+                visibility: 'public'
+              });
+              console.log('GHCR package visibility set to public (user endpoint).');
+            }

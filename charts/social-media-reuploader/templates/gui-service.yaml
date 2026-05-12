@@ -1,0 +1,13 @@
+{{- if .Values.gui.enabled -}}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "social-media-reuploader.fullname" . }}-gui
+spec:
+  type: ClusterIP
+  ports:
+    - port: {{ .Values.gui.port | default 8081 }}
+      targetPort: {{ .Values.gui.port | default 8081 }}
+  selector:
+    app: {{ include "social-media-reuploader.name" . }}-gui
+{{- end -}}

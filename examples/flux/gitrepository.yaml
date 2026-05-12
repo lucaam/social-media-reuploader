@@ -1,0 +1,11 @@
+apiVersion: source.toolkit.fluxcd.io/v1beta2
+kind: GitRepository
+metadata:
+  name: social-media-reuploader-repo
+  namespace: flux-system
+spec:
+  interval: 1m0s
+  # Replace with your Git repository URL (SSH or HTTPS)
+  url: ssh://git@github.com/lucaam/social-media-reuploader.git
+  ref:
+    branch: main

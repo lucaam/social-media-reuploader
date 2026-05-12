@@ -1,0 +1,78 @@
+{{- if .Values.gui.enabled -}}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "social-media-reuploader.fullname" . }}-gui
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: {{ include "social-media-reuploader.name" . }}-gui
+  template:
+    metadata:
+      labels:
+        app: {{ include "social-media-reuploader.name" . }}-gui
+    spec:
+      serviceAccountName: {{- if .Values.serviceAccount.name }}{{ .Values.serviceAccount.name }}{{- else if .Values.serviceAccount.create }}{{ include "social-media-reuploader.fullname" . }}-sa{{- end }}
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 1000
+      containers:
+        - name: social-media-reuploader-gui
+          image: "{{ .Values.gui.image.repository }}:{{ .Values.gui.image.tag }}"
+          imagePullPolicy: {{ .Values.gui.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.gui.port | default 8081 }}
+          securityContext:
+            runAsUser: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.gui.port | default 8081 }}
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: {{ .Values.gui.port | default 8081 }}
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+{{- if .Values.gui.useSecret }}
+          envFrom:
+            - secretRef:
+                name: {{ if .Values.gui.secretName }}{{ .Values.gui.secretName }}{{ else }}{{ include "social-media-reuploader.fullname" . }}-gui-secret{{ end }}
+{{- else }}
+          env:
+            - name: ADMIN_TOKEN
+              value: "{{ .Values.env.ADMIN_TOKEN | default "" }}"
+            - name: SECRET_KEY
+              value: "{{ .Values.env.SECRET_KEY | default "" }}"
+            - name: OAUTH_CLIENT_ID
+              value: "{{ .Values.env.OAUTH_CLIENT_ID | default "" }}"
+            - name: OAUTH_CLIENT_SECRET
+              value: "{{ .Values.env.OAUTH_CLIENT_SECRET | default "" }}"
+            - name: OAUTH_AUTHORIZE_URL
+              value: "{{ .Values.env.OAUTH_AUTHORIZE_URL | default "" }}"
+            - name: OAUTH_TOKEN_URL
+              value: "{{ .Values.env.OAUTH_TOKEN_URL | default "" }}"
+            - name: OAUTH_USERINFO_URL
+              value: "{{ .Values.env.OAUTH_USERINFO_URL | default "" }}"
+{{- end }}
+          resources: {{ toYaml .Values.resources | nindent 10 }}
+{{- if .Values.db.pvc.enabled }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.db.pvc.mountPath | default "/app/data" }}
+      {{- if .Values.db.pvc.enabled }}
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ include "social-media-reuploader.fullname" . }}-data
+      {{- end }}
+{{- end -}}

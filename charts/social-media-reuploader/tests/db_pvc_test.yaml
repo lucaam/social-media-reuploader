@@ -1,0 +1,14 @@
+suite: DB PVC
+templates:
+  - templates/db-pvc.yaml
+tests:
+  - it: creates PVC when db.pvc.enabled true
+    set:
+      db.pvc.enabled: true
+      db.pvc.size: 2Gi
+    asserts:
+      - isKind:
+          of: PersistentVolumeClaim
+      - equal:
+          path: spec.resources.requests.storage
+          value: 2Gi

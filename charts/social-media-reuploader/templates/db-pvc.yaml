@@ -1,0 +1,15 @@
+{{- if .Values.db.pvc.enabled -}}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "social-media-reuploader.fullname" . }}-data
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: {{ .Values.db.pvc.size | quote }}
+  {{- if .Values.db.pvc.storageClass }}
+  storageClassName: {{ .Values.db.pvc.storageClass }}
+  {{- end }}
+{{- end -}}

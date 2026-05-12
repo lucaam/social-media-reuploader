@@ -1,0 +1,11 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "social-media-reuploader.fullname" . | default "social-media-reuploader" }}
+spec:
+  type: {{ .Values.service.type | default "ClusterIP" }}
+  ports:
+    - port: {{ .Values.service.port | default 80 }}
+      targetPort: 8080
+  selector:
+    app: {{ include "social-media-reuploader.name" . | default "social-media-reuploader" }}

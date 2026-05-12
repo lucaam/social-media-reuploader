@@ -1,0 +1,15 @@
+name: Commitlint (Conventional Commits)
+
+on:
+  pull_request:
+    types: [opened, edited, synchronize]
+
+jobs:
+  commitlint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Commitlint
+        uses: wagoid/commitlint-github-action@v4
+        with:
+          configFile: commitlint.config.js
