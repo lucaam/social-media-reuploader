@@ -1,0 +1,18 @@
+{
+  "packages": {
+    "social-media-reuploader": {
+      "releaseType": "python",
+      "packageName": "social-media-reuploader",
+      "tagName": "v${version}",
+      "changelogSections": [
+        {"type": "feat", "section": "Features"},
+        {"type": "fix", "section": "Bug Fixes"},
+        {"type": "perf", "section": "Performance Improvements"},
+        {"type": "docs", "section": "Documentation"},
+        {"type": "chore", "section": "Chores"},
+        {"type": "refactor", "section": "Refactors"},
+        {"type": "test", "section": "Tests"}
+      ]
+    }
+  }
+}

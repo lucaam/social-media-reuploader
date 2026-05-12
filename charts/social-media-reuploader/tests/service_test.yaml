@@ -1,0 +1,14 @@
+suite: GUI service
+templates:
+  - templates/gui-service.yaml
+tests:
+  - it: should render GUI service when enabled
+    set:
+      gui.enabled: true
+      gui.port: 8081
+    asserts:
+      - isKind:
+          of: Service
+      - equal:
+          path: spec.ports[0].port
+          value: 8081

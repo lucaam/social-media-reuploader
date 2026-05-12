@@ -1,0 +1,26 @@
+version: '3.8'
+services:
+  bot:
+    build: .
+    image: ghcr.io/lucaam/social-media-reuploader:local
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+
+  gui:
+    build: .
+    image: ghcr.io/lucaam/social-media-reuploader:local
+    command: uvicorn src.gui:app --host 0.0.0.0 --port 8081
+    environment:
+      - ADMIN_TOKEN=${ADMIN_TOKEN}
+      - SECRET_KEY=${SECRET_KEY}
+    ports:
+      - "8081:8081"
+    volumes:
+      - data:/app/data
+
+volumes:
+  data:
+    driver: local

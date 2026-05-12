@@ -1,0 +1,61 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "social-media-reuploader.fullname" . | default "social-media-reuploader" }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: {{ include "social-media-reuploader.name" . | default "social-media-reuploader" }}
+  template:
+    metadata:
+      labels:
+        app: {{ include "social-media-reuploader.name" . | default "social-media-reuploader" }}
+    spec:
+      serviceAccountName: '{{ if .Values.serviceAccount.name }}{{ .Values.serviceAccount.name }}{{ else if .Values.serviceAccount.create }}{{ include "social-media-reuploader.fullname" . }}-sa{{ else }}{{ "" }}{{ end }}'
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 1000
+      containers:
+        - name: social-media-reuploader
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: 8080
+          env:
+            - name: BOT_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: {{ if .Values.secret.name }}{{ .Values.secret.name }}{{ else }}{{ include "social-media-reuploader.fullname" . }}-secret{{ end }}
+                  key: {{ default "BOT_TOKEN" .Values.secret.botTokenKey }}
+            - name: MODE
+              value: '{{ .Values.env.MODE | default "webhook" }}'
+            - name: WEBHOOK_URL
+              value: '{{ .Values.env.WEBHOOK_URL | default "" }}'
+            - name: TMP_DIR
+              value: '{{ .Values.env.TMP_DIR | default "/tmp/telegram_downloader" }}'
+            - name: TELEGRAM_MAX_FILE_SIZE
+              value: '{{ .Values.env.TELEGRAM_MAX_FILE_SIZE | default 52428800 }}'
+            - name: WORKERS
+              value: '{{ .Values.env.WORKERS | default "2" }}'
+          securityContext:
+            runAsUser: 1000
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 30
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources: {{ toYaml .Values.resources | nindent 12 }}

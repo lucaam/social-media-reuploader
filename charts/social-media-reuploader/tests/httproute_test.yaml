@@ -1,0 +1,18 @@
+suite: HTTPRoute
+templates:
+  - templates/httproute.yaml
+tests:
+  - it: renders HTTPRoute when gatewayApi.enabled true
+    set:
+      gatewayApi.enabled: true
+      gatewayApi.gatewayName: test-gateway
+      gatewayApi.hosts:
+        - example.com
+      gatewayApi.path: /
+      gatewayApi.servicePort: 80
+    asserts:
+      - isKind:
+          of: HTTPRoute
+      - equal:
+          path: spec.parentRefs[0].name
+          value: test-gateway

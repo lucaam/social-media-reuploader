@@ -1,0 +1,11 @@
+site_name: Social media reuploader
+site_description: A Telegram bot that downloads media links and reposts them
+site_author: social-media-reuploader
+nav:
+  - Home: index.md
+  - Usage: usage.md
+  - Deploy: deploy.md
+theme:
+  name: material
+extra_css:
+  - css/custom.css
