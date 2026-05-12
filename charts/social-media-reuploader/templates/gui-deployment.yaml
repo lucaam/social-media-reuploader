@@ -17,6 +17,9 @@ spec:
       securityContext:
         runAsNonRoot: true
         fsGroup: 1000
+      {{- if .Values.terminationGracePeriodSeconds }}
+      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+      {{- end }}
       containers:
         - name: social-media-reuploader-gui
           image: "{{ .Values.gui.image.repository }}:{{ .Values.gui.image.tag }}"
@@ -79,7 +82,7 @@ spec:
               value: "{{ .Values.gui.secrets.oauthUserinfoUrl }}"
             {{- end }}
 {{- end }}
-          resources: {{ toYaml .Values.resources | nindent 10 }}
+          resources: {{ toYaml .Values.guiResources | nindent 10 }}
           {{- if .Values.db.pvc.enabled }}
           volumeMounts:
             - name: data
