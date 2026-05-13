@@ -6,6 +6,13 @@ All notable changes to this project are documented in this file.
 
 - No unreleased changes recorded.
 
+## [0.3.0](https://github.com/lucaam/social-media-reuploader/compare/v0.2.2...v0.3.0) (2026-05-13)
+
+
+### Features
+
+* **silly:** add /silly endpoint (tiny fun feature) ([#16](https://github.com/lucaam/social-media-reuploader/issues/16)) ([6b8dbf5](https://github.com/lucaam/social-media-reuploader/commit/6b8dbf5fdf0eab237c94da628463650d81a0bcc9))
+
 ## [v0.2.2](https://github.com/lucaam/social-media-reuploader/compare/v0.2.1...v0.2.2) (2026-05-13)
 
 ### Bug Fixes
