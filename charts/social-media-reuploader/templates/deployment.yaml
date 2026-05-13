@@ -30,11 +30,18 @@ spec:
           ports:
             - containerPort: 8080
           env:
+{{- if or .Values.secret.create .Values.secret.name }}
             - name: BOT_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ if .Values.secret.name }}{{ .Values.secret.name }}{{ else }}{{ include "social-media-reuploader.fullname" . }}-secret{{ end }}
                   key: {{ default "BOT_TOKEN" .Values.secret.botTokenKey }}
+{{- else if .Values.env.BOT_TOKEN }}
+            - name: BOT_TOKEN
+              value: {{ .Values.env.BOT_TOKEN | quote }}
+{{- else }}
+            # No BOT_TOKEN provided. Provide a Secret (recommended) or set `env.BOT_TOKEN` when installing the chart.
+{{- end }}
             - name: MODE
               value: '{{ .Values.env.MODE | default "webhook" }}'
             - name: WEBHOOK_URL
