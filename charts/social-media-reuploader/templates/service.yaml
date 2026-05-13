@@ -11,3 +11,4 @@ spec:
       targetPort: 8080
   selector:
     app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: bot

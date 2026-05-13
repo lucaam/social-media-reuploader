@@ -124,7 +124,7 @@ async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optio
         if incompatible:
             try:
                 base = os.path.splitext(os.path.basename(latest))[0]
-                trans_path = os.path.join(dest_dir, f"{base}.mp4")
+                trans_path = os.path.join(dest_dir, f"{base}_transcoded.mp4")
                 ffmpeg_cmd = [
                     ffmpeg_bin,
                     "-y",
@@ -165,10 +165,10 @@ async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optio
                 logger.exception("Transcoding failed")
         else:
             # compatible codecs: remux to MP4 if not already MP4 to improve playback (faststart)
-            if fmt and "mp4" not in fmt:
+                    if fmt and "mp4" not in fmt:
                 try:
                     base = os.path.splitext(os.path.basename(latest))[0]
-                    remux_path = os.path.join(dest_dir, f"{base}.mp4")
+                    remux_path = os.path.join(dest_dir, f"{base}_remuxed.mp4")
                     ffmpeg_cmd = [ffmpeg_bin, "-y", "-i", latest, "-c", "copy", "-movflags", "+faststart", remux_path]
                     logger.info("Remuxing %s to mp4 container", latest)
                     proc5 = await asyncio.create_subprocess_exec(*ffmpeg_cmd, stdout=PIPE, stderr=PIPE)
@@ -197,7 +197,7 @@ async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optio
         if ffmpeg_bin:
             try:
                 base = os.path.splitext(os.path.basename(latest))[0]
-                mp4_path = os.path.join(dest_dir, f"{base}.mp4")
+                mp4_path = os.path.join(dest_dir, f"{base}_wrapped.mp4")
                 ffmpeg_cmd = [
                     ffmpeg_bin,
                     "-y",
@@ -240,10 +240,7 @@ async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optio
             # fallback: attempt a single recode with yt-dlp if available
             if yt_dlp_bin:
                 logger.info("ffmpeg not available; attempting yt-dlp recode to mp4")
-                if yt_dlp_bin:
-                    recode_cmd = [yt_dlp_bin, "--no-playlist", "--recode-video", "mp4", "-o", out_template, url]
-                else:
-                    recode_cmd = [sys.executable, "-m", "yt_dlp", "--no-playlist", "--recode-video", "mp4", "-o", out_template, url]
+                recode_cmd = [yt_dlp_bin, "--no-playlist", "--recode-video", "mp4", "-o", out_template, url]
                 logger.debug("Running recode command: %s", " ".join(recode_cmd))
                 proc2 = await asyncio.create_subprocess_exec(*recode_cmd, stdout=PIPE, stderr=PIPE)
                 try:
@@ -266,9 +263,9 @@ async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optio
     if ext in audio_exts:
         try:
             base = os.path.splitext(os.path.basename(latest))[0]
-            mp4_path = os.path.join(dest_dir, f"{base}.mp4")
+            mp4_path = os.path.join(dest_dir, f"{base}_wrapped.mp4")
             ffmpeg_cmd = [
-                "ffmpeg",
+                ffmpeg_bin or "ffmpeg",
                 "-y",
                 "-f",
                 "lavfi",
