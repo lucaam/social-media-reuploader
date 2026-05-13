@@ -65,17 +65,20 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.created=${{ github.event.release.published_at }}
 
-      - name: Make GHCR package public (requires GHCR_PAT)
-        if: ${{ secrets.GHCR_PAT }}
+      - name: Make GHCR package public (optional via GHCR_PAT)
         env:
           OWNER: ${{ github.repository_owner }}
           REPO: ${{ github.event.repository.name }}
           GHCR_PAT: ${{ secrets.GHCR_PAT }}
         run: |
           set -euo pipefail
+          if [ -z "${GHCR_PAT:-}" ]; then
+            printf 'GHCR_PAT not set — skipping automatic visibility change\n'
+            exit 0
+          fi
           package_name="$REPO"
           package_type="container"
-          echo "Repository: $GITHUB_REPOSITORY, package: $package_name, owner: $OWNER"
+          printf 'Repository: %s, package: %s, owner: %s\n' "$GITHUB_REPOSITORY" "$package_name" "$OWNER"
 
           # Try org endpoint first
           resp=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
@@ -85,11 +88,11 @@ jobs:
             -d '{"visibility":"public"}' || true)
 
           if [ "$resp" = "200" ] || [ "$resp" = "201" ] || [ "$resp" = "204" ]; then
-            echo "GHCR package visibility set to public (org endpoint)."
+            printf 'GHCR package visibility set to public (org endpoint).\n'
             exit 0
           fi
 
-          echo "Org endpoint returned $resp; trying user endpoint..."
+          printf 'Org endpoint returned %s; trying user endpoint...\n' "$resp"
 
           resp2=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
             -H "Authorization: Bearer $GHCR_PAT" \
@@ -98,15 +101,9 @@ jobs:
             -d '{"visibility":"public"}' || true)
 
           if [ "$resp2" = "200" ] || [ "$resp2" = "201" ] || [ "$resp2" = "204" ]; then
-            echo "GHCR package visibility set to public (user endpoint)."
+            printf 'GHCR package visibility set to public (user endpoint).\n'
             exit 0
           fi
 
-          echo "Failed to set GHCR package visibility: org=$resp user=$resp2"
-          echo "This operation usually requires a personal access token (GHCR_PAT) with package write/admin privileges for the package owner.\nAdd a secret named 'GHCR_PAT' and re-run the workflow to enable automatic visibility changes."
-
-      - name: Make GHCR package public (skipped)
-        if: ${{ !secrets.GHCR_PAT }}
-        run: |
-          echo "No GHCR_PAT secret found — skipping automatic visibility change."
-          echo "To enable automatic publishing of GHCR packages as public, create a personal access token with 'write:packages' (and org admin rights if needed) and add it as the repository secret 'GHCR_PAT'."
+          printf 'Failed to set GHCR package visibility: org=%s user=%s\n' "$resp" "$resp2"
+          printf 'This operation usually requires a personal access token (GHCR_PAT) with package write/admin privileges for the package owner.\nAdd a secret named GHCR_PAT and re-run the workflow to enable automatic visibility changes.\n'
