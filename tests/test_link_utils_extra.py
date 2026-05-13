@@ -18,7 +18,9 @@ def test_find_links_multiple_and_duplicates():
 
 
 def test_find_links_trailing_punctuation_and_parentheses():
-    text = "See (https://youtu.be/xyz), and end. Also: https://www.instagram.com/p/ABC123." 
+    text = (
+        "See (https://youtu.be/xyz), and end. Also: https://www.instagram.com/p/ABC123."
+    )
     links = find_links(text)
     # ensure the URL substring is present even if punctuation is attached
     assert any("youtu.be/xyz" in link for link in links)

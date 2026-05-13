@@ -86,4 +86,3 @@ See [GHCR notes](ghcr.md) for details about publishing images to GitHub Containe
 Local testing
 
 For step-by-step local testing instructions, see [Local testing & development](local-testing.md).
-

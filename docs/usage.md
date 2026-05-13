@@ -47,4 +47,3 @@ curl -H "Authorization: Bearer $ADMIN_TOKEN" http://localhost:8081/requests
 ```
 
 If you want the HTML view in a browser but don't want to expose the token in the URL, use an OAuth login instead (see OAuth setup in `oauth.md`) or open the page behind a secure tunnel.
-

@@ -1,12 +1,11 @@
-import asyncio
 import logging
+
 from aiohttp import web
+from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-from prometheus_client import generate_latest, CONTENT_TYPE_LATEST
-
+from . import config, telegram_api
 from .link_utils import find_links
 from .worker import WorkerPool
-from . import config, telegram_api
 
 logger = logging.getLogger("telegram_downloader")
 logging.basicConfig(level=logging.INFO)
@@ -31,7 +30,7 @@ async def handle_webhook(request: web.Request) -> web.Response:
     links = find_links(text)
 
     if links and chat_id:
-        message_id = message.get('message_id')
+        message_id = message.get("message_id")
         for url in links:
             request.app["worker"].enqueue(chat_id, url, original_message_id=message_id)
 
@@ -66,14 +65,14 @@ async def _on_startup(app: web.Application):
 
 def create_app() -> web.Application:
     app = web.Application()
-    app.router.add_post('/webhook/{token}', handle_webhook)
-    app.router.add_get('/health', health)
-    app.router.add_get('/metrics', metrics)
-    app['worker'] = WorkerPool(config.BOT_TOKEN, workers=config.WORKERS)
+    app.router.add_post("/webhook/{token}", handle_webhook)
+    app.router.add_get("/health", health)
+    app.router.add_get("/metrics", metrics)
+    app["worker"] = WorkerPool(config.BOT_TOKEN, workers=config.WORKERS)
     app.on_startup.append(_on_startup)
     return app
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     app = create_app()
     web.run_app(app, host=config.HOST, port=config.PORT)
