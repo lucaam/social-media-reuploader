@@ -34,3 +34,18 @@ repos:
         language: system
         pass_filenames: false
         stages: [pre-push]
+
+  - repo: local
+    hooks:
+      - id: commitlint
+        name: commitlint (Conventional Commits)
+        entry: scripts/commit-msg-fix.sh
+        language: script
+        pass_filenames: true
+        stages: [commit-msg]
+      - id: commitlint-pre-push
+        name: commitlint (pre-push)
+        entry: scripts/commitlint-pre-push.sh
+        language: script
+        pass_filenames: false
+        stages: [pre-push]

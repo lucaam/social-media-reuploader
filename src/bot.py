@@ -6,7 +6,7 @@ import re
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message, Update
 
-from . import config, db, http_client, telegram_api, telegram_client
+from . import __version__, config, db, http_client, telegram_api, telegram_client
 from .link_utils import find_links, is_supported
 from .worker import WorkerPool
 
@@ -293,6 +293,16 @@ async def main():
     if not config.BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not set in config")
 
+    # Print a concise startup banner for operators
+    try:
+        root_logger.info(
+            "Social Media Reuploader v%s starting — mode=polling workers=%s",
+            __version__,
+            config.WORKERS,
+        )
+    except Exception:
+        root_logger.info("Social Media Reuploader starting")
+
     bot = Bot(token=config.BOT_TOKEN)
     # register bot instance for reuse by helper APIs
     telegram_client.set_bot(bot)
@@ -331,6 +341,12 @@ async def main():
             await dp.stop_polling()
         except Exception:
             pass
+        # ensure workers finish before closing bots and http sessions
+        try:
+            if app_worker:
+                await app_worker.shutdown()
+        except Exception:
+            logger.debug("app_worker.shutdown() failed during bot shutdown")
         try:
             # close cached bot(s) and shared http session
             await telegram_client.close_all_bots()

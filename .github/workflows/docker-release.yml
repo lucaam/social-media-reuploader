@@ -65,29 +65,45 @@ jobs:
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.created=${{ github.event.release.published_at }}
 
-      - name: Make GHCR package public (org or user)
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const [owner, repo] = process.env.GITHUB_REPOSITORY.split('/');
-            const packageName = repo;
-            const packageType = 'container';
-            console.log(`Repository: ${process.env.GITHUB_REPOSITORY}, package: ${packageName}`);
-            try {
-              await github.request('PUT /orgs/{org}/packages/{package_type}/{package_name}/visibility', {
-                org: owner,
-                package_type: packageType,
-                package_name: packageName,
-                visibility: 'public'
-              });
-              console.log('GHCR package visibility set to public (org endpoint).');
-            } catch (err) {
-              console.log('Org endpoint failed, trying user endpoint:', err && err.message ? err.message : err);
-              await github.request('PUT /user/packages/{package_type}/{package_name}/visibility', {
-                package_type: packageType,
-                package_name: packageName,
-                visibility: 'public'
-              });
-              console.log('GHCR package visibility set to public (user endpoint).');
-            }
+      - name: Make GHCR package public (optional via GHCR_PAT)
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GHCR_PAT:-}" ]; then
+            printf 'GHCR_PAT not set — skipping automatic visibility change\n'
+            exit 0
+          fi
+          package_name="$REPO"
+          package_type="container"
+          printf 'Repository: %s, package: %s, owner: %s\n' "$GITHUB_REPOSITORY" "$package_name" "$OWNER"
+
+          # Try org endpoint first
+          resp=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+            -H "Authorization: Bearer $GHCR_PAT" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/orgs/${OWNER}/packages/${package_type}/${package_name}/visibility" \
+            -d '{"visibility":"public"}' || true)
+
+          if [ "$resp" = "200" ] || [ "$resp" = "201" ] || [ "$resp" = "204" ]; then
+            printf 'GHCR package visibility set to public (org endpoint).\n'
+            exit 0
+          fi
+
+          printf 'Org endpoint returned %s; trying user endpoint...\n' "$resp"
+
+          resp2=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+            -H "Authorization: Bearer $GHCR_PAT" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/user/packages/${package_type}/${package_name}/visibility" \
+            -d '{"visibility":"public"}' || true)
+
+          if [ "$resp2" = "200" ] || [ "$resp2" = "201" ] || [ "$resp2" = "204" ]; then
+            printf 'GHCR package visibility set to public (user endpoint).\n'
+            exit 0
+          fi
+
+          printf 'Failed to set GHCR package visibility: org=%s user=%s\n' "$resp" "$resp2"
+          printf 'This operation usually requires a personal access token (GHCR_PAT) with package write/admin privileges for the package owner.\nAdd a secret named GHCR_PAT and re-run the workflow to enable automatic visibility changes.\n'
