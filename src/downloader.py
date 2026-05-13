@@ -128,6 +128,18 @@ async def download(
                     logger.debug("Could not parse ffprobe output")
         except Exception:
             logger.debug("ffprobe execution failed")
+        # Log a concise ffprobe summary for debugging/diagnostics
+        try:
+            logger.info(
+                "ffprobe: has_video=%s has_audio=%s video_codec=%s audio_codec=%s format=%s",
+                has_video,
+                has_audio,
+                video_codec,
+                audio_codec,
+                fmt,
+            )
+        except Exception:
+            pass
 
     # If we have a video+audio file but codecs are not widely compatible (e.g. vp9/opus),
     # transcode to h264/aac MP4 for better client compatibility. If codecs are compatible
@@ -623,5 +635,10 @@ async def download(
         "compressed": compressed_flag,
         "original_size": orig_size,
         "final_size": size,
+        "has_video": has_video,
+        "has_audio": has_audio,
+        "video_codec": video_codec,
+        "audio_codec": audio_codec,
+        "format": fmt,
     }
     return latest, meta

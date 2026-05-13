@@ -3,7 +3,7 @@ import logging
 from aiohttp import web
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-from . import config, http_client, telegram_api, telegram_client
+from . import __version__, config, http_client, telegram_api, telegram_client
 from .link_utils import find_links
 from .worker import WorkerPool
 
@@ -63,16 +63,52 @@ async def _on_startup(app: web.Application):
             logger.exception("Failed to set webhook")
 
 
+async def _print_startup_banner(app: web.Application):
+    try:
+        logger.info(
+            "Social Media Reuploader v%s starting — mode=%s host=%s port=%s workers=%s",
+            __version__,
+            config.MODE,
+            config.HOST,
+            config.PORT,
+            config.WORKERS,
+        )
+    except Exception:
+        logger.info("Social Media Reuploader starting")
+
+
+async def _on_cleanup(app: web.Application):
+    # ensure worker tasks are shutdown before closing HTTP/bot clients
+    try:
+        worker = app.get("worker")
+        if worker:
+            try:
+                await worker.shutdown()
+            except Exception:
+                logger.debug("worker.shutdown() failed during cleanup")
+    except Exception:
+        logger.debug("Error while attempting worker shutdown")
+    try:
+        await http_client.close_session()
+    except Exception:
+        logger.debug("http_client.close_session failed during cleanup")
+    try:
+        await telegram_client.close_all_bots()
+    except Exception:
+        logger.debug("telegram_client.close_all_bots failed during cleanup")
+
+
 def create_app() -> web.Application:
     app = web.Application()
     app.router.add_post("/webhook/{token}", handle_webhook)
     app.router.add_get("/health", health)
     app.router.add_get("/metrics", metrics)
     app["worker"] = WorkerPool(config.BOT_TOKEN, workers=config.WORKERS)
+    # print a short banner on startup and register webhook if needed
+    app.on_startup.append(_print_startup_banner)
     app.on_startup.append(_on_startup)
-    # ensure shared resources are closed on cleanup
-    app.on_cleanup.append(http_client.close_session)
-    app.on_cleanup.append(telegram_client.close_all_bots)
+    # ensure worker tasks/shutdown happens before closing shared resources
+    app.on_cleanup.append(_on_cleanup)
     return app
 
 

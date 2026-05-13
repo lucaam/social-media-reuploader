@@ -5,6 +5,7 @@ import re
 import shutil
 import tempfile
 import time
+from asyncio.subprocess import PIPE
 
 from . import config, db, downloader, link_utils, metrics, telegram_api
 
@@ -15,6 +16,40 @@ class WorkerPool:
     def __init__(self, token: str, workers: int = 2):
         self.token = token
         self._sem = asyncio.Semaphore(workers)
+        # track running asyncio.Tasks so we can wait for them at shutdown
+        self._tasks = set()
+        self._closing = False
+
+    async def shutdown(self, timeout: int | None = None):
+        """Gracefully wait for currently running tasks to finish.
+
+        New enqueues are rejected once shutdown starts. Waits up to `timeout`
+        seconds (defaults to `config.WORKER_SHUTDOWN_TIMEOUT` or 30s) and then
+        cancels remaining tasks.
+        """
+        self._closing = True
+        if timeout is None:
+            timeout = getattr(config, "WORKER_SHUTDOWN_TIMEOUT", 30)
+        if not self._tasks:
+            return
+        try:
+            # make a snapshot to avoid mutation during wait
+            to_wait = set(self._tasks)
+            done, pending = await asyncio.wait(to_wait, timeout=timeout)
+            if pending:
+                logger.info(
+                    "WorkerPool.shutdown: cancelling %d pending tasks", len(pending)
+                )
+                for t in pending:
+                    try:
+                        t.cancel()
+                    except Exception:
+                        pass
+                await asyncio.gather(*pending, return_exceptions=True)
+        except Exception:
+            logger.exception("Exception while shutting down WorkerPool tasks")
+        finally:
+            self._tasks.clear()
 
     def enqueue(
         self,
@@ -57,11 +92,19 @@ class WorkerPool:
             logger.debug("Recorded request id=%s", request_id)
         except Exception:
             logger.exception("Failed to record request in DB")
-        asyncio.create_task(
+        if getattr(self, "_closing", False):
+            logger.warning(
+                "WorkerPool is shutting down — rejecting new enqueue for %s", url
+            )
+            return
+        task = asyncio.create_task(
             self._process_link(
                 chat_id, url, request_id, description, original_message_id, chat_type
             )
         )
+        # track task and ensure it's removed from the set when done
+        self._tasks.add(task)
+        task.add_done_callback(lambda t: self._tasks.discard(t))
 
     async def _process_link(
         self,
@@ -240,6 +283,97 @@ class WorkerPool:
                 size = os.path.getsize(file_path)
                 compressed = meta.get("compressed") if isinstance(meta, dict) else False
                 final_size = meta.get("final_size") if isinstance(meta, dict) else size
+                # If the downloaded file lacks a video stream but has an mp4 extension,
+                # attempt to add a minimal black video track so mobile clients can play it.
+                try:
+                    has_video = (
+                        meta.get("has_video") if isinstance(meta, dict) else True
+                    )
+                except Exception:
+                    has_video = True
+
+                if not has_video:
+                    logger.info(
+                        "Downloaded file appears to have no video stream; attempting wrapper for %s",
+                        file_path,
+                    )
+                    ffmpeg_bin = shutil.which("ffmpeg")
+                    if ffmpeg_bin:
+                        try:
+                            base = os.path.splitext(os.path.basename(file_path))[0]
+                            wrapper = os.path.join(
+                                os.path.dirname(file_path), f"{base}_withvideo.mp4"
+                            )
+                            ffmpeg_cmd = [
+                                ffmpeg_bin,
+                                "-y",
+                                "-f",
+                                "lavfi",
+                                "-i",
+                                "color=c=black:s=1280x720",
+                                "-i",
+                                file_path,
+                                "-c:v",
+                                "libx264",
+                                "-preset",
+                                "fast",
+                                "-crf",
+                                "23",
+                                "-c:a",
+                                "aac",
+                                "-b:a",
+                                "128k",
+                                "-shortest",
+                                "-movflags",
+                                "+faststart",
+                                wrapper,
+                            ]
+                            logger.info(
+                                "Running ffmpeg wrapper: %s", " ".join(ffmpeg_cmd)
+                            )
+                            pwrap = await asyncio.create_subprocess_exec(
+                                *ffmpeg_cmd, stdout=PIPE, stderr=PIPE
+                            )
+                            try:
+                                outw, errw = await asyncio.wait_for(
+                                    pwrap.communicate(), timeout=120
+                                )
+                            except asyncio.TimeoutError:
+                                pwrap.kill()
+                                await pwrap.communicate()
+                                logger.warning(
+                                    "ffmpeg wrapper timed out for %s", file_path
+                                )
+                            else:
+                                if pwrap.returncode == 0 and os.path.exists(wrapper):
+                                    file_path = wrapper
+                                    size = os.path.getsize(file_path)
+                                    final_size = size
+                                    logger.info(
+                                        "Created wrapper video %s (%d bytes)",
+                                        file_path,
+                                        size,
+                                    )
+                                else:
+                                    try:
+                                        errtxt = (
+                                            errw.decode(errors="ignore") if errw else ""
+                                        )
+                                    except Exception:
+                                        errtxt = ""
+                                    logger.warning(
+                                        "ffmpeg wrapper failed for %s: %s",
+                                        file_path,
+                                        errtxt[:1000],
+                                    )
+                        except Exception:
+                            logger.exception(
+                                "Exception while attempting ffmpeg wrapper"
+                            )
+                    else:
+                        logger.info(
+                            "ffmpeg not available; will send file as document (no video stream)"
+                        )
 
                 async def _maybe_notify_compression():
                     try:
