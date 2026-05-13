@@ -38,6 +38,12 @@ def init_db():
             message_id INTEGER,
             created_at TEXT
         )""")
+    try:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_processed_messages_chat_message ON processed_messages(chat_id, message_id)"
+        )
+    except Exception:
+        pass
     # ensure requests has optional telemetry/stat columns
     cols = [r[1] for r in conn.execute("PRAGMA table_info(requests)")]
     extra_cols = {
@@ -69,6 +75,24 @@ def init_db():
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_request_events_request_id ON request_events(request_id)"
         )
+    except Exception:
+        pass
+    # Migration: ensure request_events has the expected columns for older DBs
+    try:
+        existing = [r[1] for r in conn.execute("PRAGMA table_info(request_events)")]
+        needed = {
+            "event_type": "TEXT",
+            "details": "TEXT",
+            "duration_seconds": "REAL",
+        }
+        for col, col_type in needed.items():
+            if col not in existing:
+                try:
+                    conn.execute(
+                        f"ALTER TABLE request_events ADD COLUMN {col} {col_type}"
+                    )
+                except Exception:
+                    pass
     except Exception:
         pass
     # ensure requests has a description column for future use
@@ -414,12 +438,17 @@ def is_message_processed(chat_id: int, message_id: int) -> bool:
 def mark_message_processed(chat_id: int, message_id: int):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO processed_messages (chat_id, message_id, created_at) VALUES (?, ?, ?)",
-        (chat_id, message_id, datetime.datetime.utcnow().isoformat()),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        cur.execute(
+            "INSERT INTO processed_messages (chat_id, message_id, created_at) VALUES (?, ?, ?)",
+            (chat_id, message_id, datetime.datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # already present (deduplicated at DB level) — ignore
+        pass
+    finally:
+        conn.close()
 
 
 def count_updates() -> int:
