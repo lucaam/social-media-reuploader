@@ -39,7 +39,13 @@ repos:
     hooks:
       - id: commitlint
         name: commitlint (Conventional Commits)
-        entry: ./node_modules/.bin/commitlint --edit
-        language: system
-        pass_filenames: false
+        entry: scripts/commit-msg-fix.sh
+        language: script
+        pass_filenames: true
         stages: [commit-msg]
+      - id: commitlint-pre-push
+        name: commitlint (pre-push)
+        entry: scripts/commitlint-pre-push.sh
+        language: script
+        pass_filenames: false
+        stages: [pre-push]
