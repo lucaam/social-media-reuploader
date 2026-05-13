@@ -37,8 +37,6 @@ async def download(
         "--no-playlist",
         "-f",
         "bestvideo+bestaudio/best",
-        "--merge-output-format",
-        "mp4",
         "-o",
         out_template,
     ]
@@ -335,67 +333,8 @@ async def download(
                             )
                         except Exception:
                             logger.debug("Could not stat recoded file: %s", latest)
-    # if still audio-only, try ffmpeg to create a minimal video wrapper (black video + audio)
-    if ext in audio_exts:
-        try:
-            base = os.path.splitext(os.path.basename(latest))[0]
-            mp4_path = os.path.join(dest_dir, f"{base}_wrapped.mp4")
-            ffmpeg_cmd = [
-                ffmpeg_bin or "ffmpeg",
-                "-y",
-                "-f",
-                "lavfi",
-                "-i",
-                "color=c=black:s=640x360",
-                "-i",
-                latest,
-                "-c:v",
-                "libx264",
-                "-c:a",
-                "aac",
-                "-b:a",
-                "128k",
-                "-shortest",
-                "-movflags",
-                "+faststart",
-                mp4_path,
-            ]
-            proc3 = await asyncio.create_subprocess_exec(
-                *ffmpeg_cmd, stdout=PIPE, stderr=PIPE
-            )
-            try:
-                stdout3, stderr3 = await asyncio.wait_for(
-                    proc3.communicate(), timeout=timeout
-                )
-            except asyncio.TimeoutError:
-                proc3.kill()
-                await proc3.communicate()
-                logger.warning("ffmpeg conversion timed out")
-            else:
-                try:
-                    s3 = stdout3.decode(errors="ignore") if stdout3 else ""
-                except Exception:
-                    s3 = "<decoding error>"
-                try:
-                    e3 = stderr3.decode(errors="ignore") if stderr3 else ""
-                except Exception:
-                    e3 = "<decoding error>"
-                logger.debug("ffmpeg container stdout (truncated): %s", s3[:2000])
-                logger.debug("ffmpeg container stderr (truncated): %s", e3[:2000])
-                if proc3.returncode == 0 and os.path.exists(mp4_path):
-                    latest = mp4_path
-                    ext = "mp4"
-                    try:
-                        size = os.path.getsize(latest)
-                        logger.info(
-                            "After ffmpeg container, file: %s (%d bytes)", latest, size
-                        )
-                    except Exception:
-                        logger.debug("Could not stat ffmpeg container file: %s", latest)
-                else:
-                    logger.debug("ffmpeg failed: %s", e3)
-        except Exception:
-            logger.exception("ffmpeg conversion failed")
+    # NOTE: audio-only handling is done earlier (attempt wrapper/recode). Keep original audio
+    # when possible; no additional blanket wrapper here to avoid unnecessary aspect-ratio issues.
     # final size check: if too large, attempt recompression or redownload (see above)
     size = os.path.getsize(latest)
 
@@ -567,8 +506,6 @@ async def download(
                     "--no-playlist",
                     "-f",
                     fmt,
-                    "--merge-output-format",
-                    "mp4",
                     "-o",
                     out_template,
                     url,
