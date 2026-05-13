@@ -8,13 +8,16 @@ permissions:
   contents: read
   packages: write
 
+vars:
+  DOCKER_RELEASE_ALLOWED_AUTHOR: ${{ secrets.DOCKER_RELEASE_ALLOWED_AUTHOR }}
+
 jobs:
   build:
     # Run when the release author is the repository owner, an explicitly
     # allowed author (via `DOCKER_RELEASE_ALLOWED_AUTHOR`), or the
     # GitHub Actions bot (so automated releases from release-please still
     # trigger the docker build).
-    if: ${{ github.event.release.author.login == (secrets.DOCKER_RELEASE_ALLOWED_AUTHOR || github.repository_owner) || github.event.release.author.login == 'github-actions' || github.event.release.author.login == 'github-actions[bot]' }}
+    if: ${{ github.event.release.author.login == (vars.DOCKER_RELEASE_ALLOWED_AUTHOR || github.repository_owner) || github.event.release.author.login == 'github-actions' || github.event.release.author.login == 'github-actions[bot]' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

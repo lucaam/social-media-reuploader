@@ -12,4 +12,5 @@ spec:
       targetPort: {{ .Values.gui.port | default 8081 }}
   selector:
     app.kubernetes.io/instance: {{ .Release.Name }}
+    app.kubernetes.io/component: gui
 {{- end -}}

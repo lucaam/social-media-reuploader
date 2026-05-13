@@ -9,10 +9,12 @@ spec:
   selector:
     matchLabels:
       app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: bot
   template:
     metadata:
       labels:
 {{ include "social-media-reuploader.labels" . | nindent 6 }}
+      app.kubernetes.io/component: bot
     spec:
       serviceAccountName: '{{ if .Values.serviceAccount.name }}{{ .Values.serviceAccount.name }}{{ else if .Values.serviceAccount.create }}{{ include "social-media-reuploader.fullname" . }}-sa{{ else }}{{ "" }}{{ end }}'
       securityContext:
