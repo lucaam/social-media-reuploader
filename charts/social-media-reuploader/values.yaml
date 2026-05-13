@@ -1,5 +1,9 @@
 replicaCount: 1
 
+# Optional overrides
+nameOverride: ""
+fullnameOverride: ""
+
 serviceAccount:
   # If true, create a ServiceAccount for the deployment. If false, set `serviceAccount.name`
   create: true
@@ -10,6 +14,9 @@ image:
   repository: ghcr.io/lucaam/social-media-reuploader
   tag: latest
   pullPolicy: IfNotPresent
+
+# Optional imagePullSecrets for private registries
+imagePullSecrets: []
 
 service:
   type: ClusterIP
