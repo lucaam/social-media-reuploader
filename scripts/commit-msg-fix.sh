@@ -15,7 +15,7 @@ if [ -z "$MSGFILE" ] || [ ! -f "$MSGFILE" ]; then
   fi
 fi
 
-MAX=100
+MAX=120
 HEADER=$(sed -n '1p' "$MSGFILE" || true)
 LEN=${#HEADER}
 
