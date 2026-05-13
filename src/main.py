@@ -3,7 +3,7 @@ import logging
 from aiohttp import web
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
 
-from . import config, telegram_api
+from . import config, http_client, telegram_api, telegram_client
 from .link_utils import find_links
 from .worker import WorkerPool
 
@@ -70,6 +70,9 @@ def create_app() -> web.Application:
     app.router.add_get("/metrics", metrics)
     app["worker"] = WorkerPool(config.BOT_TOKEN, workers=config.WORKERS)
     app.on_startup.append(_on_startup)
+    # ensure shared resources are closed on cleanup
+    app.on_cleanup.append(http_client.close_session)
+    app.on_cleanup.append(telegram_client.close_all_bots)
     return app
 
 

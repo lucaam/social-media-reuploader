@@ -12,40 +12,38 @@ def init_db():
     if dirpath and not os.path.exists(dirpath):
         os.makedirs(dirpath, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS requests (
+    conn.execute("""CREATE TABLE IF NOT EXISTS requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id INTEGER,
             url TEXT,
             status TEXT,
             created_at TEXT
-        )"""
-    )
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS updates (
+        )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS updates (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             raw TEXT,
             created_at TEXT
-        )"""
-    )
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS users (
+        )""")
+    conn.execute("""CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT,
             email TEXT,
             role TEXT,
             created_at TEXT
-        )"""
-    )
+        )""")
     # processed messages dedup table
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS processed_messages (
+    conn.execute("""CREATE TABLE IF NOT EXISTS processed_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id INTEGER,
             message_id INTEGER,
             created_at TEXT
-        )"""
-    )
+        )""")
+    try:
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_processed_messages_chat_message ON processed_messages(chat_id, message_id)"
+        )
+    except Exception:
+        pass
     # ensure requests has optional telemetry/stat columns
     cols = [r[1] for r in conn.execute("PRAGMA table_info(requests)")]
     extra_cols = {
@@ -65,20 +63,36 @@ def init_db():
                 pass
 
     # per-request event log (compression/redownload durations, etc.)
-    conn.execute(
-        """CREATE TABLE IF NOT EXISTS request_events (
+    conn.execute("""CREATE TABLE IF NOT EXISTS request_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             request_id INTEGER,
             event_type TEXT,
             details TEXT,
             duration_seconds REAL,
             created_at TEXT
-        )"""
-    )
+        )""")
     try:
         conn.execute(
             "CREATE INDEX IF NOT EXISTS idx_request_events_request_id ON request_events(request_id)"
         )
+    except Exception:
+        pass
+    # Migration: ensure request_events has the expected columns for older DBs
+    try:
+        existing = [r[1] for r in conn.execute("PRAGMA table_info(request_events)")]
+        needed = {
+            "event_type": "TEXT",
+            "details": "TEXT",
+            "duration_seconds": "REAL",
+        }
+        for col, col_type in needed.items():
+            if col not in existing:
+                try:
+                    conn.execute(
+                        f"ALTER TABLE request_events ADD COLUMN {col} {col_type}"
+                    )
+                except Exception:
+                    pass
     except Exception:
         pass
     # ensure requests has a description column for future use
@@ -424,12 +438,17 @@ def is_message_processed(chat_id: int, message_id: int) -> bool:
 def mark_message_processed(chat_id: int, message_id: int):
     conn = sqlite3.connect(DB_PATH)
     cur = conn.cursor()
-    cur.execute(
-        "INSERT INTO processed_messages (chat_id, message_id, created_at) VALUES (?, ?, ?)",
-        (chat_id, message_id, datetime.datetime.utcnow().isoformat()),
-    )
-    conn.commit()
-    conn.close()
+    try:
+        cur.execute(
+            "INSERT INTO processed_messages (chat_id, message_id, created_at) VALUES (?, ?, ?)",
+            (chat_id, message_id, datetime.datetime.utcnow().isoformat()),
+        )
+        conn.commit()
+    except sqlite3.IntegrityError:
+        # already present (deduplicated at DB level) — ignore
+        pass
+    finally:
+        conn.close()
 
 
 def count_updates() -> int:

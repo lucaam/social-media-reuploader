@@ -344,7 +344,9 @@ class WorkerPool:
                                         pass
                                     # update status to indicate success
                                     try:
-                                        await edit_status(f"✅ done — {_mb(final_size)}")
+                                        await edit_status(
+                                            f"✅ done — {_mb(final_size)}"
+                                        )
                                     except Exception:
                                         pass
                             except Exception:
