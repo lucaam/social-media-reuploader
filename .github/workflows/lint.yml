@@ -1,0 +1,99 @@
+name: Lint and Static Checks (conditional)
+
+on:
+  pull_request:
+  push:
+    branches: [ main ]
+
+jobs:
+  filter:
+    name: Determine changed areas
+    runs-on: ubuntu-latest
+    outputs:
+      python: ${{ steps.filter.outputs.python }}
+      helm: ${{ steps.filter.outputs.helm }}
+      workflows: ${{ steps.filter.outputs.workflows }}
+      docs: ${{ steps.filter.outputs.docs }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Filter changes
+        id: filter
+        uses: dorny/paths-filter@v4.0.1
+        with:
+          filters: |
+            python:
+              - 'src/**'
+              - 'tests/**'
+              - 'requirements*.txt'
+              - '.pre-commit-config.yaml'
+              - 'pyproject.toml'
+              - 'setup.cfg'
+              - 'setup.py'
+              - 'requirements-dev.txt'
+            helm:
+              - 'charts/**'
+            workflows:
+              - '.github/workflows/**'
+            docs:
+              - 'docs/**'
+
+  python-lint:
+    name: Python linters
+    needs: filter
+    if: needs.filter.outputs.python == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v6.2.0
+        with:
+          python-version: '3.12'
+
+      - name: Install dev dependencies
+        run: pip install -r requirements-dev.txt
+
+      - name: Ruff (static analysis)
+        run: |
+          ruff check .
+
+      - name: Black check (format)
+        run: |
+          black --check .
+
+      - name: isort check (imports)
+        run: |
+          isort --check-only .
+
+      - name: Pre-commit hooks (all)
+        run: |
+          pre-commit run --all-files
+
+  helm-lint:
+    name: Helm chart lint
+    needs: filter
+    if: needs.filter.outputs.helm == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Helm
+        uses: azure/setup-helm@v3
+
+      - name: Helm lint chart
+        run: |
+          helm lint charts/social-media-reuploader
+
+  workflows-lint:
+    name: GitHub Actions linter (actionlint)
+    needs: filter
+    if: needs.filter.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run actionlint
+        run: |
+          curl -sSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash | bash -s -- latest /tmp
+          /tmp/actionlint .github/workflows/*.yml || exit 1

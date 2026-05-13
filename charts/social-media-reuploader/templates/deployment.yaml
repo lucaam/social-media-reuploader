@@ -2,15 +2,19 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: {{ include "social-media-reuploader.fullname" . | default "social-media-reuploader" }}
+  labels:
+{{ include "social-media-reuploader.labels" . | nindent 4 }}
 spec:
   replicas: {{ .Values.replicaCount }}
   selector:
     matchLabels:
-      app: {{ include "social-media-reuploader.name" . | default "social-media-reuploader" }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: bot
   template:
     metadata:
       labels:
-        app: {{ include "social-media-reuploader.name" . | default "social-media-reuploader" }}
+{{ include "social-media-reuploader.labels" . | nindent 8 }}
+        app.kubernetes.io/component: bot
     spec:
       serviceAccountName: '{{ if .Values.serviceAccount.name }}{{ .Values.serviceAccount.name }}{{ else if .Values.serviceAccount.create }}{{ include "social-media-reuploader.fullname" . }}-sa{{ else }}{{ "" }}{{ end }}'
       securityContext:
@@ -28,11 +32,18 @@ spec:
           ports:
             - containerPort: 8080
           env:
+{{- if or .Values.secret.create .Values.secret.name }}
             - name: BOT_TOKEN
               valueFrom:
                 secretKeyRef:
                   name: {{ if .Values.secret.name }}{{ .Values.secret.name }}{{ else }}{{ include "social-media-reuploader.fullname" . }}-secret{{ end }}
                   key: {{ default "BOT_TOKEN" .Values.secret.botTokenKey }}
+{{- else if .Values.env.BOT_TOKEN }}
+            - name: BOT_TOKEN
+              value: {{ .Values.env.BOT_TOKEN | quote }}
+{{- else }}
+            # No BOT_TOKEN provided. Provide a Secret (recommended) or set `env.BOT_TOKEN` when installing the chart.
+{{- end }}
             - name: MODE
               value: '{{ .Values.env.MODE | default "webhook" }}'
             - name: WEBHOOK_URL
