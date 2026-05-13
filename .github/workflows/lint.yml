@@ -96,4 +96,4 @@ jobs:
       - name: Run actionlint
         run: |
           curl -sSL https://raw.githubusercontent.com/rhysd/actionlint/main/scripts/download-actionlint.bash | bash -s -- latest /tmp
-          /tmp/actionlint .github/workflows || exit 1
+          /tmp/actionlint .github/workflows/*.yml || exit 1

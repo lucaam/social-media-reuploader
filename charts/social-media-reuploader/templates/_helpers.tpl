@@ -21,5 +21,5 @@
     "app.kubernetes.io/managed-by" .Release.Service
     "helm.sh/chart" (printf "%s-%s" .Chart.Name .Chart.Version)
   -}}
-{{- toYaml $labels -}}
+{{ toYaml $labels }}
 {{- end -}}
