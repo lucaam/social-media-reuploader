@@ -36,3 +36,25 @@ GitHub Actions & GHCR
 See the documentation for publishing and required Actions secrets: [docs/ghcr.md](docs/ghcr.md).
 
 Nota: questo scaffold usa `yt-dlp` per il download; verifica limiti e policy di Telegram prima dell'uso in produzione.
+
+Developer setup — pre-commit & linters
+------------------------------------
+
+Per uno sviluppo coerente e per riprodurre i controlli eseguiti in CI, installa le dipendenze di sviluppo e configura `pre-commit`:
+
+```bash
+python -m pip install -r requirements-dev.txt
+pre-commit install
+pre-commit install --hook-type pre-push
+```
+
+Questo installerà i hook locali che eseguono controlli `ruff`, `black`, `isort` al commit e `pytest` al pre-push. In CI gli stessi controlli vengono eseguiti dal workflow `ci.yml` e dal workflow `lint.yml`.
+
+Se vuoi solo eseguire i controlli manualmente:
+
+```bash
+pre-commit run --all-files
+pytest -q
+```
+
+Nota: i comandi sopra assumono che le dipendenze di sviluppo (ruff, black, isort, pre-commit) siano installate (vedi `requirements-dev.txt`).
