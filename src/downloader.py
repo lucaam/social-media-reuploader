@@ -165,7 +165,7 @@ async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optio
                 logger.exception("Transcoding failed")
         else:
             # compatible codecs: remux to MP4 if not already MP4 to improve playback (faststart)
-                    if fmt and "mp4" not in fmt:
+            if fmt and "mp4" not in fmt:
                 try:
                     base = os.path.splitext(os.path.basename(latest))[0]
                     remux_path = os.path.join(dest_dir, f"{base}_remuxed.mp4")
