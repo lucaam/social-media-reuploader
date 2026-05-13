@@ -10,10 +10,11 @@ permissions:
 
 jobs:
   build:
-    # Run only when the release author is the repository owner (or an explicitly
-    # allowed author). To override, set the repository secret
-    # `DOCKER_RELEASE_ALLOWED_AUTHOR` to your GitHub username.
-    if: ${{ github.event.release.author.login == (secrets.DOCKER_RELEASE_ALLOWED_AUTHOR || github.repository_owner) }}
+    # Run when the release author is the repository owner, an explicitly
+    # allowed author (via `DOCKER_RELEASE_ALLOWED_AUTHOR`), or the
+    # GitHub Actions bot (so automated releases from release-please still
+    # trigger the docker build).
+    if: ${{ github.event.release.author.login == (secrets.DOCKER_RELEASE_ALLOWED_AUTHOR || github.repository_owner) || github.event.release.author.login == 'github-actions' || github.event.release.author.login == 'github-actions[bot]' }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
