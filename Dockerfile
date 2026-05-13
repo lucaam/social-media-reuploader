@@ -3,6 +3,7 @@ FROM python:3.12-slim
 ARG VCS_REF=""
 ARG BUILD_DATE=""
 ARG VERSION="0.1.0"
+ARG DEBIAN_FRONTEND=noninteractive
 
 LABEL org.opencontainers.image.title="social-media-reuploader" \
 	org.opencontainers.image.description="Telegram bot that downloads video content from YouTube, TikTok, Instagram and Facebook and posts it back to the chat" \
@@ -17,8 +18,14 @@ WORKDIR /app
 
 # Install minimal runtime packages (ffmpeg) and Python requirements
 COPY requirements.txt ./
+ENV DEBIAN_FRONTEND=noninteractive
+ENV TZ=Etc/UTC
 RUN apt-get update \
-	&& apt-get install -y --no-install-recommends ffmpeg ca-certificates \
+	&& apt-get install -y --no-install-recommends \
+		ffmpeg \
+		ca-certificates \
+	-o Dpkg::Options::="--force-confdef" \
+	-o Dpkg::Options::="--force-confold" \
 	&& rm -rf /var/lib/apt/lists/* \
 	&& python -m pip install --no-cache-dir -r requirements.txt
 
