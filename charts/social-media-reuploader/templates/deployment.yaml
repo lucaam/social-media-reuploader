@@ -11,9 +11,9 @@ spec:
       app.kubernetes.io/instance: {{ .Release.Name }}
       app.kubernetes.io/component: bot
   template:
-        metadata:
+    metadata:
       labels:
-    {{ include "social-media-reuploader.labels" . | nindent 8 }}
+{{ include "social-media-reuploader.labels" . | nindent 8 }}
         app.kubernetes.io/component: bot
     spec:
       serviceAccountName: '{{ if .Values.serviceAccount.name }}{{ .Values.serviceAccount.name }}{{ else if .Values.serviceAccount.create }}{{ include "social-media-reuploader.fullname" . }}-sa{{ else }}{{ "" }}{{ end }}'
