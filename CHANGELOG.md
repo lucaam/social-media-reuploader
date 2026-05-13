@@ -11,6 +11,27 @@ All notable changes to this project are documented in this file.
 - Improve robustness in `telegram_api` to reuse sessions and handle fallbacks
 
 
+## [v0.2.2](https://github.com/lucaam/social-media-reuploader/compare/v0.2.1...v0.2.2) (2026-05-13)
+
+### Bug Fixes
+
+* trigger release-please (#13) [1042c9d]
+
+
+### Chores
+
+* release 0.2.2 (#14) [7764498]
+
+* add prepare_release script and release guide (#12) [0807a2a]
+
+* release-please v5 + Dockerfile noninteractive fixes (#10) [930698c]
+
+
+### CI
+
+* ensure release-please publishes GitHub releases (skip-github-release: false) (#11) [d77acb8]
+
+
 ## [v0.2.1](https://github.com/lucaam/social-media-reuploader/compare/v0.2.0...v0.2.1) (2026-05-13)
 
 ### Chores
