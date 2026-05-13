@@ -1,18 +1,18 @@
 import asyncio
 import logging
 import os
+import re
 
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message, Update
 
 from .link_utils import find_links, is_supported
 from . import telegram_api
-import re
-
-TELEGRAM_URL_RE = re.compile(r'https?://(?:t\.me|telegram\.me)/', re.IGNORECASE)
 from .worker import WorkerPool
 from . import config
 from . import db
+
+TELEGRAM_URL_RE = re.compile(r'https?://(?:t\.me|telegram\.me)/', re.IGNORECASE)
 
 logger = logging.getLogger(__name__)
 
@@ -82,10 +82,10 @@ async def handle_message(message: Message):
         if links:
             seen = set()
             deduped = []
-            for l in links:
-                if l not in seen:
-                    seen.add(l)
-                    deduped.append(l)
+            for link in links:
+                if link not in seen:
+                    seen.add(link)
+                    deduped.append(link)
             links = deduped
 
         # also detect any other http(s) URLs so we can handle unsupported sites
@@ -114,8 +114,8 @@ async def handle_message(message: Message):
             description = ''
             try:
                 description = text or ''
-                for l in (links or all_urls):
-                    description = description.replace(l, '')
+                for link in (links or all_urls):
+                    description = description.replace(link, '')
                 description = description.strip()
             except Exception:
                 description = ''
