@@ -1,5 +1,16 @@
 # Changelog
 
+All notable changes to this project are documented in this file.
+
+## Unreleased
+
+- Bump runtime dependencies to recent releases (aiohttp, aiogram, yt-dlp, fastapi, uvicorn, websockets, prometheus-client, etc.)
+- Introduce shared `aiohttp` ClientSession and cached `aiogram.Bot` instance for performance and reduced connection churn
+- Update pre-commit configuration and dev tools (`black`, `ruff`) and apply formatting
+- Fix Helm chart indentation and CI workflow issues; ensure `helm lint` passes
+- Improve robustness in `telegram_api` to reuse sessions and handle fallbacks
+# Changelog
+
 ## [0.2.0](https://github.com/lucaam/social-media-reuploader/compare/0.1.0...v0.2.0) (2026-05-12)
 
 
