@@ -1,0 +1,46 @@
+name: PR Docker build (test)
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened]
+    paths:
+      - 'Dockerfile'
+      - 'src/**'
+      - 'charts/**'
+      - 'requirements*.txt'
+      - 'package.json'
+      - 'scripts/**'
+      - '.github/workflows/**'
+      - 'pyproject.toml'
+      - 'Pipfile'
+      - 'setup.cfg'
+      - 'setup.py'
+
+jobs:
+  build:
+    name: Build Docker image (test)
+    runs-on: ubuntu-latest
+    concurrency:
+      group: pr-docker-build-${{ github.event.pull_request.number }}
+      cancel-in-progress: true
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Build (no push)
+        uses: docker/build-push-action@v4
+        with:
+          context: .
+          file: ./Dockerfile
+          push: false
+          load: true
+          tags: pr-${{ github.event.pull_request.number }}:${{ github.sha }}
