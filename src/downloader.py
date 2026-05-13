@@ -4,6 +4,7 @@ import glob
 import logging
 import sys
 import shutil
+import json
 from asyncio.subprocess import PIPE
 from typing import Optional
 
@@ -78,44 +79,189 @@ async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optio
     except Exception:
         orig_size = None
         logger.debug("Could not stat downloaded file: %s", latest)
-    # if yt-dlp returned an audio-only file (e.g. .m4a) try a recode fallback
+
+    # inspect file/container/codec info when possible and prefer preserving original
     audio_exts = {"m4a", "mp3", "aac", "wav", "ogg", "opus"}
     ext = os.path.splitext(latest)[1].lower().lstrip('.')
-    if ext in audio_exts:
-        logger.info("Downloaded audio-only file (%s). Attempting recode to mp4 container for Telegram compatibility.", ext)
-        # attempt a single recode attempt to mp4 (requires ffmpeg)
-        if yt_dlp_bin:
-            recode_cmd = [yt_dlp_bin, "--no-playlist", "--recode-video", "mp4", "-o", out_template, url]
-        else:
-            recode_cmd = [sys.executable, "-m", "yt_dlp", "--no-playlist", "--recode-video", "mp4", "-o", out_template, url]
-        logger.debug("Running recode command: %s", " ".join(recode_cmd))
-        proc2 = await asyncio.create_subprocess_exec(*recode_cmd, stdout=PIPE, stderr=PIPE)
+
+    ffmpeg_bin = shutil.which("ffmpeg")
+    ffprobe_bin = shutil.which("ffprobe")
+    fmt = ""
+    video_codec = None
+    audio_codec = None
+    has_video = False
+    has_audio = False
+    if ffprobe_bin:
         try:
-            stdout2, stderr2 = await asyncio.wait_for(proc2.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            proc2.kill()
-            await proc2.communicate()
-            logger.warning("Recode attempt timed out")
-        else:
-            try:
-                s2 = stdout2.decode(errors='ignore') if stdout2 else ''
-            except Exception:
-                s2 = '<decoding error>'
-            try:
-                e2 = stderr2.decode(errors='ignore') if stderr2 else ''
-            except Exception:
-                e2 = '<decoding error>'
-            logger.debug("recode stdout (truncated): %s", s2[:2000])
-            logger.debug("recode stderr (truncated): %s", e2[:2000])
-            if proc2.returncode == 0:
-                files = glob.glob(os.path.join(dest_dir, "*"))
-                latest = max(files, key=os.path.getmtime)
-                ext = os.path.splitext(latest)[1].lower().lstrip('.')
+            p = await asyncio.create_subprocess_exec(ffprobe_bin, "-v", "error", "-print_format", "json", "-show_streams", "-show_format", latest, stdout=PIPE, stderr=PIPE)
+            outp, errp = await p.communicate()
+            if outp:
                 try:
-                    size = os.path.getsize(latest)
-                    logger.info("After recode, file: %s (%d bytes)", latest, size)
+                    info = json.loads(outp)
+                    streams = info.get("streams", [])
+                    fmt = info.get("format", {}).get("format_name", "") or ""
+                    for s in streams:
+                        if s.get("codec_type") == "video":
+                            has_video = True
+                            video_codec = s.get("codec_name")
+                        elif s.get("codec_type") == "audio":
+                            has_audio = True
+                            audio_codec = s.get("codec_name")
                 except Exception:
-                    logger.debug("Could not stat recoded file: %s", latest)
+                    logger.debug("Could not parse ffprobe output")
+        except Exception:
+            logger.debug("ffprobe execution failed")
+
+    # If we have a video+audio file but codecs are not widely compatible (e.g. vp9/opus),
+    # transcode to h264/aac MP4 for better client compatibility. If codecs are compatible
+    # but container is not MP4, remux to MP4 with faststart.
+    if has_video and has_audio and ffmpeg_bin:
+        preferred_video = ("h264", "mpeg4")
+        preferred_audio = ("aac", "mp3", "mp4a")
+        incompatible = False
+        if (video_codec and video_codec not in preferred_video) or (audio_codec and audio_codec not in preferred_audio):
+            incompatible = True
+        if incompatible:
+            try:
+                base = os.path.splitext(os.path.basename(latest))[0]
+                trans_path = os.path.join(dest_dir, f"{base}.mp4")
+                ffmpeg_cmd = [
+                    ffmpeg_bin,
+                    "-y",
+                    "-i",
+                    latest,
+                    "-c:v",
+                    "libx264",
+                    "-preset",
+                    "fast",
+                    "-crf",
+                    "23",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "128k",
+                    "-movflags",
+                    "+faststart",
+                    trans_path,
+                ]
+                logger.info("Transcoding %s to mp4/h264 for compatibility", latest)
+                proc4 = await asyncio.create_subprocess_exec(*ffmpeg_cmd, stdout=PIPE, stderr=PIPE)
+                try:
+                    out4, err4 = await asyncio.wait_for(proc4.communicate(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    proc4.kill()
+                    await proc4.communicate()
+                    logger.warning("ffmpeg transcode timed out")
+                else:
+                    if proc4.returncode == 0 and os.path.exists(trans_path):
+                        latest = trans_path
+                        ext = "mp4"
+                        try:
+                            size = os.path.getsize(latest)
+                            logger.info("Transcoded file: %s (%d bytes)", latest, size)
+                        except Exception:
+                            logger.debug("Could not stat transcoded file: %s", latest)
+            except Exception:
+                logger.exception("Transcoding failed")
+        else:
+            # compatible codecs: remux to MP4 if not already MP4 to improve playback (faststart)
+            if fmt and "mp4" not in fmt:
+                try:
+                    base = os.path.splitext(os.path.basename(latest))[0]
+                    remux_path = os.path.join(dest_dir, f"{base}.mp4")
+                    ffmpeg_cmd = [ffmpeg_bin, "-y", "-i", latest, "-c", "copy", "-movflags", "+faststart", remux_path]
+                    logger.info("Remuxing %s to mp4 container", latest)
+                    proc5 = await asyncio.create_subprocess_exec(*ffmpeg_cmd, stdout=PIPE, stderr=PIPE)
+                    try:
+                        out5, err5 = await asyncio.wait_for(proc5.communicate(), timeout=timeout)
+                    except asyncio.TimeoutError:
+                        proc5.kill()
+                        await proc5.communicate()
+                        logger.warning("ffmpeg remux timed out")
+                    else:
+                        if proc5.returncode == 0 and os.path.exists(remux_path):
+                            latest = remux_path
+                            ext = "mp4"
+                            try:
+                                size = os.path.getsize(latest)
+                                logger.info("Remuxed file: %s (%d bytes)", latest, size)
+                            except Exception:
+                                logger.debug("Could not stat remuxed file: %s", latest)
+                except Exception:
+                    logger.exception("Remux failed")
+
+    # if yt-dlp returned an audio-only file (e.g. .m4a) try to package it into mp4 for Telegram
+    if ext in audio_exts:
+        logger.info("Downloaded audio-only file (%s). Attempting to wrap into mp4 for Telegram compatibility.", ext)
+        # prefer ffmpeg wrapper (black video) if available
+        if ffmpeg_bin:
+            try:
+                base = os.path.splitext(os.path.basename(latest))[0]
+                mp4_path = os.path.join(dest_dir, f"{base}.mp4")
+                ffmpeg_cmd = [
+                    ffmpeg_bin,
+                    "-y",
+                    "-f",
+                    "lavfi",
+                    "-i",
+                    "color=c=black:s=640x360",
+                    "-i",
+                    latest,
+                    "-c:v",
+                    "libx264",
+                    "-c:a",
+                    "aac",
+                    "-b:a",
+                    "128k",
+                    "-shortest",
+                    "-movflags",
+                    "+faststart",
+                    mp4_path,
+                ]
+                proc3 = await asyncio.create_subprocess_exec(*ffmpeg_cmd, stdout=PIPE, stderr=PIPE)
+                try:
+                    stdout3, stderr3 = await asyncio.wait_for(proc3.communicate(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    proc3.kill()
+                    await proc3.communicate()
+                    logger.warning("ffmpeg conversion timed out")
+                else:
+                    if proc3.returncode == 0 and os.path.exists(mp4_path):
+                        latest = mp4_path
+                        ext = "mp4"
+                        try:
+                            size = os.path.getsize(latest)
+                            logger.info("After ffmpeg wrapper, file: %s (%d bytes)", latest, size)
+                        except Exception:
+                            logger.debug("Could not stat ffmpeg wrapper file: %s", latest)
+            except Exception:
+                logger.exception("ffmpeg wrapper failed")
+        else:
+            # fallback: attempt a single recode with yt-dlp if available
+            if yt_dlp_bin:
+                logger.info("ffmpeg not available; attempting yt-dlp recode to mp4")
+                if yt_dlp_bin:
+                    recode_cmd = [yt_dlp_bin, "--no-playlist", "--recode-video", "mp4", "-o", out_template, url]
+                else:
+                    recode_cmd = [sys.executable, "-m", "yt_dlp", "--no-playlist", "--recode-video", "mp4", "-o", out_template, url]
+                logger.debug("Running recode command: %s", " ".join(recode_cmd))
+                proc2 = await asyncio.create_subprocess_exec(*recode_cmd, stdout=PIPE, stderr=PIPE)
+                try:
+                    stdout2, stderr2 = await asyncio.wait_for(proc2.communicate(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    proc2.kill()
+                    await proc2.communicate()
+                    logger.warning("Recode attempt timed out")
+                else:
+                    if proc2.returncode == 0:
+                        files = glob.glob(os.path.join(dest_dir, "*"))
+                        latest = max(files, key=os.path.getmtime)
+                        ext = os.path.splitext(latest)[1].lower().lstrip('.')
+                        try:
+                            size = os.path.getsize(latest)
+                            logger.info("After recode, file: %s (%d bytes)", latest, size)
+                        except Exception:
+                            logger.debug("Could not stat recoded file: %s", latest)
     # if still audio-only, try ffmpeg to create a minimal video wrapper (black video + audio)
     if ext in audio_exts:
         try:
