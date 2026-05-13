@@ -53,7 +53,7 @@ resourceProfiles:
     limits:
       cpu: 1000m
       memory: 1Gi
-    terminationGracePeriodSeconds: 120
+    terminationGracePeriodSeconds: 180
 
   large:
     # For videos ≤500MB (heavy processing, multiple compress attempts)
