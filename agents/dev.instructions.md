@@ -28,4 +28,3 @@ Obiettivo: riprendere lo sviluppo delle funzionalità del bot social-media-reupl
    Replace the remote URL with the target if different. The agent should NOT push
    without user confirmation.
 4. Convenzioni commit: usa Conventional Commits (es. `feat:`, `fix:`, `chore:`).
-

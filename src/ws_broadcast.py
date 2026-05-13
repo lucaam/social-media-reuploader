@@ -1,6 +1,6 @@
 import asyncio
 import logging
-from typing import Set, Optional
+from typing import Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -9,14 +9,17 @@ loop: Optional[asyncio.AbstractEventLoop] = None
 
 _connections: Set[asyncio.Queue] = set()
 
+
 async def register_queue(q: asyncio.Queue):
     _connections.add(q)
+
 
 async def unregister_queue(q: asyncio.Queue):
     try:
         _connections.remove(q)
     except KeyError:
         pass
+
 
 async def broadcast(message: dict):
     if not _connections:
@@ -36,6 +39,7 @@ async def broadcast(message: dict):
         except Exception:
             pass
 
+
 # helper for sync callers
 def publish_sync(message: dict):
     global loop
@@ -44,4 +48,3 @@ def publish_sync(message: dict):
             asyncio.run_coroutine_threadsafe(broadcast(message), loop)
         except Exception:
             logger.exception("publish_sync failed")
- 
