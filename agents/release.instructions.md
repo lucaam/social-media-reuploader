@@ -11,5 +11,5 @@ Checklist for a release:
 
 Suggested prompts:
 
-- "Prepare a release PR for v0.1.1 with changelog and chart bump." 
-- "Generate GitHub Actions workflow to build and push GHCR image on release." 
+- "Prepare a release PR for v0.1.1 with changelog and chart bump."
+- "Generate GitHub Actions workflow to build and push GHCR image on release."

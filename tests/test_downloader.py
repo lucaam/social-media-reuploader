@@ -31,7 +31,9 @@ def test_download_success_monkeypatched(tmp_path, monkeypatch, size):
     monkeypatch.setattr(asyncio, "create_subprocess_exec", fake_create)
     monkeypatch.setattr(shutil, "which", lambda name: None)
 
-    latest, meta = asyncio.run(download("http://example.com/video", str(dest_dir), timeout=2))
+    latest, meta = asyncio.run(
+        download("http://example.com/video", str(dest_dir), timeout=2)
+    )
 
     assert os.path.basename(latest) == "video123.mp4"
     assert meta["final_size"] == file_path.stat().st_size

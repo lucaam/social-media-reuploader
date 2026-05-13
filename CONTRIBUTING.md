@@ -7,7 +7,7 @@ Usa il formato Conventional Commits per i messaggi di commit, esempi:
 
 - `feat: aggiungi supporto per reels` — un nuovo feature -> incrementa MINOR
 - `fix: correggi parsing link` — bugfix -> incrementa PATCH
-- `perf: ottimizza download` 
+- `perf: ottimizza download`
 - `docs: aggiorna README`
 - `chore: aggiornamenti di build`
 - `refactor: ristruttura codice senza cambiare behavior`
@@ -82,4 +82,3 @@ pytest -q
 export BOT_TOKEN="<token>"
 python -m src.main
 ```
-

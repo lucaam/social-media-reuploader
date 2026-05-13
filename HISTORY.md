@@ -14,4 +14,3 @@ Questo file traccia le tappe principali del progetto in modo che sia facile ripr
 - Aggiungere fallback S3/MinIO per file grandi.
 - Aggiungere integrazione `aiogram` o alternativa per gestire limiti avanzati.
 - Raffinare gestione errori e policy anti-abuse.
-

@@ -44,7 +44,7 @@ resourceProfiles:
       cpu: 300m
       memory: 512Mi
     terminationGracePeriodSeconds: 60
-  
+
   medium:
     # For videos ≤100MB (standard processing + recompress)
     requests:
@@ -54,7 +54,7 @@ resourceProfiles:
       cpu: 1000m
       memory: 1Gi
     terminationGracePeriodSeconds: 120
-  
+
   large:
     # For videos ≤500MB (heavy processing, multiple compress attempts)
     requests:

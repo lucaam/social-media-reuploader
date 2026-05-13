@@ -1,10 +1,10 @@
 import asyncio
-import os
 import glob
-import logging
-import sys
-import shutil
 import json
+import logging
+import os
+import shutil
+import sys
 from asyncio.subprocess import PIPE
 from typing import Optional
 
@@ -13,7 +13,13 @@ from . import config
 logger = logging.getLogger(__name__)
 
 
-async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optional[int] = None, notify=None) -> (str, dict):
+async def download(
+    url: str,
+    dest_dir: str,
+    timeout: int = 300,
+    max_bytes: Optional[int] = None,
+    notify=None,
+) -> (str, dict):
     """
     Download a media resource using yt-dlp to `dest_dir` and return the downloaded file path.
     If `max_bytes` is provided, pass it to yt-dlp as `--max-filesize` to abort early when possible.
@@ -52,13 +58,13 @@ async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optio
 
     # log subprocess output (truncated) for debugging
     try:
-        stdout_str = stdout.decode(errors='ignore') if stdout else ''
+        stdout_str = stdout.decode(errors="ignore") if stdout else ""
     except Exception:
-        stdout_str = '<decoding error>'
+        stdout_str = "<decoding error>"
     try:
-        stderr_str = stderr.decode(errors='ignore') if stderr else ''
+        stderr_str = stderr.decode(errors="ignore") if stderr else ""
     except Exception:
-        stderr_str = '<decoding error>'
+        stderr_str = "<decoding error>"
     logger.debug("yt-dlp stdout (truncated): %s", stdout_str[:2000])
     logger.debug("yt-dlp stderr (truncated): %s", stderr_str[:2000])
 
@@ -82,7 +88,7 @@ async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optio
 
     # inspect file/container/codec info when possible and prefer preserving original
     audio_exts = {"m4a", "mp3", "aac", "wav", "ogg", "opus"}
-    ext = os.path.splitext(latest)[1].lower().lstrip('.')
+    ext = os.path.splitext(latest)[1].lower().lstrip(".")
 
     ffmpeg_bin = shutil.which("ffmpeg")
     ffprobe_bin = shutil.which("ffprobe")
@@ -93,7 +99,18 @@ async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optio
     has_audio = False
     if ffprobe_bin:
         try:
-            p = await asyncio.create_subprocess_exec(ffprobe_bin, "-v", "error", "-print_format", "json", "-show_streams", "-show_format", latest, stdout=PIPE, stderr=PIPE)
+            p = await asyncio.create_subprocess_exec(
+                ffprobe_bin,
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_streams",
+                "-show_format",
+                latest,
+                stdout=PIPE,
+                stderr=PIPE,
+            )
             outp, errp = await p.communicate()
             if outp:
                 try:
@@ -119,7 +136,9 @@ async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optio
         preferred_video = ("h264", "mpeg4")
         preferred_audio = ("aac", "mp3", "mp4a")
         incompatible = False
-        if (video_codec and video_codec not in preferred_video) or (audio_codec and audio_codec not in preferred_audio):
+        if (video_codec and video_codec not in preferred_video) or (
+            audio_codec and audio_codec not in preferred_audio
+        ):
             incompatible = True
         if incompatible:
             try:
@@ -145,9 +164,13 @@ async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optio
                     trans_path,
                 ]
                 logger.info("Transcoding %s to mp4/h264 for compatibility", latest)
-                proc4 = await asyncio.create_subprocess_exec(*ffmpeg_cmd, stdout=PIPE, stderr=PIPE)
+                proc4 = await asyncio.create_subprocess_exec(
+                    *ffmpeg_cmd, stdout=PIPE, stderr=PIPE
+                )
                 try:
-                    out4, err4 = await asyncio.wait_for(proc4.communicate(), timeout=timeout)
+                    out4, err4 = await asyncio.wait_for(
+                        proc4.communicate(), timeout=timeout
+                    )
                 except asyncio.TimeoutError:
                     proc4.kill()
                     await proc4.communicate()
@@ -169,11 +192,25 @@ async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optio
                 try:
                     base = os.path.splitext(os.path.basename(latest))[0]
                     remux_path = os.path.join(dest_dir, f"{base}_remuxed.mp4")
-                    ffmpeg_cmd = [ffmpeg_bin, "-y", "-i", latest, "-c", "copy", "-movflags", "+faststart", remux_path]
+                    ffmpeg_cmd = [
+                        ffmpeg_bin,
+                        "-y",
+                        "-i",
+                        latest,
+                        "-c",
+                        "copy",
+                        "-movflags",
+                        "+faststart",
+                        remux_path,
+                    ]
                     logger.info("Remuxing %s to mp4 container", latest)
-                    proc5 = await asyncio.create_subprocess_exec(*ffmpeg_cmd, stdout=PIPE, stderr=PIPE)
+                    proc5 = await asyncio.create_subprocess_exec(
+                        *ffmpeg_cmd, stdout=PIPE, stderr=PIPE
+                    )
                     try:
-                        out5, err5 = await asyncio.wait_for(proc5.communicate(), timeout=timeout)
+                        out5, err5 = await asyncio.wait_for(
+                            proc5.communicate(), timeout=timeout
+                        )
                     except asyncio.TimeoutError:
                         proc5.kill()
                         await proc5.communicate()
@@ -192,7 +229,10 @@ async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optio
 
     # if yt-dlp returned an audio-only file (e.g. .m4a) try to package it into mp4 for Telegram
     if ext in audio_exts:
-        logger.info("Downloaded audio-only file (%s). Attempting to wrap into mp4 for Telegram compatibility.", ext)
+        logger.info(
+            "Downloaded audio-only file (%s). Attempting to wrap into mp4 for Telegram compatibility.",
+            ext,
+        )
         # prefer ffmpeg wrapper (black video) if available
         if ffmpeg_bin:
             try:
@@ -218,9 +258,13 @@ async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optio
                     "+faststart",
                     mp4_path,
                 ]
-                proc3 = await asyncio.create_subprocess_exec(*ffmpeg_cmd, stdout=PIPE, stderr=PIPE)
+                proc3 = await asyncio.create_subprocess_exec(
+                    *ffmpeg_cmd, stdout=PIPE, stderr=PIPE
+                )
                 try:
-                    stdout3, stderr3 = await asyncio.wait_for(proc3.communicate(), timeout=timeout)
+                    stdout3, stderr3 = await asyncio.wait_for(
+                        proc3.communicate(), timeout=timeout
+                    )
                 except asyncio.TimeoutError:
                     proc3.kill()
                     await proc3.communicate()
@@ -231,20 +275,38 @@ async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optio
                         ext = "mp4"
                         try:
                             size = os.path.getsize(latest)
-                            logger.info("After ffmpeg wrapper, file: %s (%d bytes)", latest, size)
+                            logger.info(
+                                "After ffmpeg wrapper, file: %s (%d bytes)",
+                                latest,
+                                size,
+                            )
                         except Exception:
-                            logger.debug("Could not stat ffmpeg wrapper file: %s", latest)
+                            logger.debug(
+                                "Could not stat ffmpeg wrapper file: %s", latest
+                            )
             except Exception:
                 logger.exception("ffmpeg wrapper failed")
         else:
             # fallback: attempt a single recode with yt-dlp if available
             if yt_dlp_bin:
                 logger.info("ffmpeg not available; attempting yt-dlp recode to mp4")
-                recode_cmd = [yt_dlp_bin, "--no-playlist", "--recode-video", "mp4", "-o", out_template, url]
+                recode_cmd = [
+                    yt_dlp_bin,
+                    "--no-playlist",
+                    "--recode-video",
+                    "mp4",
+                    "-o",
+                    out_template,
+                    url,
+                ]
                 logger.debug("Running recode command: %s", " ".join(recode_cmd))
-                proc2 = await asyncio.create_subprocess_exec(*recode_cmd, stdout=PIPE, stderr=PIPE)
+                proc2 = await asyncio.create_subprocess_exec(
+                    *recode_cmd, stdout=PIPE, stderr=PIPE
+                )
                 try:
-                    stdout2, stderr2 = await asyncio.wait_for(proc2.communicate(), timeout=timeout)
+                    stdout2, stderr2 = await asyncio.wait_for(
+                        proc2.communicate(), timeout=timeout
+                    )
                 except asyncio.TimeoutError:
                     proc2.kill()
                     await proc2.communicate()
@@ -253,10 +315,12 @@ async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optio
                     if proc2.returncode == 0:
                         files = glob.glob(os.path.join(dest_dir, "*"))
                         latest = max(files, key=os.path.getmtime)
-                        ext = os.path.splitext(latest)[1].lower().lstrip('.')
+                        ext = os.path.splitext(latest)[1].lower().lstrip(".")
                         try:
                             size = os.path.getsize(latest)
-                            logger.info("After recode, file: %s (%d bytes)", latest, size)
+                            logger.info(
+                                "After recode, file: %s (%d bytes)", latest, size
+                            )
                         except Exception:
                             logger.debug("Could not stat recoded file: %s", latest)
     # if still audio-only, try ffmpeg to create a minimal video wrapper (black video + audio)
@@ -284,22 +348,26 @@ async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optio
                 "+faststart",
                 mp4_path,
             ]
-            proc3 = await asyncio.create_subprocess_exec(*ffmpeg_cmd, stdout=PIPE, stderr=PIPE)
+            proc3 = await asyncio.create_subprocess_exec(
+                *ffmpeg_cmd, stdout=PIPE, stderr=PIPE
+            )
             try:
-                stdout3, stderr3 = await asyncio.wait_for(proc3.communicate(), timeout=timeout)
+                stdout3, stderr3 = await asyncio.wait_for(
+                    proc3.communicate(), timeout=timeout
+                )
             except asyncio.TimeoutError:
                 proc3.kill()
                 await proc3.communicate()
                 logger.warning("ffmpeg conversion timed out")
             else:
                 try:
-                    s3 = stdout3.decode(errors='ignore') if stdout3 else ''
+                    s3 = stdout3.decode(errors="ignore") if stdout3 else ""
                 except Exception:
-                    s3 = '<decoding error>'
+                    s3 = "<decoding error>"
                 try:
-                    e3 = stderr3.decode(errors='ignore') if stderr3 else ''
+                    e3 = stderr3.decode(errors="ignore") if stderr3 else ""
                 except Exception:
-                    e3 = '<decoding error>'
+                    e3 = "<decoding error>"
                 logger.debug("ffmpeg container stdout (truncated): %s", s3[:2000])
                 logger.debug("ffmpeg container stderr (truncated): %s", e3[:2000])
                 if proc3.returncode == 0 and os.path.exists(mp4_path):
@@ -307,7 +375,9 @@ async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optio
                     ext = "mp4"
                     try:
                         size = os.path.getsize(latest)
-                        logger.info("After ffmpeg container, file: %s (%d bytes)", latest, size)
+                        logger.info(
+                            "After ffmpeg container, file: %s (%d bytes)", latest, size
+                        )
                     except Exception:
                         logger.debug("Could not stat ffmpeg container file: %s", latest)
                 else:
@@ -323,15 +393,28 @@ async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optio
     if target and size > target:
         ffmpeg_bin = shutil.which("ffmpeg")
         if ffmpeg_bin:
-            logger.info("File %s (%d bytes) exceeds target %d bytes, attempting recompression", latest, size, target)
+            logger.info(
+                "File %s (%d bytes) exceeds target %d bytes, attempting recompression",
+                latest,
+                size,
+                target,
+            )
             # notify compression start
             try:
                 if notify:
-                    await notify({'type': 'compress_start', 'original_size': size, 'target': target})
+                    await notify(
+                        {
+                            "type": "compress_start",
+                            "original_size": size,
+                            "target": target,
+                        }
+                    )
             except Exception:
-                logger.debug('notify compress_start failed')
+                logger.debug("notify compress_start failed")
 
-            async def _try_compress(input_path: str, dest_dir: str, target_bytes: int) -> Optional[str]:
+            async def _try_compress(
+                input_path: str, dest_dir: str, target_bytes: int
+            ) -> Optional[str]:
                 base = os.path.splitext(os.path.basename(input_path))[0]
                 out_path = os.path.join(dest_dir, f"{base}.recompressed.mp4")
 
@@ -369,30 +452,58 @@ async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optio
                         ]
                         logger.debug("Running ffmpeg recompress: %s", " ".join(cmd))
                         try:
-                            proc = await asyncio.create_subprocess_exec(*cmd, stdout=PIPE, stderr=PIPE)
+                            proc = await asyncio.create_subprocess_exec(
+                                *cmd, stdout=PIPE, stderr=PIPE
+                            )
                             try:
-                                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=300)
+                                stdout, stderr = await asyncio.wait_for(
+                                    proc.communicate(), timeout=300
+                                )
                             except asyncio.TimeoutError:
                                 proc.kill()
                                 await proc.communicate()
-                                logger.warning("ffmpeg recompress timed out for crf=%s h=%s", crf, h)
+                                logger.warning(
+                                    "ffmpeg recompress timed out for crf=%s h=%s",
+                                    crf,
+                                    h,
+                                )
                                 continue
                             try:
-                                out_str = stdout.decode(errors='ignore') if stdout else ''
+                                out_str = (
+                                    stdout.decode(errors="ignore") if stdout else ""
+                                )
                             except Exception:
-                                out_str = '<decoding error>'
+                                out_str = "<decoding error>"
                             try:
-                                err_str = stderr.decode(errors='ignore') if stderr else ''
+                                err_str = (
+                                    stderr.decode(errors="ignore") if stderr else ""
+                                )
                             except Exception:
-                                err_str = '<decoding error>'
-                            logger.debug("ffmpeg recompress stdout (truncated): %s", out_str[:2000])
-                            logger.debug("ffmpeg recompress stderr (truncated): %s", err_str[:2000])
+                                err_str = "<decoding error>"
+                            logger.debug(
+                                "ffmpeg recompress stdout (truncated): %s",
+                                out_str[:2000],
+                            )
+                            logger.debug(
+                                "ffmpeg recompress stderr (truncated): %s",
+                                err_str[:2000],
+                            )
                             if proc.returncode != 0:
-                                logger.debug("ffmpeg returned non-zero (%s). stderr=%s", proc.returncode, err_str)
+                                logger.debug(
+                                    "ffmpeg returned non-zero (%s). stderr=%s",
+                                    proc.returncode,
+                                    err_str,
+                                )
                                 continue
                             if os.path.exists(out_path):
                                 new_size = os.path.getsize(out_path)
-                                logger.info("Recompressed file size=%d (target=%d) with crf=%s h=%s", new_size, target_bytes, crf, h)
+                                logger.info(
+                                    "Recompressed file size=%d (target=%d) with crf=%s h=%s",
+                                    new_size,
+                                    target_bytes,
+                                    crf,
+                                    h,
+                                )
                                 if new_size <= target_bytes:
                                     return out_path
                                 # otherwise keep trying
@@ -402,7 +513,9 @@ async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optio
                 return None
 
             try:
-                compressed = await _try_compress(latest, os.path.dirname(latest), target)
+                compressed = await _try_compress(
+                    latest, os.path.dirname(latest), target
+                )
                 if compressed:
                     logger.info("Compression successful, using %s", compressed)
                     latest = compressed
@@ -410,15 +523,20 @@ async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optio
                     compressed_flag = True
                     try:
                         if notify:
-                            await notify({'type': 'compress_done', 'new_size': size})
+                            await notify({"type": "compress_done", "new_size": size})
                     except Exception:
-                        logger.debug('notify compress_done failed')
+                        logger.debug("notify compress_done failed")
                 else:
-                    logger.info("Compression attempts exhausted; file remains too large (%d bytes)", size)
+                    logger.info(
+                        "Compression attempts exhausted; file remains too large (%d bytes)",
+                        size,
+                    )
             except Exception:
                 logger.exception("Compression step failed")
         else:
-            logger.warning("ffmpeg not available; attempting redownload with lower-quality formats")
+            logger.warning(
+                "ffmpeg not available; attempting redownload with lower-quality formats"
+            )
             # Try progressively lower-quality downloads using yt-dlp format selectors
             formats_to_try = [
                 "bestvideo[height<=360]+bestaudio/best",
@@ -433,30 +551,43 @@ async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optio
                         os.remove(f)
                     except Exception:
                         pass
-                rd_cmd = base_cmd + ["--no-playlist", "-f", fmt, "--merge-output-format", "mp4", "-o", out_template, url]
+                rd_cmd = base_cmd + [
+                    "--no-playlist",
+                    "-f",
+                    fmt,
+                    "--merge-output-format",
+                    "mp4",
+                    "-o",
+                    out_template,
+                    url,
+                ]
                 logger.info("Attempting redownload with format %s", fmt)
                 try:
                     if notify:
-                        await notify({'type': 'redownload_start', 'format': fmt})
+                        await notify({"type": "redownload_start", "format": fmt})
                 except Exception:
-                    logger.debug('notify redownload_start failed')
+                    logger.debug("notify redownload_start failed")
                 logger.debug("Running redownload command: %s", " ".join(rd_cmd))
-                proc_rd = await asyncio.create_subprocess_exec(*rd_cmd, stdout=PIPE, stderr=PIPE)
+                proc_rd = await asyncio.create_subprocess_exec(
+                    *rd_cmd, stdout=PIPE, stderr=PIPE
+                )
                 try:
-                    out_r, err_r = await asyncio.wait_for(proc_rd.communicate(), timeout=timeout)
+                    out_r, err_r = await asyncio.wait_for(
+                        proc_rd.communicate(), timeout=timeout
+                    )
                 except asyncio.TimeoutError:
                     proc_rd.kill()
                     await proc_rd.communicate()
                     logger.warning("Redownload with format %s timed out", fmt)
                     continue
                 try:
-                    out_r_str = out_r.decode(errors='ignore') if out_r else ''
+                    out_r_str = out_r.decode(errors="ignore") if out_r else ""
                 except Exception:
-                    out_r_str = '<decoding error>'
+                    out_r_str = "<decoding error>"
                 try:
-                    err_r_str = err_r.decode(errors='ignore') if err_r else ''
+                    err_r_str = err_r.decode(errors="ignore") if err_r else ""
                 except Exception:
-                    err_r_str = '<decoding error>'
+                    err_r_str = "<decoding error>"
                 logger.debug("redownload stdout (truncated): %s", out_r_str[:2000])
                 logger.debug("redownload stderr (truncated): %s", err_r_str[:2000])
                 files2 = glob.glob(os.path.join(dest_dir, "*"))
@@ -466,7 +597,9 @@ async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optio
                 latest = max(files2, key=os.path.getmtime)
                 try:
                     size = os.path.getsize(latest)
-                    logger.info("After redownload format=%s, file=%s size=%d", fmt, latest, size)
+                    logger.info(
+                        "After redownload format=%s, file=%s size=%d", fmt, latest, size
+                    )
                 except Exception:
                     logger.debug("Could not stat redownloaded file: %s", latest)
                 if size <= target:
@@ -474,14 +607,21 @@ async def download(url: str, dest_dir: str, timeout: int = 300, max_bytes: Optio
                     compressed_flag = True
                     try:
                         if notify:
-                            await notify({'type': 'redownload_done', 'new_size': size})
+                            await notify({"type": "redownload_done", "new_size": size})
                     except Exception:
-                        logger.debug('notify redownload_done failed')
+                        logger.debug("notify redownload_done failed")
                     break
             else:
-                logger.info("All redownload attempts exhausted; file remains too large (%d bytes)", size)
+                logger.info(
+                    "All redownload attempts exhausted; file remains too large (%d bytes)",
+                    size,
+                )
 
     if config.TELEGRAM_MAX_FILE_SIZE and size > config.TELEGRAM_MAX_FILE_SIZE:
         raise RuntimeError(f"downloaded file too large ({size} bytes)")
-    meta = {'compressed': compressed_flag, 'original_size': orig_size, 'final_size': size}
+    meta = {
+        "compressed": compressed_flag,
+        "original_size": orig_size,
+        "final_size": size,
+    }
     return latest, meta
