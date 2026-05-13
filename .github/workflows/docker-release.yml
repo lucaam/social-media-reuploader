@@ -10,10 +10,19 @@ permissions:
 
 jobs:
   build:
+    # Run only when the release author is the repository owner (or an explicitly
+    # allowed author). To override, set the repository secret
+    # `DOCKER_RELEASE_ALLOWED_AUTHOR` to your GitHub username.
+    if: ${{ github.event.release.author.login == (secrets.DOCKER_RELEASE_ALLOWED_AUTHOR || github.repository_owner) }}
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Debug release author
+        run: |
+          echo "Release author: ${GITHUB_EVENT_RELEASE_AUTHOR_LOGIN:-${{ github.event.release.author.login }}}"
+          echo "Actor: ${{ github.actor }}"
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v2
