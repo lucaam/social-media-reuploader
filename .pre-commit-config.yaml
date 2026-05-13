@@ -34,3 +34,12 @@ repos:
         language: system
         pass_filenames: false
         stages: [pre-push]
+
+  - repo: local
+    hooks:
+      - id: commitlint
+        name: commitlint (Conventional Commits)
+        entry: ./node_modules/.bin/commitlint --edit
+        language: system
+        pass_filenames: false
+        stages: [commit-msg]
