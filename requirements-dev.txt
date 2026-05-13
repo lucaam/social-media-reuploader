@@ -3,5 +3,5 @@ mkdocs-material>=9.0
 pytest>=7.0
 pre-commit>=3.4
 ruff==0.15.12
-black>=23.9
-isort>=5.12
+black==23.9.1
+isort==5.10.1
