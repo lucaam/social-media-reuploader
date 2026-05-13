@@ -46,6 +46,17 @@ async def metrics(request: web.Request) -> web.Response:
     return web.Response(body=data, headers={"Content-Type": CONTENT_TYPE_LATEST})
 
 
+async def silly(request: web.Request) -> web.Response:
+    """A tiny 'silly' feature endpoint for fun and quick smoke tests.
+
+    Returns a short message including the package version.
+    """
+    try:
+        return web.Response(text=f"Silly feature: 🦄 — version {__version__}")
+    except Exception:
+        return web.Response(text="Silly feature: 🦄")
+
+
 async def _on_startup(app: web.Application):
     # Optionally register webhook with Telegram
     if config.MODE == "webhook" and config.WEBHOOK_URL and config.BOT_TOKEN:
@@ -103,6 +114,7 @@ def create_app() -> web.Application:
     app.router.add_post("/webhook/{token}", handle_webhook)
     app.router.add_get("/health", health)
     app.router.add_get("/metrics", metrics)
+    app.router.add_get("/silly", silly)
     app["worker"] = WorkerPool(config.BOT_TOKEN, workers=config.WORKERS)
     # print a short banner on startup and register webhook if needed
     app.on_startup.append(_print_startup_banner)
