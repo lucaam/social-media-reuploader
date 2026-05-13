@@ -2,10 +2,12 @@ apiVersion: v1
 kind: Service
 metadata:
   name: {{ include "social-media-reuploader.fullname" . | default "social-media-reuploader" }}
+  labels:
+{{ include "social-media-reuploader.labels" . | nindent 4 }}
 spec:
   type: {{ .Values.service.type | default "ClusterIP" }}
   ports:
     - port: {{ .Values.service.port | default 80 }}
       targetPort: 8080
   selector:
-    app: {{ include "social-media-reuploader.name" . | default "social-media-reuploader" }}
+    app.kubernetes.io/instance: {{ .Release.Name }}
