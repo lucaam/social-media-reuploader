@@ -6,7 +6,7 @@ import re
 from aiogram import Bot, Dispatcher
 from aiogram.types import Message, Update
 
-from . import config, db, telegram_api
+from . import config, db, http_client, telegram_api, telegram_client
 from .link_utils import find_links, is_supported
 from .worker import WorkerPool
 
@@ -294,6 +294,8 @@ async def main():
         raise RuntimeError("BOT_TOKEN is not set in config")
 
     bot = Bot(token=config.BOT_TOKEN)
+    # register bot instance for reuse by helper APIs
+    telegram_client.set_bot(bot)
     dp = Dispatcher()
 
     # create a WorkerPool instance that handlers will use
@@ -330,7 +332,12 @@ async def main():
         except Exception:
             pass
         try:
-            await bot.session.close()
+            # close cached bot(s) and shared http session
+            await telegram_client.close_all_bots()
+        except Exception:
+            pass
+        try:
+            await http_client.close_session()
         except Exception:
             pass
 
