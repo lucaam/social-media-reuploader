@@ -2,8 +2,6 @@ name: Lint and Static Checks (conditional)
 
 on:
   pull_request:
-  push:
-    branches: [ main ]
 
 jobs:
   filter:
