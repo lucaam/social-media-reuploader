@@ -82,3 +82,37 @@ pytest -q
 export BOT_TOKEN="<token>"
 python -m src.main
 ```
+
+## Setup locale: commitlint + pre-commit hooks
+
+Per avere lo stesso controllo locale che usa CI e bloccare commit/push non conformi, esegui questi passi:
+
+1. Installa le dipendenze Node (commitlint è già configurato nel progetto):
+
+```bash
+npm ci
+```
+
+2. Installa gli hook locali tramite `pre-commit` (usa `pre-commit` già presente nel repo):
+
+```bash
+# installa tutti gli hook (commit-msg e pre-push inclusi)
+pre-commit install
+
+# oppure installa solo gli hook specifici
+pre-commit install --hook-type commit-msg
+pre-commit install --hook-type pre-push
+```
+
+3. Verifica gli hook senza pushando nulla:
+
+```bash
+pre-commit run --all-files
+```
+
+4. Comportamento aggiuntivo del repository:
+
+- È presente lo script `scripts/commit-msg-fix.sh` che, quando installato come `commit-msg` hook, proverà ad accorciare automaticamente l'header del commit se supera i 100 caratteri e poi eseguirà `commitlint`.
+- Il `pre-push` hook (`scripts/commitlint-pre-push.sh`) esegue `commitlint` sui commit che stai per pushare e bloccherà il push se i messaggi non sono conformi.
+
+Se preferisci non usare Node localmente puoi comunque affidarti al workflow CI che verifica i messaggi sulle PR: correggi i commit non conformi come descritto nella sezione precedente e riapri la PR.
