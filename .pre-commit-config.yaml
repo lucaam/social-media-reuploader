@@ -29,11 +29,10 @@ repos:
   - repo: local
     hooks:
       - id: pytest-pre-push
-        name: pytest (pre-push)
+        name: pytest
         entry: env PYTHONPATH=. pytest -q
         language: system
         pass_filenames: false
-        stages: [pre-push]
 
   - repo: local
     hooks:
@@ -42,7 +41,7 @@ repos:
         entry: helm lint charts/social-media-reuploader
         language: system
         pass_filenames: false
-        stages: [pre-push]
+
 
   - repo: local
     hooks:
@@ -57,7 +56,7 @@ repos:
         entry: scripts/commitlint-pre-push.sh
         language: script
         pass_filenames: false
-        stages: [pre-push]
+
       - id: actionlint
         name: actionlint (GitHub Actions linter)
         entry: actionlint
