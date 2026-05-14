@@ -58,3 +58,9 @@ repos:
         language: script
         pass_filenames: false
         stages: [pre-push]
+      - id: actionlint
+        name: actionlint (GitHub Actions linter)
+        entry: actionlint
+        language: system
+        pass_filenames: true
+        files: '^\\.github/workflows/.*\\.(ya?ml|yaml)$'
