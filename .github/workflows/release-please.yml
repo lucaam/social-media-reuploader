@@ -44,17 +44,6 @@ jobs:
           # published releases.
           skip-github-release: true
 
-      - name: Fetch tags and set VERSION
-        run: |
-          git fetch --tags --prune
-          VERSION=$(git tag --sort=-v:refname | head -n1)
-          echo "Found tag: $VERSION"
-          # Strip leading 'v' or 'V' from tag for image and app versions
-          VERSION=${VERSION#v}
-          VERSION=${VERSION#V}
-          echo "Using cleaned version: $VERSION"
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
-
       # Version and chart updates are no longer pushed automatically here.
       # With `skip-github-release: true` release-please will create a release
       # PR that maintainers can review and merge; include any version/chart
