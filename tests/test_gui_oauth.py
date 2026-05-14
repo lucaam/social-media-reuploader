@@ -54,11 +54,11 @@ def test_login_and_auth_flow_sets_session(monkeypatch):
     client = TestClient(gui.app)
 
     # /login should return a redirect response (307/302)
-    r = client.get("/login", allow_redirects=False)
+    r = client.get("/login", follow_redirects=False)
     assert r.status_code in (302, 307)
 
     # Calling /auth should set the session user and redirect to '/'
-    r2 = client.get("/auth", allow_redirects=False)
+    r2 = client.get("/auth", follow_redirects=False)
     assert r2.status_code in (302, 307)
 
     # Now /api/me should return a user in the session
@@ -89,8 +89,8 @@ def test_grant_admin_allows_requests(monkeypatch):
     client = TestClient(gui.app)
 
     # login/auth -> session created
-    client.get("/login", allow_redirects=False)
-    client.get("/auth", allow_redirects=False)
+    client.get("/login", follow_redirects=False)
+    client.get("/auth", follow_redirects=False)
 
     # before granting admin the /requests endpoint should be forbidden
     r = client.get("/requests")
@@ -136,7 +136,7 @@ def test_oauth_group_auto_admin(monkeypatch):
     gui.OAUTH_ADMIN_GROUPS_LOWER.add("admins")
 
     client = TestClient(gui.app)
-    client.get("/login", allow_redirects=False)
+    client.get("/login", follow_redirects=False)
     client.get("/auth", allow_redirects=False)
 
     r = client.get("/api/me")
