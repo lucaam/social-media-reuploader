@@ -28,6 +28,14 @@ spec:
         - name: social-media-reuploader-gui
           image: "{{ .Values.gui.image.repository }}:{{ default .Chart.AppVersion .Values.gui.image.tag }}"
           imagePullPolicy: {{ .Values.gui.image.pullPolicy }}
+          {{- if .Values.gui.command }}
+          command:
+{{ toYaml .Values.gui.command | indent 12 }}
+          {{- end }}
+          {{- if .Values.gui.args }}
+          args:
+{{ toYaml .Values.gui.args | indent 12 }}
+          {{- end }}
           ports:
             - containerPort: {{ .Values.gui.port | default 8081 }}
           securityContext:
