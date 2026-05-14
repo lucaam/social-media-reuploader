@@ -12,7 +12,7 @@ serviceAccount:
 
 image:
   repository: ghcr.io/lucaam/social-media-reuploader
-  tag: "0.3.1"
+  tag: "0.3.2"
   pullPolicy: IfNotPresent
 
 # Optional imagePullSecrets for private registries
@@ -110,7 +110,7 @@ gui:
   # by default use the same image as the main app; override to a separate image if needed
   image:
     repository: ghcr.io/lucaam/social-media-reuploader
-    tag: "0.3.1"
+    tag: "0.3.2"
     pullPolicy: IfNotPresent
   port: 8081
   # if true, create a Kubernetes Secret and mount it into the GUI pod
