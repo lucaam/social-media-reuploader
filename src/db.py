@@ -22,6 +22,25 @@ _cached_memory_conn = None
 _cached_memory_lock = threading.Lock()
 
 
+class _NoCloseConn:
+    """Proxy around a sqlite3.Connection whose .close() is a no-op so the
+    shared cached connection isn't destroyed by individual callers.
+
+    All other attributes and methods are delegated to the underlying
+    connection object.
+    """
+
+    def __init__(self, conn: sqlite3.Connection):
+        self._conn = conn
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def close(self):
+        # no-op: keep the shared connection alive
+        return None
+
+
 def _init_db_conn(conn: sqlite3.Connection):
     cur = conn.cursor()
     cur.execute("""CREATE TABLE IF NOT EXISTS requests (
@@ -182,7 +201,7 @@ def _connect():
                         ":memory:", check_same_thread=False
                     )
                     _init_db_conn(_cached_memory_conn)
-            return _cached_memory_conn
+            return _NoCloseConn(_cached_memory_conn)
 
 
 def add_request(
