@@ -63,6 +63,26 @@ spec:
           envFrom:
             - secretRef:
                 name: {{ if .Values.gui.secretName }}{{ .Values.gui.secretName }}{{ else }}{{ include "social-media-reuploader.fullname" . }}-gui-secret{{ end }}
+          env:
+            {{- /* REQUESTS_DB and runtime defaults when using a secret */}}
+            {{- if .Values.db.pvc.enabled }}
+            - name: REQUESTS_DB
+              value: '{{ .Values.db.pvc.mountPath | default "/app/data" }}/requests.db'
+            {{- else if .Values.env.REQUESTS_DB }}
+            - name: REQUESTS_DB
+              value: '{{ .Values.env.REQUESTS_DB }}'
+            {{- else }}
+            - name: REQUESTS_DB
+              value: '/app/data/requests.db'
+            {{- end }}
+            - name: MODE
+              value: '{{ .Values.env.MODE | default "webhook" }}'
+            - name: TMP_DIR
+              value: '{{ .Values.env.TMP_DIR | default "/tmp/telegram_downloader" }}'
+            - name: TELEGRAM_MAX_FILE_SIZE
+              value: '{{ .Values.env.TELEGRAM_MAX_FILE_SIZE | default 52428800 }}'
+            - name: WORKERS
+              value: '{{ .Values.env.WORKERS | default "2" }}'
 {{- else if $hasSecrets }}
           env:
             {{- if .Values.gui.secrets.adminToken }}
@@ -93,6 +113,25 @@ spec:
             - name: OAUTH_USERINFO_URL
               value: "{{ .Values.gui.secrets.oauthUserinfoUrl }}"
             {{- end }}
+            {{- /* append REQUESTS_DB and runtime defaults */}}
+            {{- if .Values.db.pvc.enabled }}
+            - name: REQUESTS_DB
+              value: '{{ .Values.db.pvc.mountPath | default "/app/data" }}/requests.db'
+            {{- else if .Values.env.REQUESTS_DB }}
+            - name: REQUESTS_DB
+              value: '{{ .Values.env.REQUESTS_DB }}'
+            {{- else }}
+            - name: REQUESTS_DB
+              value: '/app/data/requests.db'
+            {{- end }}
+            - name: MODE
+              value: '{{ .Values.env.MODE | default "webhook" }}'
+            - name: TMP_DIR
+              value: '{{ .Values.env.TMP_DIR | default "/tmp/telegram_downloader" }}'
+            - name: TELEGRAM_MAX_FILE_SIZE
+              value: '{{ .Values.env.TELEGRAM_MAX_FILE_SIZE | default 52428800 }}'
+            - name: WORKERS
+              value: '{{ .Values.env.WORKERS | default "2" }}'
 {{- end }}
           resources:
 {{ toYaml .Values.guiResources | indent 12 }}
