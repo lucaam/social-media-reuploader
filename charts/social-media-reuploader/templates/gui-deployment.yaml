@@ -26,7 +26,7 @@ spec:
       {{- end }}
       containers:
         - name: social-media-reuploader-gui
-          image: "{{ .Values.gui.image.repository }}:{{ .Values.gui.image.tag }}"
+          image: "{{ .Values.gui.image.repository }}:{{ default .Chart.AppVersion .Values.gui.image.tag }}"
           imagePullPolicy: {{ .Values.gui.image.pullPolicy }}
           ports:
             - containerPort: {{ .Values.gui.port | default 8081 }}
@@ -86,7 +86,8 @@ spec:
               value: "{{ .Values.gui.secrets.oauthUserinfoUrl }}"
             {{- end }}
 {{- end }}
-          resources: {{ toYaml .Values.guiResources | nindent 10 }}
+          resources:
+{{ toYaml .Values.guiResources | indent 12 }}
           {{- if .Values.db.pvc.enabled }}
           volumeMounts:
             - name: data

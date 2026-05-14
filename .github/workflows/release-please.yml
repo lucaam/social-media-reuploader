@@ -22,8 +22,12 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
 
       - name: Create release PR / Release (release-please)
+        id: release-please
         # NOTE: `release-please` can be configured to publish releases automatically.
         # If you prefer to only create a release PR and publish releases manually
         # (so downstream workflows like docker-release only run for your manual
@@ -34,33 +38,18 @@ jobs:
         with:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           release-type: 'python'
-          # Ensure we do not skip creating GitHub releases (publish automatically)
-          skip-github-release: false
+          # Create a release PR instead of publishing releases automatically.
+          # This ensures version/chart changes are reviewed and merged manually
+          # and downstream jobs (e.g. docker-release) run only on actual
+          # published releases.
+          skip-github-release: true
 
-      - name: Fetch tags and set VERSION
-        run: |
-          git fetch --tags --prune
-          VERSION=$(git tag --sort=-v:refname | head -n1)
-          echo "Found tag: $VERSION"
-          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+      # Version and chart updates are no longer pushed automatically here.
+      # With `skip-github-release: true` release-please will create a release
+      # PR that maintainers can review and merge; include any version/chart
+      # changes inside that PR instead of pushing to `main` from this workflow.
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
-
-      - name: Set up buildx
-        uses: docker/setup-buildx-action@v3
-
-      - name: Log in to GitHub Container Registry
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-
-      - name: Build and push Docker image
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          file: ./Dockerfile
-          push: true
-          tags: ghcr.io/${{ github.repository }}:${{ env.VERSION }}
+      # Docker image build/push is handled in .github/workflows/docker-release.yml
+      # which runs on `release.published` events. Remove build/push from
+      # release-please to keep separation of concerns and avoid long-running
+      # steps during release metadata creation.

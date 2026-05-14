@@ -18,3 +18,11 @@ except Exception:
 # Control whether the process creates a rotating file log handler.
 # Default: do not write to a file (useful for containers where stdout is preferred).
 LOG_TO_FILE = os.getenv("LOG_TO_FILE", "false").lower() in ("1", "true", "yes")
+
+# Whether the worker should generate and attach thumbnails using ffmpeg.
+# Set to false to skip thumbnail generation and let Telegram handle thumbnails.
+WORKER_GENERATE_THUMBNAIL = os.getenv("WORKER_GENERATE_THUMBNAIL", "true").lower() in (
+    "1",
+    "true",
+    "yes",
+)

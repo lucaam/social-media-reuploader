@@ -48,21 +48,16 @@ jobs:
         uses: actions/setup-python@v6.2.0
         with:
           python-version: '3.12'
-
       - name: Install dev dependencies
         run: pip install -r requirements-dev.txt
 
-      - name: Ruff (static analysis)
-        run: |
-          ruff check .
+      - name: Set up Node (for commitlint / npm-based hooks)
+        uses: actions/setup-node@v4
+        with:
+          node-version: '18'
 
-      - name: Black check (format)
-        run: |
-          black --check .
-
-      - name: isort check (imports)
-        run: |
-          isort --check-only .
+      - name: Install Node dev dependencies
+        run: npm ci
 
       - name: Pre-commit hooks (all)
         run: |

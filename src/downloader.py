@@ -26,6 +26,62 @@ async def download(
     """
     os.makedirs(dest_dir, exist_ok=True)
     out_template = os.path.join(dest_dir, "%(id)s.%(ext)s")
+    logger.debug("download(): dest_dir=%s out_template=%s", dest_dir, out_template)
+    # track spawned subprocesses so we can terminate them on cancellation/exit
+    procs: set = set()
+
+    async def _cleanup_procs():
+        # best-effort: terminate any remaining child processes to avoid subprocess
+        # transports being garbage-collected after the event loop is closed
+        for p in list(procs):
+            try:
+                if getattr(p, "returncode", None) is None:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+                    try:
+                        await p.communicate()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
+    async def _spawn(*cmd_args):
+        p = await asyncio.create_subprocess_exec(*cmd_args, stdout=PIPE, stderr=PIPE)
+        procs.add(p)
+        return p
+
+    async def _await_proc(p, to: int | None = None):
+        try:
+            out, err = await asyncio.wait_for(p.communicate(), timeout=to)
+            return out, err
+        except asyncio.TimeoutError:
+            try:
+                p.kill()
+            except Exception:
+                pass
+            try:
+                await p.communicate()
+            except Exception:
+                pass
+            raise
+        except asyncio.CancelledError:
+            try:
+                p.kill()
+            except Exception:
+                pass
+            try:
+                await p.communicate()
+            except Exception:
+                pass
+            raise
+        finally:
+            try:
+                procs.discard(p)
+            except Exception:
+                pass
+
     # prefer merging video+audio and produce mp4 when possible
     # resolve yt-dlp binary if available; fall back to running as a module
     yt_dlp_bin = shutil.which("yt-dlp")
@@ -33,49 +89,71 @@ async def download(
         base_cmd = [yt_dlp_bin]
     else:
         base_cmd = [sys.executable, "-m", "yt_dlp"]
-    cmd = base_cmd + [
-        "--no-playlist",
-        "-f",
+    # Try to prefer H.264/AVC streams from the source before falling back to
+    # generic bestvideo selection. This avoids downloading VP9/AV1 streams that
+    # some Telegram clients cannot play in MP4 containers.
+    format_candidates = [
+        "bestvideo[ext=mp4][vcodec^=avc1]+bestaudio/best",
+        "bestvideo[vcodec^=avc1]+bestaudio/best",
+        "bestvideo[ext=mp4]+bestaudio/best",
         "bestvideo+bestaudio/best",
-        "-o",
-        out_template,
     ]
-    if max_bytes:
-        # yt-dlp accepts raw bytes or human readable (e.g. 50M); pass raw bytes
-        cmd += ["--max-filesize", str(max_bytes)]
-    cmd += [url]
 
-    logger.debug("Running download command: %s", " ".join(cmd))
-    proc = await asyncio.create_subprocess_exec(*cmd, stdout=PIPE, stderr=PIPE)
-    try:
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
-        await proc.communicate()
-        raise
+    proc = None
+    stdout = stderr = b""
+    for fmt in format_candidates:
+        cmd = base_cmd + ["--no-playlist", "-f", fmt, "-o", out_template]
+        if max_bytes:
+            cmd += ["--max-filesize", str(max_bytes)]
+        cmd += [url]
 
-    # log subprocess output (truncated) for debugging
-    try:
-        stdout_str = stdout.decode(errors="ignore") if stdout else ""
-    except Exception:
-        stdout_str = "<decoding error>"
-    try:
-        stderr_str = stderr.decode(errors="ignore") if stderr else ""
-    except Exception:
-        stderr_str = "<decoding error>"
-    logger.debug("yt-dlp stdout (truncated): %s", stdout_str[:2000])
-    logger.debug("yt-dlp stderr (truncated): %s", stderr_str[:2000])
+        logger.debug("Trying yt-dlp format '%s': %s", fmt, " ".join(cmd))
+        proc = await _spawn(*cmd)
+        logger.debug(
+            "spawned downloader proc=%s (fmt=%s)",
+            getattr(proc, "returncode", None),
+            fmt,
+        )
+        stdout, stderr = await _await_proc(proc, to=timeout)
+        logger.debug("after yt-dlp attempt for fmt=%s", fmt)
+        try:
+            stdout_str = stdout.decode(errors="ignore") if stdout else ""
+        except Exception:
+            stdout_str = "<decoding error>"
+        try:
+            stderr_str = stderr.decode(errors="ignore") if stderr else ""
+        except Exception:
+            stderr_str = "<decoding error>"
+        logger.debug("yt-dlp stdout (truncated): %s", stdout_str[:2000])
+        logger.debug("yt-dlp stderr (truncated): %s", stderr_str[:2000])
 
-    if proc.returncode != 0:
-        err = stderr_str
-        logger.error("yt-dlp failed: %s", err)
+        # If this attempt succeeded and produced a file, stop trying further formats
+        if proc.returncode == 0:
+            files = glob.glob(os.path.join(dest_dir, "*"))
+            if files:
+                latest = max(files, key=os.path.getmtime)
+                logger.debug("picked latest file %s after fmt=%s", latest, fmt)
+                break
+            # no files produced despite exit code 0 — try next candidate
+
+    if proc is None or (getattr(proc, "returncode", None) != 0):
+        err = stderr.decode(errors="ignore") if stderr else ""
+        logger.error("yt-dlp failed (all format attempts): %s", err)
+        await _cleanup_procs()
         raise RuntimeError(f"yt-dlp failed: {err.strip()[:200]}")
 
-    # pick the newest file in dest_dir
-    files = glob.glob(os.path.join(dest_dir, "*"))
-    if not files:
-        raise RuntimeError("no file downloaded")
-    latest = max(files, key=os.path.getmtime)
+    # if we fell through above but didn't set `latest`, pick newest file now
+    if "latest" not in locals():
+        files = glob.glob(os.path.join(dest_dir, "*"))
+        if not files:
+            await _cleanup_procs()
+            raise RuntimeError("no file downloaded")
+        latest = max(files, key=os.path.getmtime)
+        logger.debug("picked latest file %s", latest)
+
+    # pick the newest file in dest_dir (if not already set)
+    # Note: stdout/stderr and returncode were already handled in the
+    # format-candidates loop above; avoid duplicating that logic here.
     try:
         size = os.path.getsize(latest)
         orig_size = size
@@ -97,7 +175,7 @@ async def download(
     has_audio = False
     if ffprobe_bin:
         try:
-            p = await asyncio.create_subprocess_exec(
+            p = await _spawn(
                 ffprobe_bin,
                 "-v",
                 "error",
@@ -106,19 +184,32 @@ async def download(
                 "-show_streams",
                 "-show_format",
                 latest,
-                stdout=PIPE,
-                stderr=PIPE,
             )
-            outp, errp = await p.communicate()
+            outp, errp = await _await_proc(p)
             if outp:
                 try:
                     info = json.loads(outp)
                     streams = info.get("streams", [])
                     fmt = info.get("format", {}).get("format_name", "") or ""
+                    # capture some useful stream-level metadata for orientation-aware transcoding
+                    video_width = None
+                    video_height = None
+                    video_bit_rate = None
+                    video_profile = None
                     for s in streams:
                         if s.get("codec_type") == "video":
                             has_video = True
                             video_codec = s.get("codec_name")
+                            video_profile = s.get("profile")
+                            try:
+                                video_width = int(s.get("width") or 0) or None
+                            except Exception:
+                                video_width = None
+                            try:
+                                video_height = int(s.get("height") or 0) or None
+                            except Exception:
+                                video_height = None
+                            video_bit_rate = s.get("bit_rate") or None
                         elif s.get("codec_type") == "audio":
                             has_audio = True
                             audio_codec = s.get("codec_name")
@@ -126,23 +217,34 @@ async def download(
                     logger.debug("Could not parse ffprobe output")
         except Exception:
             logger.debug("ffprobe execution failed")
-        # Log a concise ffprobe summary for debugging/diagnostics
-        try:
-            logger.info(
-                "ffprobe: has_video=%s has_audio=%s video_codec=%s audio_codec=%s format=%s",
-                has_video,
-                has_audio,
-                video_codec,
-                audio_codec,
-                fmt,
-            )
-        except Exception:
-            pass
+    # Log a concise ffprobe summary for debugging/diagnostics
+    try:
+        logger.info(
+            "ffprobe: has_video=%s has_audio=%s video_codec=%s audio_codec=%s format=%s",
+            has_video,
+            has_audio,
+            video_codec,
+            audio_codec,
+            fmt,
+        )
+    except Exception:
+        pass
+
+    logger.debug(
+        "after ffprobe: has_video=%s has_audio=%s ext=%s fmt=%s",
+        has_video,
+        has_audio,
+        ext,
+        fmt,
+    )
+    logger.debug(
+        "checking compatibility: ffmpeg_bin=%s yt_dlp_bin=%s", ffmpeg_bin, yt_dlp_bin
+    )
 
     # If we have a video+audio file but codecs are not widely compatible (e.g. vp9/opus),
     # transcode to h264/aac MP4 for better client compatibility. If codecs are compatible
     # but container is not MP4, remux to MP4 with faststart.
-    if has_video and has_audio and ffmpeg_bin:
+    if has_video and has_audio:
         preferred_video = ("h264", "mpeg4")
         preferred_audio = ("aac", "mp3", "mp4a")
         incompatible = False
@@ -150,40 +252,244 @@ async def download(
             audio_codec and audio_codec not in preferred_audio
         ):
             incompatible = True
+        # Treat H.264 with non-baseline profile (e.g. Main/High) as incompatible so we can re-encode to baseline
+        try:
+            if (
+                video_codec == "h264"
+                and video_profile
+                and "baseline" not in video_profile.lower()
+            ):
+                incompatible = True
+        except Exception:
+            pass
         if incompatible:
+            # First, attempt a yt-dlp recode to mp4 (may use ffmpeg internally).
+            # This is a lighter-weight fallback than a full manual ffmpeg transcode
+            # and can succeed when a source can be re-encoded to H.264 by yt-dlp.
+            if yt_dlp_bin:
+                try:
+                    logger.info(
+                        "Attempting yt-dlp --recode-video mp4 fallback for %s", latest
+                    )
+                    recode_cmd = base_cmd + [
+                        "--no-playlist",
+                        "--recode-video",
+                        "mp4",
+                        "-o",
+                        out_template,
+                        url,
+                    ]
+                    if max_bytes:
+                        recode_cmd = recode_cmd[:-1] + [
+                            "--max-filesize",
+                            str(max_bytes),
+                            url,
+                        ]
+                    logger.debug("Running recode command: %s", " ".join(recode_cmd))
+                    proc_recode = await _spawn(*recode_cmd)
+                    try:
+                        stdout_re, stderr_re = await _await_proc(
+                            proc_recode, to=timeout
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning("yt-dlp recode timed out")
+                    else:
+                        if proc_recode.returncode == 0:
+                            files = glob.glob(os.path.join(dest_dir, "*"))
+                            if files:
+                                latest_candidate = max(files, key=os.path.getmtime)
+                                if latest_candidate and latest_candidate != latest:
+                                    latest = latest_candidate
+                                    ext = (
+                                        os.path.splitext(latest)[1].lower().lstrip(".")
+                                    )
+                                    # re-run ffprobe on the recoded file to refresh codec info
+                                    if ffprobe_bin:
+                                        try:
+                                            p2 = await _spawn(
+                                                ffprobe_bin,
+                                                "-v",
+                                                "error",
+                                                "-print_format",
+                                                "json",
+                                                "-show_streams",
+                                                "-show_format",
+                                                latest,
+                                            )
+                                            out2, err2 = await _await_proc(p2)
+                                            if out2:
+                                                try:
+                                                    info2 = json.loads(out2)
+                                                    streams2 = info2.get("streams", [])
+                                                    fmt = (
+                                                        info2.get("format", {}).get(
+                                                            "format_name", ""
+                                                        )
+                                                        or ""
+                                                    )
+                                                    # reset codec vars and capture profile/size info
+                                                    video_codec = None
+                                                    audio_codec = None
+                                                    has_video = False
+                                                    has_audio = False
+                                                    video_width = None
+                                                    video_height = None
+                                                    video_bit_rate = None
+                                                    video_profile = None
+                                                    for s in streams2:
+                                                        if (
+                                                            s.get("codec_type")
+                                                            == "video"
+                                                        ):
+                                                            has_video = True
+                                                            video_codec = s.get(
+                                                                "codec_name"
+                                                            )
+                                                            video_profile = s.get(
+                                                                "profile"
+                                                            )
+                                                            try:
+                                                                video_width = (
+                                                                    int(
+                                                                        s.get("width")
+                                                                        or 0
+                                                                    )
+                                                                    or None
+                                                                )
+                                                            except Exception:
+                                                                video_width = None
+                                                            try:
+                                                                video_height = (
+                                                                    int(
+                                                                        s.get("height")
+                                                                        or 0
+                                                                    )
+                                                                    or None
+                                                                )
+                                                            except Exception:
+                                                                video_height = None
+                                                            video_bit_rate = (
+                                                                s.get("bit_rate")
+                                                                or None
+                                                            )
+                                                        elif (
+                                                            s.get("codec_type")
+                                                            == "audio"
+                                                        ):
+                                                            has_audio = True
+                                                            audio_codec = s.get(
+                                                                "codec_name"
+                                                            )
+                                                except Exception:
+                                                    logger.debug(
+                                                        "Could not parse ffprobe output for recoded file"
+                                                    )
+                                        except Exception:
+                                            logger.debug(
+                                                "ffprobe execution failed for recoded file"
+                                            )
+                                    # recompute compatibility
+                                    if (
+                                        video_codec and video_codec in preferred_video
+                                    ) and (
+                                        audio_codec and audio_codec in preferred_audio
+                                    ):
+                                        try:
+                                            size = os.path.getsize(latest)
+                                            logger.info(
+                                                "yt-dlp recode produced compatible file: %s (%d bytes)",
+                                                latest,
+                                                size,
+                                            )
+                                        except Exception:
+                                            logger.debug(
+                                                "Could not stat recoded file: %s",
+                                                latest,
+                                            )
+                                        incompatible = False
+                except Exception:
+                    logger.exception("yt-dlp recode failed")
+
+            # If still incompatible, fall back to manual ffmpeg transcode (if available)
             try:
                 base = os.path.splitext(os.path.basename(latest))[0]
                 trans_path = os.path.join(dest_dir, f"{base}_transcoded.mp4")
+
+                # choose orientation-aware scale/pad target
+                try:
+                    is_portrait = False
+                    if video_width and video_height:
+                        is_portrait = int(video_height) >= int(video_width)
+                except Exception:
+                    is_portrait = False
+
+                if is_portrait:
+                    target_w = 720
+                    pad_w = 720
+                    pad_h = 1280
+                else:
+                    target_w = 640
+                    pad_w = 640
+                    pad_h = 360
+
+                # determine reasonable video bitrate (fall back to 1780k)
+                try:
+                    if video_bit_rate:
+                        # ffprobe bit_rate is in bps, convert to kbps
+                        kb = int(int(video_bit_rate) / 1000)
+                        vb = f"{kb}k" if kb > 0 else "1780k"
+                    else:
+                        vb = "1780k"
+                except Exception:
+                    vb = "1780k"
+
+                # Preserve original aspect ratio; avoid forcing fixed-pad frames
+                scale_filter = f"scale=w={target_w}:h=-2:force_original_aspect_ratio=decrease,setsar=1"
+
                 ffmpeg_cmd = [
                     ffmpeg_bin,
                     "-y",
+                    "-max_muxing_queue_size",
+                    "9999",
                     "-i",
                     latest,
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "0:a:0?",
                     "-c:v",
                     "libx264",
                     "-preset",
-                    "fast",
-                    "-crf",
-                    "23",
+                    "medium",
+                    "-profile:v",
+                    "baseline",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-b:v",
+                    vb,
+                    "-maxrate",
+                    vb,
+                    "-bufsize",
+                    str(int(int(vb.rstrip("k")) * 2000)),
+                    "-vf",
+                    scale_filter,
                     "-c:a",
                     "aac",
                     "-b:a",
-                    "128k",
+                    "65k",
+                    "-ac",
+                    "2",
+                    "-ar",
+                    "44100",
                     "-movflags",
                     "+faststart",
                     trans_path,
                 ]
                 logger.info("Transcoding %s to mp4/h264 for compatibility", latest)
-                proc4 = await asyncio.create_subprocess_exec(
-                    *ffmpeg_cmd, stdout=PIPE, stderr=PIPE
-                )
+                proc4 = await _spawn(*ffmpeg_cmd)
                 try:
-                    out4, err4 = await asyncio.wait_for(
-                        proc4.communicate(), timeout=timeout
-                    )
+                    out4, err4 = await _await_proc(proc4, to=timeout)
                 except asyncio.TimeoutError:
-                    proc4.kill()
-                    await proc4.communicate()
                     logger.warning("ffmpeg transcode timed out")
                 else:
                     if proc4.returncode == 0 and os.path.exists(trans_path):
@@ -194,6 +500,71 @@ async def download(
                             logger.info("Transcoded file: %s (%d bytes)", latest, size)
                         except Exception:
                             logger.debug("Could not stat transcoded file: %s", latest)
+                        # re-run ffprobe on the transcoded file to refresh codec/profile info
+                        if ffprobe_bin:
+                            try:
+                                p3 = await _spawn(
+                                    ffprobe_bin,
+                                    "-v",
+                                    "error",
+                                    "-print_format",
+                                    "json",
+                                    "-show_streams",
+                                    "-show_format",
+                                    latest,
+                                )
+                                out3, err3 = await _await_proc(p3)
+                                if out3:
+                                    try:
+                                        info3 = json.loads(out3)
+                                        streams3 = info3.get("streams", [])
+                                        fmt = (
+                                            info3.get("format", {}).get(
+                                                "format_name", ""
+                                            )
+                                            or ""
+                                        )
+                                        # reset codec vars and capture profile/size info
+                                        video_codec = None
+                                        audio_codec = None
+                                        has_video = False
+                                        has_audio = False
+                                        video_width = None
+                                        video_height = None
+                                        video_bit_rate = None
+                                        video_profile = None
+                                        for s in streams3:
+                                            if s.get("codec_type") == "video":
+                                                has_video = True
+                                                video_codec = s.get("codec_name")
+                                                video_profile = s.get("profile")
+                                                try:
+                                                    video_width = (
+                                                        int(s.get("width") or 0) or None
+                                                    )
+                                                except Exception:
+                                                    video_width = None
+                                                try:
+                                                    video_height = (
+                                                        int(s.get("height") or 0)
+                                                        or None
+                                                    )
+                                                except Exception:
+                                                    video_height = None
+                                                video_bit_rate = (
+                                                    s.get("bit_rate") or None
+                                                )
+                                            elif s.get("codec_type") == "audio":
+                                                has_audio = True
+                                                audio_codec = s.get("codec_name")
+                                    except Exception:
+                                        logger.debug(
+                                            "Could not parse ffprobe output for transcoded file"
+                                        )
+                            except Exception:
+                                logger.debug(
+                                    "ffprobe execution failed for transcoded file"
+                                )
             except Exception:
                 logger.exception("Transcoding failed")
         else:
@@ -205,6 +576,8 @@ async def download(
                     ffmpeg_cmd = [
                         ffmpeg_bin,
                         "-y",
+                        "-max_muxing_queue_size",
+                        "9999",
                         "-i",
                         latest,
                         "-c",
@@ -214,16 +587,10 @@ async def download(
                         remux_path,
                     ]
                     logger.info("Remuxing %s to mp4 container", latest)
-                    proc5 = await asyncio.create_subprocess_exec(
-                        *ffmpeg_cmd, stdout=PIPE, stderr=PIPE
-                    )
+                    proc5 = await _spawn(*ffmpeg_cmd)
                     try:
-                        out5, err5 = await asyncio.wait_for(
-                            proc5.communicate(), timeout=timeout
-                        )
+                        out5, err5 = await _await_proc(proc5, to=timeout)
                     except asyncio.TimeoutError:
-                        proc5.kill()
-                        await proc5.communicate()
                         logger.warning("ffmpeg remux timed out")
                     else:
                         if proc5.returncode == 0 and os.path.exists(remux_path):
@@ -251,33 +618,49 @@ async def download(
                 ffmpeg_cmd = [
                     ffmpeg_bin,
                     "-y",
+                    "-max_muxing_queue_size",
+                    "9999",
                     "-f",
                     "lavfi",
                     "-i",
-                    "color=c=black:s=640x360",
+                    "color=c=black:s=640x360:r=25",
                     "-i",
                     latest,
+                    "-map",
+                    "0:v:0",
+                    "-map",
+                    "1:a:0",
                     "-c:v",
                     "libx264",
+                    "-preset",
+                    "faster",
+                    "-crf",
+                    "23",
+                    "-maxrate",
+                    "4.5M",
+                    "-flags",
+                    "+global_header",
+                    "-pix_fmt",
+                    "yuv420p",
+                    "-profile:v",
+                    "baseline",
                     "-c:a",
                     "aac",
+                    "-ac",
+                    "2",
                     "-b:a",
                     "128k",
+                    "-vf",
+                    "setsar=1",
                     "-shortest",
                     "-movflags",
                     "+faststart",
                     mp4_path,
                 ]
-                proc3 = await asyncio.create_subprocess_exec(
-                    *ffmpeg_cmd, stdout=PIPE, stderr=PIPE
-                )
+                proc3 = await _spawn(*ffmpeg_cmd)
                 try:
-                    stdout3, stderr3 = await asyncio.wait_for(
-                        proc3.communicate(), timeout=timeout
-                    )
+                    stdout3, stderr3 = await _await_proc(proc3, to=timeout)
                 except asyncio.TimeoutError:
-                    proc3.kill()
-                    await proc3.communicate()
                     logger.warning("ffmpeg conversion timed out")
                 else:
                     if proc3.returncode == 0 and os.path.exists(mp4_path):
@@ -310,16 +693,10 @@ async def download(
                     url,
                 ]
                 logger.debug("Running recode command: %s", " ".join(recode_cmd))
-                proc2 = await asyncio.create_subprocess_exec(
-                    *recode_cmd, stdout=PIPE, stderr=PIPE
-                )
+                proc2 = await _spawn(*recode_cmd)
                 try:
-                    stdout2, stderr2 = await asyncio.wait_for(
-                        proc2.communicate(), timeout=timeout
-                    )
+                    stdout2, stderr2 = await _await_proc(proc2, to=timeout)
                 except asyncio.TimeoutError:
-                    proc2.kill()
-                    await proc2.communicate()
                     logger.warning("Recode attempt timed out")
                 else:
                     if proc2.returncode == 0:
@@ -383,18 +760,30 @@ async def download(
                         cmd = [
                             ffmpeg_bin,
                             "-y",
+                            "-max_muxing_queue_size",
+                            "9999",
                             "-i",
                             input_path,
                             "-vf",
-                            f"scale=-2:{h}",
+                            "scale=w=640:h=-2:force_original_aspect_ratio=decrease,setsar=1",
                             "-c:v",
                             "libx264",
                             "-preset",
-                            "fast",
+                            "faster",
                             "-crf",
                             str(crf),
+                            "-maxrate",
+                            "4.5M",
+                            "-flags",
+                            "+global_header",
+                            "-pix_fmt",
+                            "yuv420p",
+                            "-profile:v",
+                            "baseline",
                             "-c:a",
                             "aac",
+                            "-ac",
+                            "2",
                             "-b:a",
                             "128k",
                             "-movflags",
@@ -403,16 +792,10 @@ async def download(
                         ]
                         logger.debug("Running ffmpeg recompress: %s", " ".join(cmd))
                         try:
-                            proc = await asyncio.create_subprocess_exec(
-                                *cmd, stdout=PIPE, stderr=PIPE
-                            )
+                            proc = await _spawn(*cmd)
                             try:
-                                stdout, stderr = await asyncio.wait_for(
-                                    proc.communicate(), timeout=300
-                                )
+                                stdout, stderr = await _await_proc(proc, to=300)
                             except asyncio.TimeoutError:
-                                proc.kill()
-                                await proc.communicate()
                                 logger.warning(
                                     "ffmpeg recompress timed out for crf=%s h=%s",
                                     crf,
@@ -517,16 +900,10 @@ async def download(
                 except Exception:
                     logger.debug("notify redownload_start failed")
                 logger.debug("Running redownload command: %s", " ".join(rd_cmd))
-                proc_rd = await asyncio.create_subprocess_exec(
-                    *rd_cmd, stdout=PIPE, stderr=PIPE
-                )
+                proc_rd = await _spawn(*rd_cmd)
                 try:
-                    out_r, err_r = await asyncio.wait_for(
-                        proc_rd.communicate(), timeout=timeout
-                    )
+                    out_r, err_r = await _await_proc(proc_rd, to=timeout)
                 except asyncio.TimeoutError:
-                    proc_rd.kill()
-                    await proc_rd.communicate()
                     logger.warning("Redownload with format %s timed out", fmt)
                     continue
                 try:
@@ -566,8 +943,12 @@ async def download(
                     size,
                 )
 
-    if config.TELEGRAM_MAX_FILE_SIZE and size > config.TELEGRAM_MAX_FILE_SIZE:
-        raise RuntimeError(f"downloaded file too large ({size} bytes)")
+        if config.TELEGRAM_MAX_FILE_SIZE and size > config.TELEGRAM_MAX_FILE_SIZE:
+            await _cleanup_procs()
+            raise RuntimeError(f"downloaded file too large ({size} bytes)")
+    await _cleanup_procs()
+
+    # return metadata for the downloaded file in all code paths
     meta = {
         "compressed": compressed_flag,
         "original_size": orig_size,
@@ -577,5 +958,9 @@ async def download(
         "video_codec": video_codec,
         "audio_codec": audio_codec,
         "format": fmt,
+        "video_width": locals().get("video_width"),
+        "video_height": locals().get("video_height"),
+        "video_profile": locals().get("video_profile"),
     }
+    logger.debug("download(): returning latest=%s final_size=%s", latest, size)
     return latest, meta

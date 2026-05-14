@@ -46,21 +46,29 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Set cleaned release tag
+        run: |
+          TAG="${{ github.event.release.tag_name }}"
+          CLEAN_TAG=${TAG#v}
+          CLEAN_TAG=${CLEAN_TAG#V}
+          echo "CLEAN_TAG=${CLEAN_TAG}" >> "$GITHUB_ENV"
+
       - name: Build and push to GHCR
         uses: docker/build-push-action@v5
         with:
           context: .
           push: true
           platforms: linux/amd64,linux/arm64
+          # Use cleaned tag (strip leading 'v') for image tags and metadata
           tags: |
-            ghcr.io/${{ github.repository }}:${{ github.event.release.tag_name }}
+            ghcr.io/${{ github.repository }}:${{ env.CLEAN_TAG }}
             ghcr.io/${{ github.repository }}:latest
           build-args: |
             VCS_REF=${{ github.sha }}
             BUILD_DATE=${{ github.event.release.published_at }}
-            VERSION=${{ github.event.release.tag_name }}
+            VERSION=${{ env.CLEAN_TAG }}
           labels: |
-            org.opencontainers.image.version=${{ github.event.release.tag_name }}
+            org.opencontainers.image.version=${{ env.CLEAN_TAG }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
             org.opencontainers.image.created=${{ github.event.release.published_at }}

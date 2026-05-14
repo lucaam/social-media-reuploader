@@ -28,12 +28,21 @@ repos:
 
   - repo: local
     hooks:
-      - id: pytest-pre-push
-        name: pytest (pre-push)
-        entry: pytest -q
+      - id: pytest
+        name: pytest
+        entry: env PYTHONPATH=. pytest -q
         language: system
         pass_filenames: false
         stages: [pre-push]
+
+  - repo: local
+    hooks:
+      - id: helm-lint
+        name: helm lint (charts)
+        entry: helm lint charts/social-media-reuploader
+        language: system
+        pass_filenames: false
+
 
   - repo: local
     hooks:
@@ -43,9 +52,9 @@ repos:
         language: script
         pass_filenames: true
         stages: [commit-msg]
-      - id: commitlint-pre-push
-        name: commitlint (pre-push)
-        entry: scripts/commitlint-pre-push.sh
-        language: script
-        pass_filenames: false
-        stages: [pre-push]
+      - id: actionlint
+        name: actionlint (GitHub Actions linter)
+        entry: actionlint
+        language: system
+        pass_filenames: true
+        files: '^\\.github/workflows/.*\\.(ya?ml|yaml)$'
