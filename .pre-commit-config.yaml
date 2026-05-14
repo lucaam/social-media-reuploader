@@ -52,13 +52,6 @@ repos:
         language: script
         pass_filenames: true
         stages: [commit-msg]
-      - id: commitlint-pre-push
-        name: commitlint (pre-push)
-        entry: scripts/commitlint-pre-push.sh
-        language: script
-        pass_filenames: false
-        stages: [pre-push]
-
       - id: actionlint
         name: actionlint (GitHub Actions linter)
         entry: actionlint
