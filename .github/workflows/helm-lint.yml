@@ -1,7 +1,6 @@
 name: Helm Lint & Template
 
 on:
-  pull_request:
   push:
     branches: [ main ]
 

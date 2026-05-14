@@ -6,11 +6,8 @@ on:
     paths:
       - 'Dockerfile'
       - 'src/**'
-      - 'charts/**'
       - 'requirements*.txt'
       - 'package.json'
-      - 'scripts/**'
-      - '.github/workflows/**'
       - 'pyproject.toml'
       - 'Pipfile'
       - 'setup.cfg'
