@@ -25,9 +25,15 @@ OAUTH_AUTHORIZE_URL = os.environ.get("OAUTH_AUTHORIZE_URL")
 OAUTH_TOKEN_URL = os.environ.get("OAUTH_TOKEN_URL")
 OAUTH_USERINFO_URL = os.environ.get("OAUTH_USERINFO_URL")
 OAUTH_SCOPE = os.environ.get("OAUTH_SCOPE", "openid profile email")
+OAUTH_SERVER_METADATA_URL = os.environ.get("OAUTH_SERVER_METADATA_URL")
+OAUTH_JWKS_URI = os.environ.get("OAUTH_JWKS_URI")
 
 if OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET and OAUTH_AUTHORIZE_URL and OAUTH_TOKEN_URL:
-    oauth.register(
+    # support optional OIDC discovery URL (server_metadata_url) so authlib
+    # can fetch `jwks_uri` and other endpoints automatically. If you run
+    # against an OpenID Connect provider, set `OAUTH_SERVER_METADATA_URL`
+    # (e.g. https://<issuer>/.well-known/openid-configuration).
+    register_kwargs = dict(
         name="provider",
         client_id=OAUTH_CLIENT_ID,
         client_secret=OAUTH_CLIENT_SECRET,
@@ -35,6 +41,9 @@ if OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET and OAUTH_AUTHORIZE_URL and OAUTH_TOK
         access_token_url=OAUTH_TOKEN_URL,
         client_kwargs={"scope": OAUTH_SCOPE},
     )
+    if OAUTH_SERVER_METADATA_URL:
+        register_kwargs["server_metadata_url"] = OAUTH_SERVER_METADATA_URL
+    oauth.register(**register_kwargs)
 
 # static SPA directory
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
