@@ -6,6 +6,13 @@ All notable changes to this project are documented in this file.
 
 - No unreleased changes recorded.
 
+## [0.3.1](https://github.com/lucaam/social-media-reuploader/compare/v0.3.0...v0.3.1) (2026-05-14)
+
+
+### Bug Fixes
+
+* **downloader:** improve how videos are downloaded and reuploaded ([#18](https://github.com/lucaam/social-media-reuploader/issues/18)) ([19f91b6](https://github.com/lucaam/social-media-reuploader/commit/19f91b64b88959e1883bc0ec98a0860535f5bd81))
+
 ## [0.3.0](https://github.com/lucaam/social-media-reuploader/compare/v0.2.2...v0.3.0) (2026-05-13)
 
 
