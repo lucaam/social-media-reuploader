@@ -56,6 +56,16 @@ spec:
               value: '{{ .Values.env.WORKERS | default "2" }}'
             - name: WORKER_SHUTDOWN_TIMEOUT
               value: '{{ .Values.terminationGracePeriodSeconds | default $profile.terminationGracePeriodSeconds | quote }}'
+            - name: HEALTH_DEBUG
+              value: '{{ .Values.env.HEALTH_DEBUG | default "false" }}'
+            - name: YTDLP_USER_AGENT
+              value: '{{ .Values.env.YTDLP_USER_AGENT | default "" }}'
+            - name: YTDLP_COOKIES_PATH
+              value: '{{ .Values.env.YTDLP_COOKIES_PATH | default "" }}'
+            - name: YTDLP_COOKIES_FROM_BROWSER
+              value: '{{ .Values.env.YTDLP_COOKIES_FROM_BROWSER | default "" }}'
+            - name: YTDLP_HEADERS
+              value: '{{ .Values.env.YTDLP_HEADERS | default "" }}'
             {{- if .Values.db.pvc.enabled }}
             - name: REQUESTS_DB
               value: '{{ .Values.db.pvc.mountPath | default "/app/data" }}/requests.db'

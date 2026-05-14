@@ -83,6 +83,16 @@ spec:
               value: '{{ .Values.env.TELEGRAM_MAX_FILE_SIZE | default 52428800 }}'
             - name: WORKERS
               value: '{{ .Values.env.WORKERS | default "2" }}'
+            - name: HEALTH_DEBUG
+              value: '{{ .Values.env.HEALTH_DEBUG | default "false" }}'
+            - name: YTDLP_USER_AGENT
+              value: '{{ .Values.env.YTDLP_USER_AGENT | default "" }}'
+            - name: YTDLP_COOKIES_PATH
+              value: '{{ .Values.env.YTDLP_COOKIES_PATH | default "" }}'
+            - name: YTDLP_COOKIES_FROM_BROWSER
+              value: '{{ .Values.env.YTDLP_COOKIES_FROM_BROWSER | default "" }}'
+            - name: YTDLP_HEADERS
+              value: '{{ .Values.env.YTDLP_HEADERS | default "" }}'
 {{- else if $hasSecrets }}
           env:
             {{- if .Values.gui.secrets.adminToken }}
@@ -132,6 +142,16 @@ spec:
               value: '{{ .Values.env.TELEGRAM_MAX_FILE_SIZE | default 52428800 }}'
             - name: WORKERS
               value: '{{ .Values.env.WORKERS | default "2" }}'
+            - name: HEALTH_DEBUG
+              value: '{{ .Values.env.HEALTH_DEBUG | default "false" }}'
+            - name: YTDLP_USER_AGENT
+              value: '{{ .Values.env.YTDLP_USER_AGENT | default "" }}'
+            - name: YTDLP_COOKIES_PATH
+              value: '{{ .Values.env.YTDLP_COOKIES_PATH | default "" }}'
+            - name: YTDLP_COOKIES_FROM_BROWSER
+              value: '{{ .Values.env.YTDLP_COOKIES_FROM_BROWSER | default "" }}'
+            - name: YTDLP_HEADERS
+              value: '{{ .Values.env.YTDLP_HEADERS | default "" }}'
 {{- end }}
           resources:
 {{ toYaml .Values.guiResources | indent 12 }}
