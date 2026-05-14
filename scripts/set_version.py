@@ -26,8 +26,15 @@ def get_version_from_tag(tag: str | None) -> str | None:
             .strip()
         )
         return tag.lstrip("vV")
-    except Exception:
+    except (
+        subprocess.CalledProcessError,
+        subprocess.TimeoutExpired,
+        FileNotFoundError,
+    ):
         return None
+    except (KeyboardInterrupt, SystemExit):
+        # propagate control exceptions
+        raise
 
 
 def update_init_py(version: str, path: str = "src/__init__.py") -> bool:
@@ -77,6 +84,9 @@ def git_commit_and_push(
         )
         subprocess.check_call(["git", "config", "user.name", "github-actions[bot]"])
         subprocess.check_call(["git", "add"] + files, timeout=20)
+        # ensure commit messages from automation do not re-trigger CI
+        if "[skip ci]" not in message:
+            message = f"{message} [skip ci]"
         subprocess.check_call(["git", "commit", "-m", message], timeout=20)
         if branch:
             subprocess.check_call(["git", "push", remote, f"HEAD:{branch}"], timeout=30)
