@@ -1,0 +1,105 @@
+name: Manual Docker build and publish to GHCR
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Tag or ref to build (e.g. v0.5.1)'
+        required: true
+        default: 'v0.5.1'
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout requested tag
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ inputs.tag }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set cleaned release tag
+        run: |
+          TAG="${{ inputs.tag }}"
+          CLEAN_TAG=${TAG#v}
+          CLEAN_TAG=${CLEAN_TAG#V}
+          echo "CLEAN_TAG=${CLEAN_TAG}" >> "$GITHUB_ENV"
+
+      - name: Build and push to GHCR
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          platforms: linux/amd64,linux/arm64
+          tags: |
+            ghcr.io/${{ github.repository }}:${{ env.CLEAN_TAG }}
+            ghcr.io/${{ github.repository }}:latest
+          build-args: |
+            VCS_REF=${{ github.sha }}
+            BUILD_DATE=${{ github.run_started_at }}
+            VERSION=${{ env.CLEAN_TAG }}
+          labels: |
+            org.opencontainers.image.version=${{ env.CLEAN_TAG }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+            org.opencontainers.image.created=${{ github.run_started_at }}
+
+      - name: Make GHCR package public (optional via GHCR_PAT)
+        env:
+          OWNER: ${{ github.repository_owner }}
+          REPO: ${{ github.event.repository.name }}
+          GHCR_PAT: ${{ secrets.GHCR_PAT }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GHCR_PAT:-}" ]; then
+            printf 'GHCR_PAT not set — skipping automatic visibility change\n'
+            exit 0
+          fi
+          package_name="$REPO"
+          package_type="container"
+          printf 'Repository: %s, package: %s, owner: %s\n' "$GITHUB_REPOSITORY" "$package_name" "$OWNER"
+
+          resp=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+            -H "Authorization: Bearer $GHCR_PAT" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/orgs/${OWNER}/packages/${package_type}/${package_name}/visibility" \
+            -d '{"visibility":"public"}' || true)
+
+          if [ "$resp" = "200" ] || [ "$resp" = "201" ] || [ "$resp" = "204" ]; then
+            printf 'GHCR package visibility set to public (org endpoint).\n'
+            exit 0
+          fi
+
+          printf 'Org endpoint returned %s; trying user endpoint...\n' "$resp"
+
+          resp2=$(curl -s -o /dev/null -w "%{http_code}" -X PUT \
+            -H "Authorization: Bearer $GHCR_PAT" \
+            -H "Accept: application/vnd.github.v3+json" \
+            "https://api.github.com/user/packages/${package_type}/${package_name}/visibility" \
+            -d '{"visibility":"public"}' || true)
+
+          if [ "$resp2" = "200" ] || [ "$resp2" = "201" ] || [ "$resp2" = "204" ]; then
+            printf 'GHCR package visibility set to public (user endpoint).\n'
+            exit 0
+          fi
+
+          printf 'Failed to set GHCR package visibility: org=%s user=%s\n' "$resp" "$resp2"
+          printf 'This operation usually requires a personal access token (GHCR_PAT) with package write/admin privileges for the package owner.\nAdd a secret named GHCR_PAT and re-run the workflow to enable automatic visibility changes.\n'
