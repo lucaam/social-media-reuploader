@@ -351,7 +351,7 @@ async def main():
                 chat_id = getattr(chat, "id", None)
                 if chat_id:
                     text = (
-                        "Ciao! 👋 Sono il bot che prova a scaricare brevi video da YouTube, TikTok e Instagram e a condividerli qui. "
+                        "Ciao! 👋 Sono il bot che prova a scaricare brevi video da YouTube, TikTok, Instagram e Facebook e a condividerli qui. "
                         "In questo gruppo rispondo solo quando qualcuno incolla un link. "
                         "Nota: non posso scaricare contenuti che richiedono autenticazione."
                     )

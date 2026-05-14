@@ -7,7 +7,7 @@ PATTERNS = {
         re.IGNORECASE,
     ),
     "tiktok": re.compile(
-        r"(https?://(?:www\.)?(?:tiktok\.com|vm\.tiktok\.com|m\.tiktok\.com|v\.tiktok\.com)/[^\s]+)",
+        r"(https?://(?:(?:www\.)?tiktok\.com|vm\.tiktok\.com|m\.tiktok\.com|v\.tiktok\.com)/[^\s]+)",
         re.IGNORECASE,
     ),
     "instagram": re.compile(

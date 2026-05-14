@@ -240,8 +240,6 @@ async def download(
     logger.debug(
         "checking compatibility: ffmpeg_bin=%s yt_dlp_bin=%s", ffmpeg_bin, yt_dlp_bin
     )
-    # DEBUG TRACING
-    # import pdb; pdb.set_trace()
 
     # If we have a video+audio file but codecs are not widely compatible (e.g. vp9/opus),
     # transcode to h264/aac MP4 for better client compatibility. If codecs are compatible
