@@ -302,12 +302,74 @@ async def set_message_reaction(
 
         # no remove: use aiogram Bot (cached)
         bot = telegram_client.get_bot(token)
-        # aiogram expects a list of ReactionType objects
-        reaction_for_aiogram = payload_reaction
+
+        # aiogram expectations vary between versions. For a single emoji
+        # some versions expect a plain emoji string, while others accept
+        # structured ReactionType objects. Convert conservatively:
+        def _to_aiogram_reaction(payload):
+            if not payload:
+                return payload
+            if isinstance(payload, list) and len(payload) == 1:
+                single = payload[0]
+                if isinstance(single, dict):
+                    if single.get("type") == "emoji" and isinstance(
+                        single.get("emoji"), str
+                    ):
+                        return single["emoji"]
+                    return single
+                return single
+            if isinstance(payload, list):
+                # If all entries are simple emoji dicts, convert to list of emoji strings
+                emoji_list = []
+                for p in payload:
+                    if (
+                        isinstance(p, dict)
+                        and p.get("type") == "emoji"
+                        and isinstance(p.get("emoji"), str)
+                    ):
+                        emoji_list.append(p.get("emoji"))
+                    else:
+                        return payload
+                return emoji_list
+            return payload
+
+        reaction_for_aiogram = _to_aiogram_reaction(payload_reaction)
         logger.debug("set_message_reaction payload (aiogram): %s", reaction_for_aiogram)
-        res = await bot.set_message_reaction(
-            chat_id=chat_id, message_id=int(message_id), reaction=reaction_for_aiogram
-        )
+        try:
+            res = await bot.set_message_reaction(
+                chat_id=chat_id,
+                message_id=int(message_id),
+                reaction=reaction_for_aiogram,
+            )
+        except Exception as e:
+            # If aiogram/Telegram rejects the supplied form, try the raw HTTP API
+            logger.debug(
+                "aiogram set_message_reaction failed (%s), trying HTTP fallback", e
+            )
+            session = await http_client.get_session()
+            url = f"https://api.telegram.org/bot{token}/setMessageReaction"
+            payload = {
+                "chat_id": chat_id,
+                "message_id": int(message_id),
+                "reaction": payload_reaction,
+                "remove": False,
+            }
+            logger.debug("set_message_reaction HTTP payload (fallback): %s", payload)
+            async with session.post(url, json=payload) as resp:
+                try:
+                    result = await resp.json()
+                except Exception:
+                    result = {"ok": False, "status": resp.status}
+            logger.debug(
+                "set_message_reaction HTTP fallback response: %s for payload: %s",
+                result,
+                payload,
+            )
+            if isinstance(result, dict) and not result.get("ok"):
+                logger.warning(
+                    "set_message_reaction HTTP fallback returned non-ok: %s", result
+                )
+            return result
         logger.debug("set_message_reaction(aiogram) response: %s", res)
         if isinstance(res, dict) and not res.get("ok"):
             logger.warning("set_message_reaction(aiogram) returned non-ok: %s", res)
