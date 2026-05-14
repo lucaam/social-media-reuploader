@@ -90,6 +90,10 @@ def test_grant_admin_allows_requests(monkeypatch):
     # Ensure provider and simulate login
     gui.oauth._clients["provider"] = {}
 
+    # create a persistent admin mapping in the DB for this test user so the
+    # session grant is allowed but still requires entitlement
+    _db.add_user(username="u2", email="u2@example.com", role="admin")
+
     class Provider:
         async def authorize_redirect(self, request, redirect_uri):
             return RedirectResponse(url="/auth")

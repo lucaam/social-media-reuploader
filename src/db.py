@@ -1,6 +1,7 @@
 import datetime
 import os
 import sqlite3
+import threading
 
 
 def _db_path() -> str:
@@ -12,6 +13,13 @@ def _db_path() -> str:
     return os.environ.get(
         "REQUESTS_DB", os.path.join(os.getcwd(), "data", "requests.db")
     )
+
+
+# Cached in-memory fallback connection (created lazily). If the on-disk DB
+# cannot be opened we create a single shared in-memory connection so tests
+# and CI see a coherent DB across calls.
+_cached_memory_conn = None
+_cached_memory_lock = threading.Lock()
 
 
 def _init_db_conn(conn: sqlite3.Connection):
@@ -129,22 +137,52 @@ def _connect():
     and schema). If that still fails, fall back to an in-memory DB with the
     required schema so callers don't crash in CI/test environments.
     """
+    dbpath = _db_path()
     try:
-        return sqlite3.connect(_db_path())
-    except Exception:
-        # try to initialize DB path and retry
+        # Ensure parent directory exists before connecting.
+        dirpath = os.path.dirname(dbpath)
+        if dirpath and not os.path.exists(dirpath):
+            os.makedirs(dirpath, exist_ok=True)
+
+        conn = sqlite3.connect(dbpath)
+        # If the database file is empty or new, ensure schema is present so
+        # callers can rely on tables existing.
         try:
-            dbpath = _db_path()
-            dirpath = os.path.dirname(dbpath)
-            if dirpath and not os.path.exists(dirpath):
-                os.makedirs(dirpath, exist_ok=True)
-            init_db()
-            return sqlite3.connect(dbpath)
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='requests'"
+            )
+            if not cur.fetchone():
+                _init_db_conn(conn)
         except Exception:
-            # fallback to in-memory DB
-            conn = sqlite3.connect(":memory:")
-            _init_db_conn(conn)
+            pass
+        return conn
+    except Exception:
+        # try to initialize DB path and retry (covers races/permissions)
+        try:
+            init_db()
+            conn = sqlite3.connect(dbpath)
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='requests'"
+                )
+                if not cur.fetchone():
+                    _init_db_conn(conn)
+            except Exception:
+                pass
             return conn
+        except Exception:
+            # fallback to a cached in-memory DB so multiple calls operate on
+            # the same database instance during the process lifetime.
+            global _cached_memory_conn
+            with _cached_memory_lock:
+                if _cached_memory_conn is None:
+                    _cached_memory_conn = sqlite3.connect(
+                        ":memory:", check_same_thread=False
+                    )
+                    _init_db_conn(_cached_memory_conn)
+            return _cached_memory_conn
 
 
 def add_request(

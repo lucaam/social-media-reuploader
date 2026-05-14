@@ -154,7 +154,14 @@ def _get_oauth_provider():
     try:
         raw = getattr(oauth, "_clients", None)
         if raw and "provider" in raw:
-            return getattr(oauth, "provider", None)
+            # Some authlib versions store client instances directly in the
+            # internal _clients dict (e.g. authlib 1.7.x). Return the stored
+            # client rather than attempting attribute access which may not
+            # be present.
+            try:
+                return raw["provider"]
+            except Exception:
+                return getattr(oauth, "provider", None)
     except Exception:
         pass
     return None
@@ -221,6 +228,51 @@ def _check_admin_ws(websocket: WebSocket) -> bool:
             except Exception:
                 # If DB is not available (tests/CI), do not raise here.
                 pass
+    return False
+
+
+def _session_has_persistent_entitlement(session) -> bool:
+    """Return True if the given session's user is persistently entitled to admin
+
+    This checks OAuth group membership (when configured) and the DB role for
+    the user's email. It deliberately does NOT consider the transient
+    `session['is_admin']` flag.
+    """
+    if not session or not session.get("user"):
+        return False
+    try:
+        user = session.get("user")
+        # check groups if configured
+        if OAUTH_ADMIN_GROUPS_SET and isinstance(user, dict):
+            groups = user.get("groups") or user.get("memberOf") or user.get("member_of")
+            if groups:
+                if isinstance(groups, str):
+                    groups_list = [g.strip() for g in groups.split(",") if g.strip()]
+                elif isinstance(groups, (list, tuple)):
+                    groups_list = list(groups)
+                else:
+                    groups_list = [str(groups)]
+                for g in groups_list:
+                    if (
+                        g in OAUTH_ADMIN_GROUPS_SET
+                        or g.lower() in OAUTH_ADMIN_GROUPS_LOWER
+                    ):
+                        return True
+        # check DB role by email
+        email = None
+        if isinstance(user, dict):
+            email = (
+                user.get("email") or user.get("preferred_username") or user.get("sub")
+            )
+        if email:
+            try:
+                u = db.get_user_by_email(email)
+                if u and u[3] == "admin":
+                    return True
+            except Exception:
+                pass
+    except Exception:
+        pass
     return False
 
 
@@ -561,6 +613,11 @@ async def api_session_grant_admin(request: Request):
     session = request.session
     if not session or not session.get("user"):
         raise HTTPException(status_code=403, detail="not logged in")
+    # Only allow granting admin for sessions that already have a persistent
+    # entitlement (group membership or DB role). Do NOT allow any logged-in
+    # user to self-elevate.
+    if not _session_has_persistent_entitlement(session):
+        raise HTTPException(status_code=403, detail="not entitled")
     try:
         session["is_admin"] = True
     except Exception:
