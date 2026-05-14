@@ -39,7 +39,3 @@ YTDLP_COOKIES = os.getenv("YTDLP_COOKIES_PATH")
 YTDLP_COOKIES_FROM_BROWSER = os.getenv("YTDLP_COOKIES_FROM_BROWSER")
 # Optional extra headers for yt-dlp (format: 'Header: Value|Other: Value')
 YTDLP_HEADERS = os.getenv("YTDLP_HEADERS")
-
-# When true, avoid any automatic video resizing or scaling; keep original
-# resolution when possible. Set via environment variable `AVOID_RESIZE=1`.
-AVOID_RESIZE = os.getenv("AVOID_RESIZE", "false").lower() in ("1", "true", "yes")

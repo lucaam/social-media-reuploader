@@ -222,11 +222,9 @@ class WorkerPool:
             )
 
         # 3) full transcode to baseline H.264
-        # Respect config.AVOID_RESIZE: avoid changing resolution when requested.
-        if getattr(config, "AVOID_RESIZE", False):
-            vf_filter = "setsar=1"
-        else:
-            vf_filter = "scale=w=640:h=-2:force_original_aspect_ratio=decrease,setsar=1"
+        # Default: do not change resolution; only ensure SAR is set. If
+        # needed, callers may implement scaled transcode as a separate step.
+        vf_filter = "setsar=1"
 
         cmd_full = [
             ffmpeg_bin,

@@ -475,12 +475,10 @@ async def download(
                     vb = "1780k"
 
                 # Preserve original aspect ratio; avoid forcing fixed-pad frames.
-                # Respect config.AVOID_RESIZE to skip automatic resolution changes.
-                if getattr(config, "AVOID_RESIZE", False):
-                    # Avoid changing resolution; only ensure sample aspect ratio is set.
-                    scale_filter = "setsar=1"
-                else:
-                    scale_filter = f"scale=w={target_w}:h=-2:force_original_aspect_ratio=decrease,setsar=1"
+                # Default behaviour: do NOT change resolution — only ensure sample
+                # aspect ratio is set. If later compression fails to meet size
+                # constraints, we will attempt scaled recompression as a fallback.
+                scale_filter = "setsar=1"
 
                 ffmpeg_cmd = [
                     ffmpeg_bin,
@@ -782,18 +780,102 @@ async def download(
                 base = os.path.splitext(os.path.basename(input_path))[0]
                 out_path = os.path.join(dest_dir, f"{base}.recompressed.mp4")
 
-                # try decreasing quality and (optionally) resolution combinations
+                # try decreasing quality and resolution combinations. Default
+                # behaviour: first attempt CRF-only recompression (no resize).
                 scale_heights = [360, 240, 180]
                 crf_values = [28, 30, 32, 34, 36]
 
-                if getattr(config, "AVOID_RESIZE", False):
-                    # Preserve original resolution; only vary CRF to reduce size.
+                # Phase 1: CRF-only attempts (preserve original resolution)
+                for crf in crf_values:
+                    if os.path.exists(out_path):
+                        try:
+                            os.remove(out_path)
+                        except Exception:
+                            pass
+                    cmd = [
+                        ffmpeg_bin,
+                        "-y",
+                        "-max_muxing_queue_size",
+                        "9999",
+                        "-i",
+                        input_path,
+                        "-vf",
+                        "setsar=1",
+                        "-c:v",
+                        "libx264",
+                        "-preset",
+                        "faster",
+                        "-crf",
+                        str(crf),
+                        "-maxrate",
+                        "4.5M",
+                        "-flags",
+                        "+global_header",
+                        "-pix_fmt",
+                        "yuv420p",
+                        "-profile:v",
+                        "baseline",
+                        "-c:a",
+                        "aac",
+                        "-ac",
+                        "2",
+                        "-b:a",
+                        "128k",
+                        "-movflags",
+                        "+faststart",
+                        out_path,
+                    ]
+                    logger.debug(
+                        "Running ffmpeg recompress (no-resize): %s", " ".join(cmd)
+                    )
+                    try:
+                        proc = await _spawn(*cmd)
+                        try:
+                            stdout, stderr = await _await_proc(proc, to=300)
+                        except asyncio.TimeoutError:
+                            logger.warning(
+                                "ffmpeg recompress timed out for crf=%s", crf
+                            )
+                            continue
+                        if proc.returncode != 0:
+                            try:
+                                err_str = (
+                                    stderr.decode(errors="ignore") if stderr else ""
+                                )
+                            except Exception:
+                                err_str = "<decoding error>"
+                            logger.debug(
+                                "ffmpeg returned non-zero (%s). stderr=%s",
+                                proc.returncode,
+                                err_str,
+                            )
+                            continue
+                        if os.path.exists(out_path):
+                            new_size = os.path.getsize(out_path)
+                            logger.info(
+                                "Recompressed file size=%d (target=%d) with crf=%s (no-resize)",
+                                new_size,
+                                target_bytes,
+                                crf,
+                            )
+                            if new_size <= target_bytes:
+                                return out_path
+                            # otherwise keep trying
+                    except Exception:
+                        logger.exception(
+                            "Exception while attempting recompress (no-resize)"
+                        )
+                        continue
+
+                # Phase 2: try scaled recompression as a fallback
+                for h in scale_heights:
                     for crf in crf_values:
                         if os.path.exists(out_path):
                             try:
                                 os.remove(out_path)
                             except Exception:
                                 pass
+                        vf = f"scale=-2:{h}:force_original_aspect_ratio=decrease,setsar=1"
                         cmd = [
                             ffmpeg_bin,
                             "-y",
@@ -802,7 +884,7 @@ async def download(
                             "-i",
                             input_path,
                             "-vf",
-                            "setsar=1",
+                            vf,
                             "-c:v",
                             "libx264",
                             "-preset",
@@ -827,48 +909,12 @@ async def download(
                             "+faststart",
                             out_path,
                         ]
-                else:
-                    for h in scale_heights:
-                        for crf in crf_values:
-                            if os.path.exists(out_path):
-                                try:
-                                    os.remove(out_path)
-                                except Exception:
-                                    pass
-                            cmd = [
-                                ffmpeg_bin,
-                                "-y",
-                                "-max_muxing_queue_size",
-                                "9999",
-                                "-i",
-                                input_path,
-                                "-vf",
-                                "scale=w=640:h=-2:force_original_aspect_ratio=decrease,setsar=1",
-                                "-c:v",
-                                "libx264",
-                                "-preset",
-                                "faster",
-                                "-crf",
-                                str(crf),
-                                "-maxrate",
-                                "4.5M",
-                                "-flags",
-                                "+global_header",
-                                "-pix_fmt",
-                                "yuv420p",
-                                "-profile:v",
-                                "baseline",
-                                "-c:a",
-                                "aac",
-                                "-ac",
-                                "2",
-                                "-b:a",
-                                "128k",
-                                "-movflags",
-                                "+faststart",
-                                out_path,
-                            ]
-                        logger.debug("Running ffmpeg recompress: %s", " ".join(cmd))
+                        logger.debug(
+                            "Running ffmpeg recompress (scale=%s crf=%s): %s",
+                            h,
+                            crf,
+                            " ".join(cmd),
+                        )
                         try:
                             proc = await _spawn(*cmd)
                             try:
@@ -880,27 +926,13 @@ async def download(
                                     h,
                                 )
                                 continue
-                            try:
-                                out_str = (
-                                    stdout.decode(errors="ignore") if stdout else ""
-                                )
-                            except Exception:
-                                out_str = "<decoding error>"
-                            try:
-                                err_str = (
-                                    stderr.decode(errors="ignore") if stderr else ""
-                                )
-                            except Exception:
-                                err_str = "<decoding error>"
-                            logger.debug(
-                                "ffmpeg recompress stdout (truncated): %s",
-                                out_str[:2000],
-                            )
-                            logger.debug(
-                                "ffmpeg recompress stderr (truncated): %s",
-                                err_str[:2000],
-                            )
                             if proc.returncode != 0:
+                                try:
+                                    err_str = (
+                                        stderr.decode(errors="ignore") if stderr else ""
+                                    )
+                                except Exception:
+                                    err_str = "<decoding error>"
                                 logger.debug(
                                     "ffmpeg returned non-zero (%s). stderr=%s",
                                     proc.returncode,
@@ -920,7 +952,9 @@ async def download(
                                     return out_path
                                 # otherwise keep trying
                         except Exception:
-                            logger.exception("Exception while attempting recompress")
+                            logger.exception(
+                                "Exception while attempting recompress (scale)"
+                            )
                             continue
                 return None
 
