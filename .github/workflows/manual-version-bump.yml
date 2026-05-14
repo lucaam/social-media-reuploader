@@ -1,0 +1,62 @@
+name: Manual Version Bump
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  bump:
+    name: Bump versions and open PR
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Set git user
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Setup Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.12'
+
+      - name: Run bump script
+        id: bump
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 scripts/release/bump_versions.py > bump-output.txt || true
+          if [ -s bump-output.txt ]; then
+            BRANCH=$(sed -n '1p' bump-output.txt)
+            VERSION=$(sed -n '2p' bump-output.txt)
+            echo "branch=$BRANCH" >> $GITHUB_OUTPUT
+            echo "version=$VERSION" >> $GITHUB_OUTPUT
+          else
+            echo "branch=" >> $GITHUB_OUTPUT
+            echo "version=" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Create Pull Request
+        if: steps.bump.outputs.branch != ''
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          BRANCH=${{ steps.bump.outputs.branch }}
+          VERSION=${{ steps.bump.outputs.version }}
+          # Compose simple changelog from commits since last tag if available
+          LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || true)
+          if [ -n "$LAST_TAG" ]; then
+            COMMITS=$(git log --pretty=format:'- %s' "$LAST_TAG"..HEAD)
+          else
+            COMMITS=$(git log --pretty=format:'- %s' HEAD)
+          fi
+          gh pr create --title "chore(release): bump versions to v${VERSION}" \
+            --body "Automated version bump to v${VERSION}\n\nCommits:\n${COMMITS}" \
+            --head "$BRANCH" --base main
