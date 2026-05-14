@@ -328,11 +328,16 @@ async def main():
     global app_worker
     app_worker = WorkerPool(config.BOT_TOKEN, workers=config.WORKERS)
 
-    # Provide a lightweight HTTP health endpoint when running in polling
-    # mode so Kubernetes liveness/readiness probes don't kill the process
-    # while long-running downloads/transcodes are in progress.
+    # Provide a lightweight HTTP health endpoint so Kubernetes
+    # liveness/readiness probes don't kill the process while
+    # long-running downloads/transcodes are in progress.
+    # Start the health endpoint unless we're running in webhook
+    # mode with a configured `WEBHOOK_URL` (in that case another
+    # HTTP server will be serving webhooks/health).
     health_runner = None
-    if getattr(config, "MODE", "polling") == "polling":
+    mode = getattr(config, "MODE", "polling")
+    webhook_url = getattr(config, "WEBHOOK_URL", None)
+    if not (mode == "webhook" and webhook_url):
         try:
 
             async def _health(request: web.Request):
