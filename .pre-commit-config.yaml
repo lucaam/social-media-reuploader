@@ -37,6 +37,15 @@ repos:
 
   - repo: local
     hooks:
+      - id: helm-lint
+        name: helm lint (charts)
+        entry: helm lint charts/social-media-reuploader
+        language: system
+        pass_filenames: false
+        stages: [pre-push]
+
+  - repo: local
+    hooks:
       - id: commitlint
         name: commitlint (Conventional Commits)
         entry: scripts/commit-msg-fix.sh
