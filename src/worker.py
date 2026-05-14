@@ -222,6 +222,10 @@ class WorkerPool:
             )
 
         # 3) full transcode to baseline H.264
+        # Default: do not change resolution; only ensure SAR is set. If
+        # needed, callers may implement scaled transcode as a separate step.
+        vf_filter = "setsar=1"
+
         cmd_full = [
             ffmpeg_bin,
             "-y",
@@ -242,7 +246,7 @@ class WorkerPool:
             "-pix_fmt",
             "yuv420p",
             "-vf",
-            "scale=w=640:h=-2:force_original_aspect_ratio=decrease,setsar=1",
+            vf_filter,
             "-c:a",
             "aac",
             "-b:a",
