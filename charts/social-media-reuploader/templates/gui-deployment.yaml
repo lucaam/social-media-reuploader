@@ -123,6 +123,14 @@ spec:
             - name: OAUTH_USERINFO_URL
               value: "{{ .Values.gui.secrets.oauthUserinfoUrl }}"
             {{- end }}
+            {{- if .Values.gui.secrets.oauthJwksUri }}
+            - name: OAUTH_JWKS_URI
+              value: "{{ .Values.gui.secrets.oauthJwksUri }}"
+            {{- end }}
+            {{- if .Values.gui.secrets.oauthServerMetadataUrl }}
+            - name: OAUTH_SERVER_METADATA_URL
+              value: "{{ .Values.gui.secrets.oauthServerMetadataUrl }}"
+            {{- end }}
             {{- /* append REQUESTS_DB and runtime defaults */}}
             {{- if .Values.db.pvc.enabled }}
             - name: REQUESTS_DB
