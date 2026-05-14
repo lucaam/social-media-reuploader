@@ -125,6 +125,39 @@ def _check_admin(request: Request) -> bool:
     return False
 
 
+def _get_oauth_provider():
+    """Return a provider client in a way that works across authlib versions.
+
+    Some authlib versions expose registered clients as attribute access
+    (e.g. ``oauth.provider``). Newer versions encourage using
+    ``oauth.create_client(name)``. Tests may also monkeypatch
+    ``oauth.provider`` directly. Try several fallbacks and return the
+    first callable-like provider.
+    """
+    # prefer attribute access if present
+    try:
+        if hasattr(oauth, "provider") and getattr(oauth, "provider") is not None:
+            return getattr(oauth, "provider")
+    except Exception:
+        pass
+    # try authlib factory method
+    try:
+        if hasattr(oauth, "create_client"):
+            client = oauth.create_client("provider")
+            if client is not None:
+                return client
+    except Exception:
+        pass
+    # finally, fall back to raw _clients dict (used in some tests)
+    try:
+        raw = getattr(oauth, "_clients", None)
+        if raw and "provider" in raw:
+            return getattr(oauth, "provider", None)
+    except Exception:
+        pass
+    return None
+
+
 def _check_admin_ws(websocket: WebSocket) -> bool:
     # same as _check_admin but for WebSocket scope
     admin_token = os.environ.get("ADMIN_TOKEN")
@@ -284,16 +317,20 @@ async def health(request: Request):
 
 @app.get("/login")
 async def login(request: Request):
-    if "provider" not in oauth._clients:
+    provider = _get_oauth_provider()
+    if not provider:
         raise HTTPException(status_code=400, detail="OAuth provider not configured")
     redirect_uri = request.url_for("auth")
-    return await oauth.provider.authorize_redirect(request, redirect_uri)
+    return await provider.authorize_redirect(request, redirect_uri)
 
 
 @app.get("/auth")
 async def auth(request: Request):
+    provider = _get_oauth_provider()
+    if not provider:
+        raise HTTPException(status_code=400, detail="OAuth provider not configured")
     try:
-        token = await oauth.provider.authorize_access_token(request)
+        token = await provider.authorize_access_token(request)
     except OAuthError as err:
         raise HTTPException(status_code=400, detail=str(err))
 

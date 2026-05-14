@@ -49,7 +49,7 @@ def test_login_and_auth_flow_sets_session(monkeypatch):
                 },
             }
 
-    monkeypatch.setattr(gui.oauth, "provider", Provider())
+    monkeypatch.setattr(gui.oauth, "provider", Provider(), raising=False)
 
     client = TestClient(gui.app)
 
@@ -84,7 +84,7 @@ def test_grant_admin_allows_requests(monkeypatch):
                 "userinfo": {"sub": "u2", "email": "u2@example.com"},
             }
 
-    monkeypatch.setattr(gui.oauth, "provider", Provider())
+    monkeypatch.setattr(gui.oauth, "provider", Provider(), raising=False)
 
     client = TestClient(gui.app)
 
@@ -126,7 +126,7 @@ def test_oauth_group_auto_admin(monkeypatch):
                 },
             }
 
-    monkeypatch.setattr(gui.oauth, "provider", Provider())
+    monkeypatch.setattr(gui.oauth, "provider", Provider(), raising=False)
     # inject admin group config into module for the test
     orig_groups = set(gui.OAUTH_ADMIN_GROUPS_SET)
     orig_groups_lower = set(gui.OAUTH_ADMIN_GROUPS_LOWER)
