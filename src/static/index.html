@@ -301,6 +301,28 @@
           btn.className = 'btn btn-sm btn-outline-primary ms-2'
           btn.textContent = me.user && me.user.login ? ('Logout ' + (me.user.login || '')) : 'Login with OAuth'
           document.querySelector('.d-flex.justify-content-between').appendChild(btn)
+          // If the user is logged in via OAuth, offer a button to grant
+          // admin rights for this session (session-scoped). This allows the
+          // GUI to be usable without requiring a persistent DB user entry.
+          if (me && me.user) {
+            const grant = document.createElement('button')
+            grant.className = 'btn btn-sm btn-outline-success ms-2'
+            grant.textContent = 'Grant session admin'
+            grant.onclick = async () => {
+              try {
+                const r = await fetch('/api/session/grant_admin', { method: 'POST' })
+                if (r.ok) {
+                  alert('Session granted admin rights')
+                  loadAll()
+                } else {
+                  alert('Could not grant admin rights')
+                }
+              } catch (e) {
+                alert('Error granting admin rights')
+              }
+            }
+            document.querySelector('.d-flex.justify-content-between').appendChild(grant)
+          }
         }
       } catch (e) {
         // ignore

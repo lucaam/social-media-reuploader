@@ -76,6 +76,13 @@ def _check_admin(request: Request) -> bool:
 
     # OAuth session fallback: check DB for user role
     session = request.session
+    # Session-level admin override: allow granting admin for the current
+    # session after a successful OAuth login (see /api/session/grant_admin).
+    try:
+        if session and session.get("is_admin"):
+            return True
+    except Exception:
+        pass
     # Optional: map OAuth groups to admin role when configured
     if OAUTH_ADMIN_GROUPS_SET and session and session.get("user"):
         try:
@@ -132,6 +139,12 @@ def _check_admin_ws(websocket: WebSocket) -> bool:
             return True
     # session via scope
     session = websocket.session if hasattr(websocket, "session") else None
+    # Session-level admin override (for WebSocket scope as well)
+    try:
+        if session and session.get("is_admin"):
+            return True
+    except Exception:
+        pass
     # Optional: map OAuth groups to admin role when configured (WebSocket)
     if OAUTH_ADMIN_GROUPS_SET and session and session.get("user"):
         try:
@@ -446,6 +459,32 @@ async def api_list_users(request: Request, limit: int = 50, offset: int = 0):
         for r in rows
     ]
     return JSONResponse({"items": results, "offset": offset, "limit": limit})
+
+
+@app.post("/api/session/grant_admin")
+async def api_session_grant_admin(request: Request):
+    # Allow a logged-in OAuth session to grant itself admin rights for the
+    # current session. This is intentionally session-scoped and does not
+    # modify persistent DB state.
+    session = request.session
+    if not session or not session.get("user"):
+        raise HTTPException(status_code=403, detail="not logged in")
+    try:
+        session["is_admin"] = True
+    except Exception:
+        raise HTTPException(status_code=500, detail="failed to set session")
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/session/revoke_admin")
+async def api_session_revoke_admin(request: Request):
+    session = request.session
+    try:
+        if session and session.get("is_admin"):
+            session.pop("is_admin", None)
+    except Exception:
+        pass
+    return JSONResponse({"ok": True})
 
 
 @app.post("/api/users")

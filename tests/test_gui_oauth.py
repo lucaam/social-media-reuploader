@@ -59,3 +59,38 @@ def test_login_and_auth_flow_sets_session(monkeypatch):
     assert r3.status_code == 200
     j = r3.json()
     assert "user" in j
+
+
+def test_grant_admin_allows_requests(monkeypatch):
+    # Ensure provider and simulate login
+    gui.oauth._clients["provider"] = {}
+
+    class Provider:
+        async def authorize_redirect(self, request, redirect_uri):
+            return RedirectResponse(url="/auth")
+
+        async def authorize_access_token(self, request):
+            return {"access_token": "tok123"}
+
+    monkeypatch.setattr(gui.oauth, "provider", Provider())
+
+    client = TestClient(gui.app)
+
+    # login/auth -> session created
+    client.get("/login", allow_redirects=False)
+    client.get("/auth", allow_redirects=False)
+
+    # before granting admin the /requests endpoint should be forbidden
+    r = client.get("/requests")
+    assert r.status_code == 403
+
+    # grant admin for session
+    r2 = client.post("/api/session/grant_admin")
+    assert r2.status_code == 200
+    assert r2.json().get("ok") is True
+
+    # now requests should succeed (empty list)
+    r3 = client.get("/requests")
+    assert r3.status_code == 200
+    data = r3.json()
+    assert "items" in data
