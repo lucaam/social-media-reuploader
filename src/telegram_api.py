@@ -276,6 +276,8 @@ async def set_message_reaction(
                         else payload_reaction
                     )
                     try:
+                        # aiogram expects a list of ReactionType objects; always pass a list
+                        reaction_for_aiogram = payload_reaction
                         res = await bot.set_message_reaction(
                             chat_id=chat_id,
                             message_id=int(message_id),
@@ -305,10 +307,8 @@ async def set_message_reaction(
 
         # no remove: use aiogram Bot (cached)
         bot = telegram_client.get_bot(token)
-        # prefer single ReactionType object for aiogram when only one reaction
-        reaction_for_aiogram = (
-            payload_reaction[0] if len(payload_reaction) == 1 else payload_reaction
-        )
+        # aiogram expects a list of ReactionType objects
+        reaction_for_aiogram = payload_reaction
         logger.debug("set_message_reaction payload (aiogram): %s", reaction_for_aiogram)
         res = await bot.set_message_reaction(
             chat_id=chat_id, message_id=int(message_id), reaction=reaction_for_aiogram

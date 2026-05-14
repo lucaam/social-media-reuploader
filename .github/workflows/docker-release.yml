@@ -51,7 +51,7 @@ jobs:
           TAG="${{ github.event.release.tag_name }}"
           CLEAN_TAG=${TAG#v}
           CLEAN_TAG=${CLEAN_TAG#V}
-          echo "CLEAN_TAG=${CLEAN_TAG}" >> $GITHUB_ENV
+          echo "CLEAN_TAG=${CLEAN_TAG}" >> "$GITHUB_ENV"
 
       - name: Build and push to GHCR
         uses: docker/build-push-action@v5
