@@ -12,7 +12,7 @@ serviceAccount:
 
 image:
   repository: ghcr.io/lucaam/social-media-reuploader
-  tag: "0.6.0"
+  tag: "0.6.1"
   pullPolicy: IfNotPresent
 
 # Optional imagePullSecrets for private registries
@@ -129,7 +129,7 @@ gui:
   # by default use the same image as the main app; override to a separate image if needed
   image:
     repository: ghcr.io/lucaam/social-media-reuploader
-    tag: "0.6.0"
+    tag: "0.6.1"
     pullPolicy: IfNotPresent
   port: 8081
   # Command to run in the GUI container. By default run the FastAPI app with uvicorn
