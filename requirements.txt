@@ -4,7 +4,7 @@ aiogram==3.28.2
 fastapi==0.136.1
 authlib==1.7.2
 httpx==0.28.1
-itsdangerous==2.1.2
+itsdangerous==2.2.0
 prometheus-client==0.25.0
 uvicorn==0.46.0
 websockets==16.0
