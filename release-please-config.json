@@ -1,0 +1,17 @@
+{
+  "packages": {
+    ".": {
+      "releaseType": "python",
+      "bumpFiles": [
+        {
+          "filename": "src/version.py",
+          "type": "python"
+        }
+      ]
+    },
+    "charts/social-media-reuploader": {
+      "releaseType": "helm",
+      "path": "charts/social-media-reuploader"
+    }
+  }
+}
