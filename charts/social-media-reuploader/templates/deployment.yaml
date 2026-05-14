@@ -58,7 +58,7 @@ spec:
               value: '{{ .Values.terminationGracePeriodSeconds | default $profile.terminationGracePeriodSeconds | quote }}'
             {{- if .Values.db.pvc.enabled }}
             - name: REQUESTS_DB
-              value: "{{ .Values.db.pvc.mountPath | default \"/app/data\" }}/requests.db"
+              value: '{{ .Values.db.pvc.mountPath | default "/app/data" }}/requests.db'
             {{- end }}
           {{- if .Values.db.pvc.enabled }}
           volumeMounts:
