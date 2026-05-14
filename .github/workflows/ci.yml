@@ -16,6 +16,12 @@ jobs:
           python-version: '3.14'
       - name: Install dependencies
         run: pip install -r requirements.txt -r requirements-dev.txt
+      - name: Prepare writable REQUESTS_DB for tests
+        run: |
+          mkdir -p "$GITHUB_WORKSPACE/test_db"
+          echo "REQUESTS_DB=$GITHUB_WORKSPACE/test_db/requests.db" >> $GITHUB_ENV
+          python -c "from src import db; db.init_db()"
+        shell: bash
       - name: Run tests
         run: |
           pytest -q
