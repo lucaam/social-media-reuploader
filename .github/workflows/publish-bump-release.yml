@@ -1,0 +1,40 @@
+name: Publish Release on Bump PR Merge
+
+on:
+  pull_request:
+    types: [closed]
+
+permissions:
+  contents: write
+
+jobs:
+  publish:
+    name: Create release when bump PR is merged
+    # Only run when a bump PR was merged (title: "chore(release): bump versions to vX.Y.Z")
+    if: "github.event.pull_request.merged == true && startsWith(github.event.pull_request.title, 'chore(release): bump versions to v')"
+    runs-on: ubuntu-latest
+    steps:
+      - name: Extract version from PR title
+        id: vars
+        run: |
+          TITLE='${{ github.event.pull_request.title }}'
+          VERSION=$(echo "$TITLE" | sed -n 's/.*v\([0-9]\+\.[0-9]\+\.[0-9]\+\).*/\1/p')
+          if [ -z "$VERSION" ]; then
+            echo "Could not extract version from title: $TITLE"
+            exit 1
+          fi
+          TAG="v$VERSION"
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: actions/create-release@v1
+        with:
+          tag_name: ${{ steps.vars.outputs.tag }}
+          release_name: ${{ steps.vars.outputs.tag }}
+          body: "Automated release for ${{ steps.vars.outputs.tag }} created from bump PR #${{ github.event.pull_request.number }}"
+          draft: false
+          prerelease: false
+          target_commitish: ${{ github.event.pull_request.merge_commit_sha }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

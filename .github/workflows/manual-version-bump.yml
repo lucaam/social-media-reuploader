@@ -23,7 +23,7 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Setup Python
-        uses: actions/setup-python@v4
+        uses: actions/setup-python@v6.2.0
         with:
           python-version: '3.14'
 
@@ -36,11 +36,11 @@ jobs:
           if [ -s bump-output.txt ]; then
             BRANCH=$(sed -n '1p' bump-output.txt)
             VERSION=$(sed -n '2p' bump-output.txt)
-            echo "branch=$BRANCH" >> $GITHUB_OUTPUT
-            echo "version=$VERSION" >> $GITHUB_OUTPUT
+            echo "branch=${BRANCH}" >> "$GITHUB_OUTPUT"
+            echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           else
-            echo "branch=" >> $GITHUB_OUTPUT
-            echo "version=" >> $GITHUB_OUTPUT
+            echo "branch=" >> "$GITHUB_OUTPUT"
+            echo "version=" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Create Pull Request
