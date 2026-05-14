@@ -5,6 +5,7 @@ import re
 
 from aiogram import Bot, Dispatcher
 from aiogram.types import ChatMemberUpdated, Message, Update
+from aiohttp import web
 
 from . import __version__, config, db, http_client, telegram_api, telegram_client
 from .link_utils import find_links, is_supported
@@ -312,6 +313,26 @@ async def main():
     global app_worker
     app_worker = WorkerPool(config.BOT_TOKEN, workers=config.WORKERS)
 
+    # Provide a lightweight HTTP health endpoint when running in polling
+    # mode so Kubernetes liveness/readiness probes don't kill the process
+    # while long-running downloads/transcodes are in progress.
+    health_runner = None
+    if getattr(config, "MODE", "polling") == "polling":
+        try:
+
+            async def _health(request: web.Request):
+                return web.Response(text="ok")
+
+            health_app = web.Application()
+            health_app.router.add_get("/health", _health)
+            health_runner = web.AppRunner(health_app)
+            await health_runner.setup()
+            site = web.TCPSite(health_runner, host=config.HOST, port=config.PORT)
+            await site.start()
+            logger.info("Health endpoint listening on %s:%s", config.HOST, config.PORT)
+        except Exception:
+            logger.exception("Failed to start health endpoint")
+
     # ensure DB exists for update storage
     try:
         db.init_db()
@@ -389,6 +410,11 @@ async def main():
             pass
         try:
             await http_client.close_session()
+        except Exception:
+            pass
+        try:
+            if health_runner:
+                await health_runner.cleanup()
         except Exception:
             pass
 
