@@ -341,7 +341,53 @@ async def main():
         try:
 
             async def _health(request: web.Request):
-                return web.Response(text="ok")
+                # Minimal response for probes to keep Kubernetes happy.
+                # Only expose diagnostic details when HEALTH_DEBUG is enabled.
+                try:
+                    if not getattr(config, "HEALTH_DEBUG", False):
+                        return web.Response(text="ok")
+                except Exception:
+                    return web.Response(text="ok")
+
+                # Diagnostic payload (debug mode)
+                try:
+                    worker_tasks = 0
+                    worker_running = 0
+                    worker_slots_free = None
+                    if globals().get("app_worker"):
+                        try:
+                            tasks = getattr(app_worker, "_tasks", set()) or set()
+                            worker_tasks = len(tasks)
+                            worker_running = sum(
+                                1
+                                for t in tasks
+                                if not getattr(t, "done", lambda: True)()
+                            )
+                        except Exception:
+                            worker_tasks = len(getattr(app_worker, "_tasks", set()))
+                        try:
+                            worker_slots_free = getattr(
+                                getattr(app_worker, "_sem", None), "_value", None
+                            )
+                        except Exception:
+                            worker_slots_free = None
+                    db_ok = False
+                    try:
+                        db.init_db()
+                        db_ok = True
+                    except Exception:
+                        db_ok = False
+                    payload = {
+                        "ok": True,
+                        "mode": getattr(config, "MODE", "polling"),
+                        "worker_tasks": worker_tasks,
+                        "worker_running": worker_running,
+                        "worker_slots_free": worker_slots_free,
+                        "db_ok": db_ok,
+                    }
+                    return web.json_response(payload)
+                except Exception:
+                    return web.Response(text="ok")
 
             health_app = web.Application()
             health_app.router.add_get("/health", _health)

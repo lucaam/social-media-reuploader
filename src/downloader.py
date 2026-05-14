@@ -19,6 +19,11 @@ async def download(
     timeout: int = 300,
     max_bytes: Optional[int] = None,
     notify=None,
+    # yt-dlp impersonation / auth options (optional)
+    ytdlp_user_agent: Optional[str] = None,
+    ytdlp_cookies: Optional[str] = None,
+    ytdlp_cookies_from_browser: Optional[str] = None,
+    ytdlp_headers: Optional[dict] = None,
 ) -> (str, dict):
     """
     Download a media resource using yt-dlp to `dest_dir` and return the downloaded file path.
@@ -105,6 +110,32 @@ async def download(
         cmd = base_cmd + ["--no-playlist", "-f", fmt, "-o", out_template]
         if max_bytes:
             cmd += ["--max-filesize", str(max_bytes)]
+        # apply global/default yt-dlp impersonation/auth options
+        ua = ytdlp_user_agent or getattr(config, "YTDLP_USER_AGENT", None)
+        if ua:
+            cmd += ["--user-agent", ua]
+        cookies_path = ytdlp_cookies or getattr(config, "YTDLP_COOKIES", None)
+        if cookies_path:
+            cmd += ["--cookies", cookies_path]
+        cookies_from_browser = ytdlp_cookies_from_browser or getattr(
+            config, "YTDLP_COOKIES_FROM_BROWSER", None
+        )
+        if cookies_from_browser:
+            cmd += ["--cookies-from-browser", cookies_from_browser]
+        # headers: merge function arg with env-var parsing if present
+        headers = ytdlp_headers or None
+        if not headers and getattr(config, "YTDLP_HEADERS", None):
+            try:
+                headers = {}
+                for part in getattr(config, "YTDLP_HEADERS").split("|"):
+                    if ":" in part:
+                        k, v = part.split(":", 1)
+                        headers[k.strip()] = v.strip()
+            except Exception:
+                headers = {}
+        if headers:
+            for k, v in headers.items():
+                cmd += ["--add-header", f"{k}: {v}"]
         cmd += [url]
 
         logger.debug("Trying yt-dlp format '%s': %s", fmt, " ".join(cmd))

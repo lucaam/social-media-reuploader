@@ -26,3 +26,16 @@ WORKER_GENERATE_THUMBNAIL = os.getenv("WORKER_GENERATE_THUMBNAIL", "true").lower
     "true",
     "yes",
 )
+
+# Control whether health endpoints expose diagnostic details.
+# Set to true only for debugging / operator troubleshooting; Kubernetes
+# probes call /health frequently so keep disabled in production.
+HEALTH_DEBUG = os.getenv("HEALTH_DEBUG", "false").lower() in ("1", "true", "yes")
+
+# yt-dlp helper defaults: optional user-agent, cookies path or cookies-from-browser
+# These can be set as environment variables in Helm values for bot workers.
+YTDLP_USER_AGENT = os.getenv("YTDLP_USER_AGENT")
+YTDLP_COOKIES = os.getenv("YTDLP_COOKIES_PATH")
+YTDLP_COOKIES_FROM_BROWSER = os.getenv("YTDLP_COOKIES_FROM_BROWSER")
+# Optional extra headers for yt-dlp (format: 'Header: Value|Other: Value')
+YTDLP_HEADERS = os.getenv("YTDLP_HEADERS")

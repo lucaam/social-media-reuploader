@@ -8,7 +8,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from starlette.middleware.sessions import SessionMiddleware
 
-from . import db, ws_broadcast
+from . import config, db, ws_broadcast
 from .db import DB_PATH
 
 app = FastAPI(title="Social media reuploader - Admin GUI")
@@ -152,8 +152,34 @@ async def api_me(request: Request):
 
 
 @app.get("/health")
-async def health():
-    return JSONResponse({"ok": True})
+async def health(request: Request):
+    # Minimal probe response by default. Expose diagnostics only when enabled.
+    try:
+        if not getattr(config, "HEALTH_DEBUG", False):
+            return JSONResponse({"ok": True})
+    except Exception:
+        return JSONResponse({"ok": True})
+
+    # Diagnostic payload
+    try:
+        try:
+            db.init_db()
+            total_requests = db.count_requests()
+            db_ok = True
+        except Exception:
+            total_requests = None
+            db_ok = False
+        ws_conns = getattr(ws_broadcast, "_connections", None)
+        ws_count = len(ws_conns) if ws_conns is not None else 0
+        payload = {
+            "ok": True,
+            "db_ok": db_ok,
+            "total_requests": total_requests,
+            "ws_clients": ws_count,
+        }
+        return JSONResponse(payload)
+    except Exception:
+        return JSONResponse({"ok": True})
 
 
 @app.get("/login")
