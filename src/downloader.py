@@ -30,6 +30,23 @@ async def download(
     # track spawned subprocesses so we can terminate them on cancellation/exit
     procs: set = set()
 
+    async def _cleanup_procs():
+        # best-effort: terminate any remaining child processes to avoid subprocess
+        # transports being garbage-collected after the event loop is closed
+        for p in list(procs):
+            try:
+                if getattr(p, "returncode", None) is None:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+                    try:
+                        await p.communicate()
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+
     async def _spawn(*cmd_args):
         p = await asyncio.create_subprocess_exec(*cmd_args, stdout=PIPE, stderr=PIPE)
         procs.add(p)
@@ -122,12 +139,14 @@ async def download(
     if proc is None or (getattr(proc, "returncode", None) != 0):
         err = stderr.decode(errors="ignore") if stderr else ""
         logger.error("yt-dlp failed (all format attempts): %s", err)
+        await _cleanup_procs()
         raise RuntimeError(f"yt-dlp failed: {err.strip()[:200]}")
 
     # if we fell through above but didn't set `latest`, pick newest file now
     if "latest" not in locals():
         files = glob.glob(os.path.join(dest_dir, "*"))
         if not files:
+            await _cleanup_procs()
             raise RuntimeError("no file downloaded")
         latest = max(files, key=os.path.getmtime)
         logger.debug("picked latest file %s", latest)
@@ -927,22 +946,9 @@ async def download(
                 )
 
         if config.TELEGRAM_MAX_FILE_SIZE and size > config.TELEGRAM_MAX_FILE_SIZE:
+            await _cleanup_procs()
             raise RuntimeError(f"downloaded file too large ({size} bytes)")
-    # best-effort: terminate any remaining child processes to avoid subprocess
-    # transports being garbage-collected after the event loop is closed
-    for p in list(procs):
-        try:
-            if getattr(p, "returncode", None) is None:
-                try:
-                    p.kill()
-                except Exception:
-                    pass
-                try:
-                    await p.communicate()
-                except Exception:
-                    pass
-        except Exception:
-            pass
+    await _cleanup_procs()
 
     # return metadata for the downloaded file in all code paths
     meta = {

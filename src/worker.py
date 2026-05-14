@@ -304,7 +304,8 @@ class WorkerPool:
     ):
         request_id = None
         tmpdir = tempfile.mkdtemp()
-        reaction_added = False
+        # track which reaction we added on the original message (None, 'eyes', 'banana')
+        reaction_current: Optional[str] = None
         status_msg_id = None
         try:
             try:
@@ -329,7 +330,7 @@ class WorkerPool:
                     else:
                         ok = bool(r)
                     if ok:
-                        reaction_added = True
+                        reaction_current = "eyes"
                     else:
                         logger.debug(
                             "set_message_reaction returned non-ok; falling back to status message"
@@ -425,25 +426,43 @@ class WorkerPool:
                         ):
                             if original_message_id:
                                 try:
-                                    if reaction_added:
+                                    if reaction_current == "eyes":
                                         try:
-                                            await telegram_api.set_message_reaction(
-                                                self.token,
-                                                chat_id,
-                                                original_message_id,
-                                                "👀",
-                                                remove=True,
+                                            rrem = (
+                                                await telegram_api.set_message_reaction(
+                                                    self.token,
+                                                    chat_id,
+                                                    original_message_id,
+                                                    "👀",
+                                                    remove=True,
+                                                )
                                             )
+                                            # if removal succeeded, clear state
+                                            if isinstance(rrem, dict) and rrem.get(
+                                                "ok"
+                                            ):
+                                                reaction_current = None
                                         except Exception:
                                             pass
                                     try:
-                                        await telegram_api.set_message_reaction(
+                                        radd = await telegram_api.set_message_reaction(
                                             self.token,
                                             chat_id,
                                             original_message_id,
                                             "🍌",
                                         )
+                                        ok_radd = (
+                                            (isinstance(radd, dict) and radd.get("ok"))
+                                            if isinstance(radd, dict)
+                                            else bool(radd)
+                                        )
+                                        if ok_radd:
+                                            reaction_current = "banana"
+                                        else:
+                                            radd = None
                                     except Exception:
+                                        radd = None
+                                    if not radd:
                                         try:
                                             await telegram_api.send_message(
                                                 self.token,
@@ -480,7 +499,7 @@ class WorkerPool:
                             # supported fall back to sending a banana emoji message.
                             if original_message_id:
                                 try:
-                                    if reaction_added:
+                                    if reaction_current == "eyes":
                                         try:
                                             rrem = (
                                                 await telegram_api.set_message_reaction(
@@ -511,7 +530,9 @@ class WorkerPool:
                                         if isinstance(radd, dict)
                                         else bool(radd)
                                     )
-                                    if not ok_radd:
+                                    if ok_radd:
+                                        reaction_current = "banana"
+                                    else:
                                         try:
                                             await telegram_api.send_message(
                                                 self.token,
@@ -944,7 +965,7 @@ class WorkerPool:
                             except Exception:
                                 pass
                             try:
-                                if reaction_added and original_message_id:
+                                if reaction_current == "eyes" and original_message_id:
                                     try:
                                         await telegram_api.set_message_reaction(
                                             self.token,
@@ -1033,7 +1054,7 @@ class WorkerPool:
                         ):
                             if original_message_id:
                                 try:
-                                    if reaction_added:
+                                    if reaction_current == "eyes":
                                         try:
                                             await telegram_api.set_message_reaction(
                                                 self.token,
@@ -1083,7 +1104,7 @@ class WorkerPool:
                             except Exception:
                                 pass
                         else:
-                            if original_message_id and reaction_added:
+                            if reaction_current == "eyes" and original_message_id:
                                 try:
                                     await telegram_api.set_message_reaction(
                                         self.token,
@@ -1126,17 +1147,17 @@ class WorkerPool:
                                     )
                                 except Exception:
                                     pass
-                        if reaction_added and original_message_id:
-                            try:
-                                await telegram_api.set_message_reaction(
-                                    self.token,
-                                    chat_id,
-                                    original_message_id,
-                                    "👀",
-                                    remove=True,
-                                )
-                            except Exception:
-                                pass
+                            if reaction_current == "eyes" and original_message_id:
+                                try:
+                                    await telegram_api.set_message_reaction(
+                                        self.token,
+                                        chat_id,
+                                        original_message_id,
+                                        "👀",
+                                        remove=True,
+                                    )
+                                except Exception:
+                                    pass
                     except Exception:
                         pass
                     try:
@@ -1164,7 +1185,7 @@ class WorkerPool:
                 # Ensure we always try to clear the eyes reaction and delete the status
                 # message regardless of how the processing ended.
                 try:
-                    if reaction_added and original_message_id:
+                    if reaction_current == "eyes" and original_message_id:
                         try:
                             await telegram_api.set_message_reaction(
                                 self.token,
