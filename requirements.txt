@@ -6,6 +6,6 @@ authlib==1.7.2
 httpx==0.28.1
 itsdangerous==2.2.0
 prometheus-client==0.25.0
-uvicorn==0.46.0
+uvicorn==0.47.0
 websockets==16.0
 yt-dlp==2026.3.17
