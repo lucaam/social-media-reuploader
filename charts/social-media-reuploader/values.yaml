@@ -118,6 +118,11 @@ env:
   # e.g. 'Referer: https://www.tiktok.com/|X-Requested-With: XMLHttpRequest'
   YTDLP_HEADERS: ""
 
+  # Optional: comma-separated list of OAuth group names that should be
+  # considered admins by the GUI (e.g. "authentik Admins,admins").
+  # Can be set via values or injected through the GUI secret.
+  OAUTH_ADMIN_GROUPS: ""
+
 # GUI (FastAPI) settings
 gui:
   enabled: true
@@ -151,6 +156,8 @@ gui:
     oauthUserinfoUrl: ""
     oauthJwksUri: ""
     oauthServerMetadataUrl: ""
+    # Comma-separated group names that should be treated as admin
+    oauthAdminGroups: ""
 
 # Database / persistence for GUI
 db:
