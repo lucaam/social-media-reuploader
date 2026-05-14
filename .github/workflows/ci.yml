@@ -19,7 +19,7 @@ jobs:
       - name: Prepare writable REQUESTS_DB for tests
         run: |
           mkdir -p "$GITHUB_WORKSPACE/test_db"
-          echo "REQUESTS_DB=$GITHUB_WORKSPACE/test_db/requests.db" >> $GITHUB_ENV
+          echo "REQUESTS_DB=$GITHUB_WORKSPACE/test_db/requests.db" >> "$GITHUB_ENV"
           python -c "from src import db; db.init_db()"
         shell: bash
       - name: Run tests
