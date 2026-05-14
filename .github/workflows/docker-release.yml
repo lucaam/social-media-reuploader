@@ -15,8 +15,14 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
+      - name: Checkout release tag
         uses: actions/checkout@v6
+        with:
+          # Ensure we checkout the exact tag being published so the Docker
+          # build is deterministic and matches the release contents.
+          ref: ${{ github.event.release.tag_name }}
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Check release author is allowed
         run: |
