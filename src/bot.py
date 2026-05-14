@@ -294,13 +294,28 @@ async def main():
     if not config.BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not set in config")
 
-    # Print a concise startup banner for operators
+    # Print a concise startup banner and a short runtime configuration
     try:
+        root_logger.info("Social Media Reuploader v%s starting", __version__)
         root_logger.info(
-            "Social Media Reuploader v%s starting — mode=polling workers=%s",
-            __version__,
-            config.WORKERS,
+            "Mode=%s host=%s port=%s workers=%s tmp_dir=%s thumbnail=%s max_file_size=%s",
+            getattr(config, "MODE", "polling"),
+            getattr(config, "HOST", "0.0.0.0"),
+            getattr(config, "PORT", "8080"),
+            getattr(config, "WORKERS", 2),
+            getattr(config, "TMP_DIR", "/tmp/telegram_downloader"),
+            getattr(config, "WORKER_GENERATE_THUMBNAIL", True),
+            getattr(config, "TELEGRAM_MAX_FILE_SIZE", 50 * 1024 * 1024),
         )
+        # Helpful operator hint when running the image in Kubernetes: the
+        # container's default command runs the polling bot (python -m src.bot).
+        # To use webhook mode you must either run `python -m src.main` in the
+        # container or set a command override in your Deployment/Helm values.
+        if getattr(config, "MODE", "polling") == "webhook":
+            if not getattr(config, "WEBHOOK_URL", None):
+                root_logger.warning(
+                    "MODE=webhook but WEBHOOK_URL is not set; container image default runs polling unless you override the command/entrypoint"
+                )
     except Exception:
         root_logger.info("Social Media Reuploader starting")
 
