@@ -7,7 +7,21 @@ pytest.importorskip("fastapi")
 from fastapi.testclient import TestClient
 from starlette.responses import RedirectResponse
 
+from src import db as _db
 from src import gui
+
+
+@pytest.fixture(scope="module", autouse=True)
+def init_db(tmp_path, monkeypatch):
+    # ensure the DB is created in a writable temporary location for tests
+    dbfile = tmp_path / "requests.db"
+    monkeypatch.setenv("REQUESTS_DB", str(dbfile))
+    _db.init_db()
+    yield
+    try:
+        dbfile.unlink()
+    except Exception:
+        pass
 
 
 def test_config_and_login_not_configured(monkeypatch):

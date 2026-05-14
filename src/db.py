@@ -2,9 +2,16 @@ import datetime
 import os
 import sqlite3
 
-DB_PATH = os.environ.get(
-    "REQUESTS_DB", os.path.join(os.getcwd(), "data", "requests.db")
-)
+
+def _db_path() -> str:
+    """Compute the DB path at runtime from the environment.
+
+    Reading the env var on every call makes the code resilient to tests
+    or CI that set `REQUESTS_DB` dynamically after import.
+    """
+    return os.environ.get(
+        "REQUESTS_DB", os.path.join(os.getcwd(), "data", "requests.db")
+    )
 
 
 def _init_db_conn(conn: sqlite3.Connection):
@@ -106,10 +113,11 @@ def _init_db_conn(conn: sqlite3.Connection):
 
 
 def init_db():
-    dirpath = os.path.dirname(DB_PATH)
+    dbpath = _db_path()
+    dirpath = os.path.dirname(dbpath)
     if dirpath and not os.path.exists(dirpath):
         os.makedirs(dirpath, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
+    conn = sqlite3.connect(dbpath)
     _init_db_conn(conn)
     conn.close()
 
@@ -122,15 +130,16 @@ def _connect():
     required schema so callers don't crash in CI/test environments.
     """
     try:
-        return sqlite3.connect(DB_PATH)
+        return sqlite3.connect(_db_path())
     except Exception:
         # try to initialize DB path and retry
         try:
-            dirpath = os.path.dirname(DB_PATH)
+            dbpath = _db_path()
+            dirpath = os.path.dirname(dbpath)
             if dirpath and not os.path.exists(dirpath):
                 os.makedirs(dirpath, exist_ok=True)
             init_db()
-            return sqlite3.connect(DB_PATH)
+            return sqlite3.connect(dbpath)
         except Exception:
             # fallback to in-memory DB
             conn = sqlite3.connect(":memory:")

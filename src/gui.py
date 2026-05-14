@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import sqlite3
 
 import aiohttp
 from authlib.integrations.starlette_client import OAuth, OAuthError
@@ -10,7 +9,6 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from starlette.middleware.sessions import SessionMiddleware
 
 from . import config, db, ws_broadcast
-from .db import DB_PATH
 
 app = FastAPI(title="Social media reuploader - Admin GUI")
 
@@ -487,7 +485,7 @@ async def api_stats(request: Request):
     if not _check_admin(request):
         raise HTTPException(status_code=403, detail="forbidden")
     # compute simple aggregates: averages and counts
-    conn = sqlite3.connect(DB_PATH)
+    conn = db._connect()
     cur = conn.cursor()
 
     def _safe_avg(col):
