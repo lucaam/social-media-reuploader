@@ -29,6 +29,17 @@ OAUTH_SCOPE = os.environ.get("OAUTH_SCOPE", "openid profile email")
 OAUTH_SERVER_METADATA_URL = os.environ.get("OAUTH_SERVER_METADATA_URL")
 OAUTH_JWKS_URI = os.environ.get("OAUTH_JWKS_URI")
 
+# Optional mapping of OAuth groups to admin role. Comma-separated list.
+# Example: OAUTH_ADMIN_GROUPS="authentik Admins,admins"
+OAUTH_ADMIN_GROUPS = os.environ.get("OAUTH_ADMIN_GROUPS")
+if OAUTH_ADMIN_GROUPS:
+    OAUTH_ADMIN_GROUPS_SET = set(
+        [g.strip() for g in OAUTH_ADMIN_GROUPS.split(",") if g.strip()]
+    )
+    OAUTH_ADMIN_GROUPS_LOWER = set(g.lower() for g in OAUTH_ADMIN_GROUPS_SET)
+else:
+    OAUTH_ADMIN_GROUPS_SET = set()
+    OAUTH_ADMIN_GROUPS_LOWER = set()
 if OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET and OAUTH_AUTHORIZE_URL and OAUTH_TOKEN_URL:
     # support optional OIDC discovery URL (server_metadata_url) so authlib
     # can fetch `jwks_uri` and other endpoints automatically. If you run
@@ -65,6 +76,32 @@ def _check_admin(request: Request) -> bool:
 
     # OAuth session fallback: check DB for user role
     session = request.session
+    # Optional: map OAuth groups to admin role when configured
+    if OAUTH_ADMIN_GROUPS_SET and session and session.get("user"):
+        try:
+            user = session.get("user")
+            if isinstance(user, dict):
+                groups = (
+                    user.get("groups") or user.get("memberOf") or user.get("member_of")
+                )
+                if groups:
+                    if isinstance(groups, str):
+                        groups_list = [
+                            g.strip() for g in groups.split(",") if g.strip()
+                        ]
+                    elif isinstance(groups, (list, tuple)):
+                        groups_list = list(groups)
+                    else:
+                        groups_list = [str(groups)]
+                    for g in groups_list:
+                        if (
+                            g in OAUTH_ADMIN_GROUPS_SET
+                            or g.lower() in OAUTH_ADMIN_GROUPS_LOWER
+                        ):
+                            return True
+        except Exception:
+            pass
+
     if session and session.get("user"):
         user = session.get("user")
         # try to extract email
@@ -95,6 +132,32 @@ def _check_admin_ws(websocket: WebSocket) -> bool:
             return True
     # session via scope
     session = websocket.session if hasattr(websocket, "session") else None
+    # Optional: map OAuth groups to admin role when configured (WebSocket)
+    if OAUTH_ADMIN_GROUPS_SET and session and session.get("user"):
+        try:
+            user = session.get("user")
+            if isinstance(user, dict):
+                groups = (
+                    user.get("groups") or user.get("memberOf") or user.get("member_of")
+                )
+                if groups:
+                    if isinstance(groups, str):
+                        groups_list = [
+                            g.strip() for g in groups.split(",") if g.strip()
+                        ]
+                    elif isinstance(groups, (list, tuple)):
+                        groups_list = list(groups)
+                    else:
+                        groups_list = [str(groups)]
+                    for g in groups_list:
+                        if (
+                            g in OAUTH_ADMIN_GROUPS_SET
+                            or g.lower() in OAUTH_ADMIN_GROUPS_LOWER
+                        ):
+                            return True
+        except Exception:
+            pass
+
     if session and session.get("user"):
         user = session.get("user")
         email = None

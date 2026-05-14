@@ -58,7 +58,7 @@ spec:
             periodSeconds: 5
             timeoutSeconds: 3
             failureThreshold: 3
-{{- $hasSecrets := or .Values.gui.secrets.adminToken .Values.gui.secrets.secretKey .Values.gui.secrets.oauthClientId .Values.gui.secrets.oauthClientSecret .Values.gui.secrets.oauthAuthorizeUrl .Values.gui.secrets.oauthTokenUrl .Values.gui.secrets.oauthUserinfoUrl -}}
+{{- $hasSecrets := or .Values.gui.secrets.adminToken .Values.gui.secrets.secretKey .Values.gui.secrets.oauthClientId .Values.gui.secrets.oauthClientSecret .Values.gui.secrets.oauthAuthorizeUrl .Values.gui.secrets.oauthTokenUrl .Values.gui.secrets.oauthUserinfoUrl .Values.gui.secrets.oauthJwksUri .Values.gui.secrets.oauthServerMetadataUrl .Values.gui.secrets.oauthAdminGroups -}}
 {{- if .Values.gui.useSecret }}
           envFrom:
             - secretRef:
@@ -130,6 +130,10 @@ spec:
             {{- if .Values.gui.secrets.oauthServerMetadataUrl }}
             - name: OAUTH_SERVER_METADATA_URL
               value: "{{ .Values.gui.secrets.oauthServerMetadataUrl }}"
+            {{- end }}
+            {{- if .Values.gui.secrets.oauthAdminGroups }}
+            - name: OAUTH_ADMIN_GROUPS
+              value: "{{ .Values.gui.secrets.oauthAdminGroups }}"
             {{- end }}
             {{- /* append REQUESTS_DB and runtime defaults */}}
             {{- if .Values.db.pvc.enabled }}
