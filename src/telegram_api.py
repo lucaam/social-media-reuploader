@@ -237,16 +237,11 @@ async def set_message_reaction(
             try:
                 session = await http_client.get_session()
                 url = f"https://api.telegram.org/bot{token}/setMessageReaction"
-                # API expects a single ReactionType object for a single reaction.
-                reaction_payload = (
-                    payload_reaction[0]
-                    if len(payload_reaction) == 1
-                    else payload_reaction
-                )
+                # API expects an Array of ReactionType objects; always send a list
                 payload = {
                     "chat_id": chat_id,
                     "message_id": int(message_id),
-                    "reaction": reaction_payload,
+                    "reaction": payload_reaction,
                     "remove": True,
                 }
                 logger.debug("set_message_reaction HTTP payload: %s", payload)
