@@ -19,7 +19,9 @@ def get_version_from_tag(tag: str | None) -> str | None:
         return tag.lstrip("vV")
     try:
         tag = (
-            subprocess.check_output(["git", "describe", "--tags", "--abbrev=0"])
+            subprocess.check_output(
+                ["git", "describe", "--tags", "--abbrev=0"], timeout=10
+            )
             .decode()
             .strip()
         )
@@ -32,7 +34,8 @@ def update_init_py(version: str, path: str = "src/__init__.py") -> bool:
     if not os.path.exists(path):
         print(f"Target file {path} not found", file=sys.stderr)
         return False
-    text = open(path, "r", encoding="utf-8").read()
+    with open(path, "r", encoding="utf-8") as fh:
+        text = fh.read()
     m = re.search(r"__version__\s*=\s*['\"]([^'\"]+)['\"]", text)
     if m:
         old = m.group(1)
@@ -48,7 +51,8 @@ def update_init_py(version: str, path: str = "src/__init__.py") -> bool:
     else:
         old = None
         new_text = text + f'\n__version__ = "{version}"\n'
-    open(path, "w", encoding="utf-8").write(new_text)
+    with open(path, "w", encoding="utf-8") as fh:
+        fh.write(new_text)
     if old:
         print(f"Updated {path}: {old} -> {version}")
     else:
@@ -72,14 +76,17 @@ def git_commit_and_push(
             ]
         )
         subprocess.check_call(["git", "config", "user.name", "github-actions[bot]"])
-        subprocess.check_call(["git", "add"] + files)
-        subprocess.check_call(["git", "commit", "-m", message])
+        subprocess.check_call(["git", "add"] + files, timeout=20)
+        subprocess.check_call(["git", "commit", "-m", message], timeout=20)
         if branch:
-            subprocess.check_call(["git", "push", remote, f"HEAD:{branch}"])
+            subprocess.check_call(["git", "push", remote, f"HEAD:{branch}"], timeout=30)
         else:
-            subprocess.check_call(["git", "push", remote])
+            subprocess.check_call(["git", "push", remote], timeout=30)
         print("Pushed commit")
         return True
+    except subprocess.TimeoutExpired as e:
+        print("Git command timed out:", e, file=sys.stderr)
+        return False
     except subprocess.CalledProcessError as e:
         print("Git commit/push failed:", e, file=sys.stderr)
         return False

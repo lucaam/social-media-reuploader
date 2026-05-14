@@ -156,6 +156,11 @@ async def send_media(
             caption=caption,
             reply_to_message_id=reply_to_message_id,
         )
+    logger.info(
+        "send_media: file %s is not mp4 (.%s); sending as document. Consider converting to mp4 for inline playback",
+        file_path,
+        ext,
+    )
     return await send_document(
         token,
         chat_id,
@@ -239,11 +244,17 @@ async def set_message_reaction(
                     "reaction": payload_reaction,
                     "remove": True,
                 }
+                logger.debug("set_message_reaction HTTP payload: %s", payload)
                 async with session.post(url, json=payload) as resp:
                     try:
                         result = await resp.json()
                     except Exception:
                         result = {"ok": False, "status": resp.status}
+                logger.debug(
+                    "set_message_reaction HTTP response: %s for payload: %s",
+                    result,
+                    payload,
+                )
                 if not (isinstance(result, dict) and result.get("ok")):
                     logger.warning(
                         "set_message_reaction HTTP API returned non-ok: %s", result
@@ -268,6 +279,11 @@ async def set_message_reaction(
                             te,
                         )
                         return {"ok": False, "error": str(te)}
+                    logger.debug(
+                        "set_message_reaction(aiogram remove) returned: %s, payload: %s",
+                        res,
+                        payload_reaction,
+                    )
                     if isinstance(res, dict) and not res.get("ok"):
                         logger.warning(
                             "set_message_reaction(aiogram) returned non-ok: %s", res
@@ -279,9 +295,11 @@ async def set_message_reaction(
 
         # no remove: use aiogram Bot (cached)
         bot = telegram_client.get_bot(token)
+        logger.debug("set_message_reaction payload (aiogram): %s", payload_reaction)
         res = await bot.set_message_reaction(
             chat_id=chat_id, message_id=int(message_id), reaction=payload_reaction
         )
+        logger.debug("set_message_reaction(aiogram) response: %s", res)
         if isinstance(res, dict) and not res.get("ok"):
             logger.warning("set_message_reaction(aiogram) returned non-ok: %s", res)
         return res
