@@ -38,8 +38,11 @@ jobs:
         with:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           release-type: 'python'
-          # Ensure we do not skip creating GitHub releases (publish automatically)
-          skip-github-release: false
+          # Create a release PR instead of publishing releases automatically.
+          # This ensures version/chart changes are reviewed and merged manually
+          # and downstream jobs (e.g. docker-release) run only on actual
+          # published releases.
+          skip-github-release: true
 
       - name: Fetch tags and set VERSION
         run: |
@@ -52,36 +55,10 @@ jobs:
           echo "Using cleaned version: $VERSION"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
 
-      - name: Update package version in src/__init__.py
-        if: ${{ steps.release-please.outputs.release_created == 'true' }}
-        env:
-          VERSION: ${{ env.VERSION }}
-        run: |
-          if [ -z "${VERSION}" ]; then
-            echo "VERSION is empty; skipping package version update"
-            exit 0
-          fi
-          echo "Updating src/__init__.py to ${VERSION}"
-          python3 scripts/set_version.py --version "${VERSION}" --commit --branch main
-
-      - name: Update Chart appVersion
-        if: ${{ steps.release-please.outputs.release_created == 'true' }}
-        run: |
-          if [ -z "${VERSION}" ]; then
-            echo "VERSION is empty; skipping Chart update"
-            exit 0
-          fi
-          echo "Updating charts/social-media-reuploader/Chart.yaml appVersion to ${VERSION}"
-          if [ -f charts/social-media-reuploader/Chart.yaml ]; then
-            sed -i -E "s/^appVersion: .*/appVersion: \"${VERSION}\"/" charts/social-media-reuploader/Chart.yaml
-            git config user.email "github-actions[bot]@users.noreply.github.com"
-            git config user.name "github-actions[bot]"
-            git add charts/social-media-reuploader/Chart.yaml
-            git commit -m "chore(chart): set appVersion ${VERSION} [skip ci]" || echo "No change to Chart.yaml"
-            git push origin main || echo "Push failed; possibly running in detached head"
-          else
-            echo "Chart.yaml not found; skipping"
-          fi
+      # Version and chart updates are no longer pushed automatically here.
+      # With `skip-github-release: true` release-please will create a release
+      # PR that maintainers can review and merge; include any version/chart
+      # changes inside that PR instead of pushing to `main` from this workflow.
 
       # Docker image build/push is handled in .github/workflows/docker-release.yml
       # which runs on `release.published` events. Remove build/push from
