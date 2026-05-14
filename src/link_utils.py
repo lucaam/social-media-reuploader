@@ -6,7 +6,10 @@ PATTERNS = {
         r"(https?://(?:www\.)?(?:youtube\.com/(?:watch\?v=|shorts/|embed/)|youtu\.be/)[^\s]+)",
         re.IGNORECASE,
     ),
-    "tiktok": re.compile(r"(https?://(?:www\.)?tiktok\.com/[^\s]+)", re.IGNORECASE),
+    "tiktok": re.compile(
+        r"(https?://(?:www\.)?(?:tiktok\.com|vm\.tiktok\.com|m\.tiktok\.com|v\.tiktok\.com)/[^\s]+)",
+        re.IGNORECASE,
+    ),
     "instagram": re.compile(
         r"(https?://(?:www\.)?instagram\.com/[^\s]+)", re.IGNORECASE
     ),

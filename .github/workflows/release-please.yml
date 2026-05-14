@@ -22,6 +22,9 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: true
 
       - name: Create release PR / Release (release-please)
         # NOTE: `release-please` can be configured to publish releases automatically.
@@ -42,7 +45,32 @@ jobs:
           git fetch --tags --prune
           VERSION=$(git tag --sort=-v:refname | head -n1)
           echo "Found tag: $VERSION"
+          # Strip leading 'v' or 'V' from tag for image and app versions
+          VERSION=${VERSION#v}
+          VERSION=${VERSION#V}
+          echo "Using cleaned version: $VERSION"
           echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+
+      - name: Update package version in src/__init__.py
+        env:
+          VERSION: ${{ env.VERSION }}
+        run: |
+          echo "Updating src/__init__.py to ${VERSION}"
+          python3 scripts/set_version.py --version "${VERSION}" --commit --branch main
+
+      - name: Update Chart appVersion
+        run: |
+          echo "Updating charts/social-media-reuploader/Chart.yaml appVersion to ${VERSION}"
+          if [ -f charts/social-media-reuploader/Chart.yaml ]; then
+            sed -i -E "s/^appVersion: .*/appVersion: \"${VERSION}\"/" charts/social-media-reuploader/Chart.yaml
+            git config user.email "github-actions[bot]@users.noreply.github.com"
+            git config user.name "github-actions[bot]"
+            git add charts/social-media-reuploader/Chart.yaml
+            git commit -m "chore(chart): set appVersion ${VERSION}" || echo "No change to Chart.yaml"
+            git push origin main || echo "Push failed; possibly running in detached head"
+          else
+            echo "Chart.yaml not found; skipping"
+          fi
 
       - name: Set up QEMU
         uses: docker/setup-qemu-action@v3

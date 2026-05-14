@@ -39,6 +39,7 @@ async def send_document(
     file_path: str,
     caption: Optional[str] = None,
     reply_to_message_id: Optional[int] = None,
+    thumbnail_path: Optional[str] = None,
 ):
     url = f"https://api.telegram.org/bot{token}/sendDocument"
     data = aiohttp.FormData()
@@ -58,6 +59,19 @@ async def send_document(
         filename=os.path.basename(file_path),
         content_type="application/octet-stream",
     )
+    # attach a thumbnail if provided (Telegram API accepts 'thumbnail' for documents)
+    tf = None
+    if thumbnail_path:
+        try:
+            tf = open(thumbnail_path, "rb")
+            data.add_field(
+                "thumbnail",
+                tf,
+                filename=os.path.basename(thumbnail_path),
+                content_type="image/jpeg",
+            )
+        except Exception:
+            logger.debug("Could not attach thumbnail %s", thumbnail_path)
     session = await http_client.get_session()
     async with session.post(url, data=data) as resp:
         try:
@@ -66,6 +80,11 @@ async def send_document(
             result = {"ok": False, "status": resp.status}
         finally:
             f.close()
+            try:
+                if tf:
+                    tf.close()
+            except Exception:
+                pass
         return result
 
 
@@ -75,6 +94,7 @@ async def send_video(
     file_path: str,
     caption: Optional[str] = None,
     reply_to_message_id: Optional[int] = None,
+    thumbnail_path: Optional[str] = None,
 ):
     url = f"https://api.telegram.org/bot{token}/sendVideo"
     data = aiohttp.FormData()
@@ -91,6 +111,18 @@ async def send_video(
     data.add_field(
         "video", f, filename=os.path.basename(file_path), content_type="video/mp4"
     )
+    # attach a pre-generated thumbnail if available (Telegram accepts JPEG/PNG)
+    if thumbnail_path:
+        try:
+            tf = open(thumbnail_path, "rb")
+            data.add_field(
+                "thumbnail",
+                tf,
+                filename=os.path.basename(thumbnail_path),
+                content_type="image/jpeg",
+            )
+        except Exception:
+            logger.debug("Could not attach thumbnail %s", thumbnail_path)
     session = await http_client.get_session()
     async with session.post(url, data=data) as resp:
         try:
@@ -99,6 +131,11 @@ async def send_video(
             result = {"ok": False, "status": resp.status}
         finally:
             f.close()
+            try:
+                if thumbnail_path:
+                    tf.close()
+            except Exception:
+                pass
         return result
 
 
@@ -163,22 +200,33 @@ async def set_message_reaction(
     constructs the correct payload for the Telegram Bot API.
     """
     try:
-        # Normalize reaction payload
+        # Normalize reaction payload into Telegram's ReactionType objects.
+        # ReactionType for emoji should be: {"type": "emoji", "emoji": "🍌"}
         payload_reaction = []
+
+        def _ensure_type(obj: dict) -> dict:
+            if "type" not in obj:
+                # If an emoji string is present, treat as emoji type
+                if "emoji" in obj:
+                    obj["type"] = "emoji"
+                else:
+                    obj["type"] = "emoji"
+            return obj
+
         if isinstance(reaction, str):
-            payload_reaction = [{"emoji": reaction}]
+            payload_reaction = [{"type": "emoji", "emoji": reaction}]
         elif isinstance(reaction, dict):
-            payload_reaction = [reaction]
+            payload_reaction = [_ensure_type(reaction)]
         elif isinstance(reaction, (list, tuple)):
             for r in reaction:
                 if isinstance(r, str):
-                    payload_reaction.append({"emoji": r})
+                    payload_reaction.append({"type": "emoji", "emoji": r})
                 elif isinstance(r, dict):
-                    payload_reaction.append(r)
+                    payload_reaction.append(_ensure_type(r))
                 else:
-                    payload_reaction.append({"emoji": str(r)})
+                    payload_reaction.append({"type": "emoji", "emoji": str(r)})
         else:
-            payload_reaction = [{"emoji": str(reaction)}]
+            payload_reaction = [{"type": "emoji", "emoji": str(reaction)}]
 
         # prefer HTTP API when `remove` is requested (some aiogram versions don't accept remove)
         if remove:
@@ -193,18 +241,37 @@ async def set_message_reaction(
                 }
                 async with session.post(url, json=payload) as resp:
                     try:
-                        return await resp.json()
+                        result = await resp.json()
                     except Exception:
-                        return {"ok": False, "status": resp.status}
+                        result = {"ok": False, "status": resp.status}
+                if not (isinstance(result, dict) and result.get("ok")):
+                    logger.warning(
+                        "set_message_reaction HTTP API returned non-ok: %s", result
+                    )
+                return result
             except Exception:
                 # fallback to aiogram
                 try:
                     bot = telegram_client.get_bot(token)
-                    res = await bot.set_message_reaction(
-                        chat_id=chat_id,
-                        message_id=int(message_id),
-                        reaction=payload_reaction,
-                    )
+                    # Try to request removal via aiogram if supported
+                    try:
+                        res = await bot.set_message_reaction(
+                            chat_id=chat_id,
+                            message_id=int(message_id),
+                            reaction=payload_reaction,
+                            remove=True,
+                        )
+                    except TypeError as te:
+                        # aiogram version does not support remove kwarg
+                        logger.exception(
+                            "set_message_reaction(aiogram) does not support remove kwarg: %s",
+                            te,
+                        )
+                        return {"ok": False, "error": str(te)}
+                    if isinstance(res, dict) and not res.get("ok"):
+                        logger.warning(
+                            "set_message_reaction(aiogram) returned non-ok: %s", res
+                        )
                     return res
                 except Exception as e:
                     logger.exception("set_message_reaction fallback failed: %s", e)
@@ -215,6 +282,8 @@ async def set_message_reaction(
         res = await bot.set_message_reaction(
             chat_id=chat_id, message_id=int(message_id), reaction=payload_reaction
         )
+        if isinstance(res, dict) and not res.get("ok"):
+            logger.warning("set_message_reaction(aiogram) returned non-ok: %s", res)
         return res
     except Exception as e:
         logger.exception("set_message_reaction failed: %s", e)

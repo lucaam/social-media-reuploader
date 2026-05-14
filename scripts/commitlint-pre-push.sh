@@ -28,6 +28,20 @@ while read local_ref local_sha remote_ref remote_sha; do
 done
 
 if [ "$read_any" = false ]; then
-  echo "commitlint-pre-push: no ref info from stdin; checking last 100 commits"
-  "$CLBIN" --from=HEAD~100 --to=HEAD || exit 1
+  echo "commitlint-pre-push: no ref info from stdin; attempting to detect upstream or recent commit"
+  # Prefer checking against upstream if present; otherwise validate the last commit only.
+  set +e
+  UPSTREAM=$(git rev-parse --abbrev-ref --symbolic-full-name @{u} 2>/dev/null || true)
+  set -e
+  if [ -n "$UPSTREAM" ]; then
+    FROM="$UPSTREAM"
+  else
+    if git rev-parse --verify HEAD~1 >/dev/null 2>&1; then
+      FROM=HEAD~1
+    else
+      FROM=HEAD
+    fi
+  fi
+  echo "commitlint-pre-push: running commitlint --from=$FROM --to=HEAD"
+  "$CLBIN" --from="$FROM" --to=HEAD || exit 1
 fi

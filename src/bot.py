@@ -4,7 +4,7 @@ import os
 import re
 
 from aiogram import Bot, Dispatcher
-from aiogram.types import Message, Update
+from aiogram.types import ChatMemberUpdated, Message, Update
 
 from . import __version__, config, db, http_client, telegram_api, telegram_client
 from .link_utils import find_links, is_supported
@@ -331,6 +331,41 @@ async def main():
     try:
         dp.edited_message.register(handle_message)
     except Exception:
+        pass
+
+    # send a short welcome message when the bot is added to a group
+    async def _handle_my_chat_member(update: ChatMemberUpdated):
+        try:
+            old = getattr(update, "old_chat_member", None)
+            new = getattr(update, "new_chat_member", None)
+            old_status = getattr(old, "status", None)
+            new_status = getattr(new, "status", None)
+            # if the bot transitioned from left/kicked -> member/administrator, greet
+            if new_status in ("member", "administrator") and old_status in (
+                "left",
+                "kicked",
+                "restricted",
+                None,
+            ):
+                chat = getattr(update, "chat", None)
+                chat_id = getattr(chat, "id", None)
+                if chat_id:
+                    text = (
+                        "Ciao! 👋 Sono il bot che prova a scaricare brevi video da YouTube, TikTok e Instagram e a condividerli qui. "
+                        "In questo gruppo rispondo solo quando qualcuno incolla un link. "
+                        "Nota: non posso scaricare contenuti che richiedono autenticazione."
+                    )
+                    try:
+                        await telegram_api.send_message(config.BOT_TOKEN, chat_id, text)
+                    except Exception:
+                        logger.debug("Could not send group welcome message")
+        except Exception:
+            logger.exception("Error in my_chat_member handler")
+
+    try:
+        dp.my_chat_member.register(_handle_my_chat_member)
+    except Exception:
+        # some aiogram versions may not expose my_chat_member convenience
         pass
 
     # Start long-polling and ensure graceful shutdown on cancellation
