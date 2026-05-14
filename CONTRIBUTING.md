@@ -58,7 +58,7 @@ Il repository esegue `commitlint` in CI (action). Per controllare i messaggi in 
 
 ```bash
 # se hai node/npm installato
-npx --no-install @commitlint/cli --config commitlint.config.js --edit
+npx --no-install @commitlint/cli --config commitlint.config.mjs --edit
 ```
 
 Se non hai Node a disposizione, affidati al workflow che bloccherà le PR non conformi; correggi i messaggi come sopra e riapri la PR.
