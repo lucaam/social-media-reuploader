@@ -5,7 +5,6 @@ import re
 
 from aiogram import Bot, Dispatcher
 from aiogram.types import ChatMemberUpdated, Message, Update
-from aiohttp import web
 
 from . import __version__, config, db, http_client, telegram_api, telegram_client
 from .link_utils import find_links, is_supported
@@ -294,28 +293,13 @@ async def main():
     if not config.BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not set in config")
 
-    # Print a concise startup banner and a short runtime configuration
+    # Print a concise startup banner for operators
     try:
-        root_logger.info("Social Media Reuploader v%s starting", __version__)
         root_logger.info(
-            "Mode=%s host=%s port=%s workers=%s tmp_dir=%s thumbnail=%s max_file_size=%s",
-            getattr(config, "MODE", "polling"),
-            getattr(config, "HOST", "0.0.0.0"),
-            getattr(config, "PORT", "8080"),
-            getattr(config, "WORKERS", 2),
-            getattr(config, "TMP_DIR", "/tmp/telegram_downloader"),
-            getattr(config, "WORKER_GENERATE_THUMBNAIL", True),
-            getattr(config, "TELEGRAM_MAX_FILE_SIZE", 50 * 1024 * 1024),
+            "Social Media Reuploader v%s starting — mode=polling workers=%s",
+            __version__,
+            config.WORKERS,
         )
-        # Helpful operator hint when running the image in Kubernetes: the
-        # container's default command runs the polling bot (python -m src.bot).
-        # To use webhook mode you must either run `python -m src.main` in the
-        # container or set a command override in your Deployment/Helm values.
-        if getattr(config, "MODE", "polling") == "webhook":
-            if not getattr(config, "WEBHOOK_URL", None):
-                root_logger.warning(
-                    "MODE=webhook but WEBHOOK_URL is not set; container image default runs polling unless you override the command/entrypoint"
-                )
     except Exception:
         root_logger.info("Social Media Reuploader starting")
 
@@ -327,26 +311,6 @@ async def main():
     # create a WorkerPool instance that handlers will use
     global app_worker
     app_worker = WorkerPool(config.BOT_TOKEN, workers=config.WORKERS)
-
-    # Provide a lightweight HTTP health endpoint when running in polling
-    # mode so Kubernetes liveness/readiness probes don't kill the process
-    # while long-running downloads/transcodes are in progress.
-    health_runner = None
-    if getattr(config, "MODE", "polling") == "polling":
-        try:
-
-            async def _health(request: web.Request):
-                return web.Response(text="ok")
-
-            health_app = web.Application()
-            health_app.router.add_get("/health", _health)
-            health_runner = web.AppRunner(health_app)
-            await health_runner.setup()
-            site = web.TCPSite(health_runner, host=config.HOST, port=config.PORT)
-            await site.start()
-            logger.info("Health endpoint listening on %s:%s", config.HOST, config.PORT)
-        except Exception:
-            logger.exception("Failed to start health endpoint")
 
     # ensure DB exists for update storage
     try:
@@ -425,11 +389,6 @@ async def main():
             pass
         try:
             await http_client.close_session()
-        except Exception:
-            pass
-        try:
-            if health_runner:
-                await health_runner.cleanup()
         except Exception:
             pass
 
