@@ -98,9 +98,9 @@ def test_grant_admin_allows_requests(monkeypatch):
     # Ensure provider and simulate login
     gui.oauth._clients["provider"] = {}
 
-    # create a persistent admin mapping in the DB for this test user so the
-    # session grant is allowed but still requires entitlement
-    _db.add_user(username="u2", email="u2@example.com", role="admin")
+    # Note: session self-grant now requires persistent entitlement. We'll
+    # first verify a non-entitled user cannot self-grant, then add a DB
+    # admin mapping and verify access/grant succeed.
 
     class Provider:
         async def authorize_redirect(self, request, redirect_uri):
@@ -123,17 +123,23 @@ def test_grant_admin_allows_requests(monkeypatch):
     # before granting admin the /requests endpoint should be forbidden
     r = client.get("/requests")
     assert r.status_code == 403
-
-    # grant admin for session
+    # grant admin for session should be forbidden for non-entitled user
     r2 = client.post("/api/session/grant_admin")
-    assert r2.status_code == 200
-    assert r2.json().get("ok") is True
+    assert r2.status_code == 403
 
-    # now requests should succeed (empty list)
+    # add persistent admin mapping in DB for this user's email
+    _db.add_user(username="u2", email="u2@example.com", role="admin")
+
+    # now the requests endpoint should be accessible (DB role applied)
     r3 = client.get("/requests")
     assert r3.status_code == 200
     data = r3.json()
     assert "items" in data
+
+    # and granting admin for the session should now succeed
+    r4 = client.post("/api/session/grant_admin")
+    assert r4.status_code == 200
+    assert r4.json().get("ok") is True
 
 
 def test_oauth_group_auto_admin(monkeypatch):
