@@ -4,7 +4,7 @@
       "releaseType": "python",
       "bumpFiles": [
         {
-          "filename": "src/version.py",
+          "filename": "src/__init__.py",
           "type": "python"
         }
       ]
