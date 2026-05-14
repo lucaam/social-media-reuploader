@@ -12,14 +12,16 @@ from src import gui
 
 
 @pytest.fixture(scope="module", autouse=True)
-def init_db(tmp_path, monkeypatch):
+def init_db(tmp_path_factory, monkeypatch):
     # ensure the DB is created in a writable temporary location for tests
-    dbfile = tmp_path / "requests.db"
+    tmpdir = tmp_path_factory.mktemp("requests_db")
+    dbfile = tmpdir / "requests.db"
     monkeypatch.setenv("REQUESTS_DB", str(dbfile))
     _db.init_db()
     yield
     try:
-        dbfile.unlink()
+        if dbfile.exists():
+            dbfile.unlink()
     except Exception:
         pass
 
