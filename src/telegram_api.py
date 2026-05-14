@@ -211,7 +211,6 @@ async def set_message_reaction(
 
         def _ensure_type(obj: dict) -> dict:
             if "type" not in obj:
-                # If an emoji string is present, treat as emoji type
                 if "emoji" in obj:
                     obj["type"] = "emoji"
                 else:
@@ -238,10 +237,16 @@ async def set_message_reaction(
             try:
                 session = await http_client.get_session()
                 url = f"https://api.telegram.org/bot{token}/setMessageReaction"
+                # API expects a single ReactionType object for a single reaction.
+                reaction_payload = (
+                    payload_reaction[0]
+                    if len(payload_reaction) == 1
+                    else payload_reaction
+                )
                 payload = {
                     "chat_id": chat_id,
                     "message_id": int(message_id),
-                    "reaction": payload_reaction,
+                    "reaction": reaction_payload,
                     "remove": True,
                 }
                 logger.debug("set_message_reaction HTTP payload: %s", payload)
@@ -264,12 +269,17 @@ async def set_message_reaction(
                 # fallback to aiogram
                 try:
                     bot = telegram_client.get_bot(token)
-                    # Try to request removal via aiogram if supported
+                    # aiogram may expect a single ReactionType for simple emoji.
+                    reaction_for_aiogram = (
+                        payload_reaction[0]
+                        if len(payload_reaction) == 1
+                        else payload_reaction
+                    )
                     try:
                         res = await bot.set_message_reaction(
                             chat_id=chat_id,
                             message_id=int(message_id),
-                            reaction=payload_reaction,
+                            reaction=reaction_for_aiogram,
                             remove=True,
                         )
                     except TypeError as te:
@@ -282,7 +292,7 @@ async def set_message_reaction(
                     logger.debug(
                         "set_message_reaction(aiogram remove) returned: %s, payload: %s",
                         res,
-                        payload_reaction,
+                        reaction_for_aiogram,
                     )
                     if isinstance(res, dict) and not res.get("ok"):
                         logger.warning(
@@ -295,9 +305,13 @@ async def set_message_reaction(
 
         # no remove: use aiogram Bot (cached)
         bot = telegram_client.get_bot(token)
-        logger.debug("set_message_reaction payload (aiogram): %s", payload_reaction)
+        # prefer single ReactionType object for aiogram when only one reaction
+        reaction_for_aiogram = (
+            payload_reaction[0] if len(payload_reaction) == 1 else payload_reaction
+        )
+        logger.debug("set_message_reaction payload (aiogram): %s", reaction_for_aiogram)
         res = await bot.set_message_reaction(
-            chat_id=chat_id, message_id=int(message_id), reaction=payload_reaction
+            chat_id=chat_id, message_id=int(message_id), reaction=reaction_for_aiogram
         )
         logger.debug("set_message_reaction(aiogram) response: %s", res)
         if isinstance(res, dict) and not res.get("ok"):

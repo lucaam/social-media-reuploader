@@ -126,12 +126,103 @@ class WorkerPool:
         return None
 
     async def _transcode_to_baseline(
-        self, src_path: str, dst_path: str, tmpdir: str
+        self, src_path: str, dst_path: str, tmpdir: str, meta: dict | None = None
     ) -> bool:
+        """Ensure `dst_path` is an MP4 file compatible with Telegram.
+
+        Strategy:
+        - If possible, try a fast remux/copy into MP4 (`-c copy`).
+        - If audio codec is incompatible (e.g. opus), copy video and transcode audio to AAC.
+        - Otherwise fall back to full transcode to H.264 baseline profile.
+        Logs ffmpeg stderr on failure to aid debugging.
+        """
         ffmpeg_bin = shutil.which("ffmpeg")
         if not ffmpeg_bin:
+            logger.debug("ffmpeg not available for transcode")
             return False
-        cmd = [
+
+        # try to learn codecs from meta if available
+        video_codec = None
+        audio_codec = None
+        try:
+            if isinstance(meta, dict):
+                video_codec = (meta.get("video_codec") or "").lower()
+                audio_codec = (meta.get("audio_codec") or "").lower()
+        except Exception:
+            pass
+
+        async def _run_cmd(cmd, timeout):
+            logger.debug("running ffmpeg cmd: %s", " ".join(cmd))
+            try:
+                p = await asyncio.create_subprocess_exec(*cmd, stdout=PIPE, stderr=PIPE)
+                try:
+                    out, err = await asyncio.wait_for(p.communicate(), timeout=timeout)
+                except asyncio.TimeoutError:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+                    try:
+                        await p.communicate()
+                    except Exception:
+                        pass
+                    logger.warning("ffmpeg timed out for %s", src_path)
+                    return False, b"", b""
+                return p.returncode == 0, out, err
+            except Exception as e:
+                logger.exception("ffmpeg invocation failed: %s", e)
+                return False, b"", b""
+
+        # 1) attempt fast remux (copy) when codecs look compatible
+        if video_codec == "h264" and (audio_codec in (None, "aac", "mp3")):
+            cmd_copy = [
+                ffmpeg_bin,
+                "-y",
+                "-i",
+                src_path,
+                "-c",
+                "copy",
+                "-movflags",
+                "+faststart",
+                dst_path,
+            ]
+            ok, out, err = await _run_cmd(cmd_copy, timeout=60)
+            if ok and os.path.exists(dst_path):
+                return True
+            logger.debug(
+                "fast remux failed: %s",
+                (err.decode(errors="ignore")[:1000] if err else ""),
+            )
+
+        # 2) if video is h264, try copying video and transcode audio to aac
+        if video_codec == "h264":
+            cmd_audio = [
+                ffmpeg_bin,
+                "-y",
+                "-i",
+                src_path,
+                "-c:v",
+                "copy",
+                "-c:a",
+                "aac",
+                "-b:a",
+                "128k",
+                "-ac",
+                "2",
+                "-movflags",
+                "+faststart",
+                dst_path,
+            ]
+            ok, out, err = await _run_cmd(cmd_audio, timeout=120)
+            if ok and os.path.exists(dst_path):
+                return True
+            logger.debug(
+                "copy-video+transcode-audio failed: %s",
+                (err.decode(errors="ignore")[:1000] if err else ""),
+            )
+
+        # 3) full transcode to baseline H.264
+        cmd_full = [
             ffmpeg_bin,
             "-y",
             "-max_muxing_queue_size",
@@ -162,25 +253,18 @@ class WorkerPool:
             "+faststart",
             dst_path,
         ]
+        ok, out, err = await _run_cmd(cmd_full, timeout=300)
+        if ok and os.path.exists(dst_path):
+            return True
+        # log ffmpeg stderr for debugging
         try:
-            p = await asyncio.create_subprocess_exec(*cmd, stdout=PIPE, stderr=PIPE)
-            try:
-                await asyncio.wait_for(p.communicate(), timeout=300)
-            except asyncio.TimeoutError:
-                try:
-                    p.kill()
-                except Exception:
-                    pass
-                try:
-                    await p.communicate()
-                except Exception:
-                    pass
-                logger.warning("Worker ffmpeg transcode timed out for %s", src_path)
-                return False
-            return p.returncode == 0 and os.path.exists(dst_path)
+            stderr_txt = err.decode(errors="ignore") if err else ""
         except Exception:
-            logger.exception("Worker transcode exception")
-            return False
+            stderr_txt = "<decoding error>"
+        logger.warning(
+            "Worker ffmpeg transcode failed for %s: %s", src_path, stderr_txt[:2000]
+        )
+        return False
 
     async def _edit_status(
         self, token: str, chat_id: int, status_msg_id: int | None, text: str
@@ -724,7 +808,7 @@ class WorkerPool:
                     base = os.path.splitext(os.path.basename(file_path))[0]
                     trans_path = os.path.join(tmpdir, f"{base}_tg_transcoded.mp4")
                     ok = await self._transcode_to_baseline(
-                        file_path, trans_path, tmpdir
+                        file_path, trans_path, tmpdir, meta=meta
                     )
                     if ok and os.path.exists(trans_path):
                         try:
