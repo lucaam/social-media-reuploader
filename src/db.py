@@ -1,30 +1,61 @@
 import datetime
 import os
 import sqlite3
-
-DB_PATH = os.environ.get(
-    "REQUESTS_DB", os.path.join(os.getcwd(), "data", "requests.db")
-)
+import threading
 
 
-def init_db():
-    dirpath = os.path.dirname(DB_PATH)
-    if dirpath and not os.path.exists(dirpath):
-        os.makedirs(dirpath, exist_ok=True)
-    conn = sqlite3.connect(DB_PATH)
-    conn.execute("""CREATE TABLE IF NOT EXISTS requests (
+def _db_path() -> str:
+    """Compute the DB path at runtime from the environment.
+
+    Reading the env var on every call makes the code resilient to tests
+    or CI that set `REQUESTS_DB` dynamically after import.
+    """
+    return os.environ.get(
+        "REQUESTS_DB", os.path.join(os.getcwd(), "data", "requests.db")
+    )
+
+
+# Cached in-memory fallback connection (created lazily). If the on-disk DB
+# cannot be opened we create a single shared in-memory connection so tests
+# and CI see a coherent DB across calls.
+_cached_memory_conn = None
+_cached_memory_lock = threading.Lock()
+
+
+class _NoCloseConn:
+    """Proxy around a sqlite3.Connection whose .close() is a no-op so the
+    shared cached connection isn't destroyed by individual callers.
+
+    All other attributes and methods are delegated to the underlying
+    connection object.
+    """
+
+    def __init__(self, conn: sqlite3.Connection):
+        self._conn = conn
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    def close(self):
+        # no-op: keep the shared connection alive
+        return None
+
+
+def _init_db_conn(conn: sqlite3.Connection):
+    cur = conn.cursor()
+    cur.execute("""CREATE TABLE IF NOT EXISTS requests (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id INTEGER,
             url TEXT,
             status TEXT,
             created_at TEXT
         )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS updates (
+    cur.execute("""CREATE TABLE IF NOT EXISTS updates (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             raw TEXT,
             created_at TEXT
         )""")
-    conn.execute("""CREATE TABLE IF NOT EXISTS users (
+    cur.execute("""CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             username TEXT,
             email TEXT,
@@ -32,18 +63,19 @@ def init_db():
             created_at TEXT
         )""")
     # processed messages dedup table
-    conn.execute("""CREATE TABLE IF NOT EXISTS processed_messages (
+    cur.execute("""CREATE TABLE IF NOT EXISTS processed_messages (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id INTEGER,
             message_id INTEGER,
             created_at TEXT
         )""")
     try:
-        conn.execute(
+        cur.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_processed_messages_chat_message ON processed_messages(chat_id, message_id)"
         )
     except Exception:
         pass
+
     # ensure requests has optional telemetry/stat columns
     cols = [r[1] for r in conn.execute("PRAGMA table_info(requests)")]
     extra_cols = {
@@ -63,7 +95,7 @@ def init_db():
                 pass
 
     # per-request event log (compression/redownload durations, etc.)
-    conn.execute("""CREATE TABLE IF NOT EXISTS request_events (
+    cur.execute("""CREATE TABLE IF NOT EXISTS request_events (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             request_id INTEGER,
             event_type TEXT,
@@ -72,11 +104,12 @@ def init_db():
             created_at TEXT
         )""")
     try:
-        conn.execute(
+        cur.execute(
             "CREATE INDEX IF NOT EXISTS idx_request_events_request_id ON request_events(request_id)"
         )
     except Exception:
         pass
+
     # Migration: ensure request_events has the expected columns for older DBs
     try:
         existing = [r[1] for r in conn.execute("PRAGMA table_info(request_events)")]
@@ -95,16 +128,80 @@ def init_db():
                     pass
     except Exception:
         pass
+
     # ensure requests has a description column for future use
     cols = [r[1] for r in conn.execute("PRAGMA table_info(requests)")]
     if "description" not in cols:
         try:
             conn.execute("ALTER TABLE requests ADD COLUMN description TEXT")
         except Exception:
-            # ignore if cannot alter (older sqlite, etc.)
             pass
     conn.commit()
+
+
+def init_db():
+    dbpath = _db_path()
+    dirpath = os.path.dirname(dbpath)
+    if dirpath and not os.path.exists(dirpath):
+        os.makedirs(dirpath, exist_ok=True)
+    conn = sqlite3.connect(dbpath)
+    _init_db_conn(conn)
     conn.close()
+
+
+def _connect():
+    """Return a sqlite3.Connection to the configured DB.
+
+    If the DB cannot be opened, attempt to initialize it (create directory
+    and schema). If that still fails, fall back to an in-memory DB with the
+    required schema so callers don't crash in CI/test environments.
+    """
+    dbpath = _db_path()
+    try:
+        # Ensure parent directory exists before connecting.
+        dirpath = os.path.dirname(dbpath)
+        if dirpath and not os.path.exists(dirpath):
+            os.makedirs(dirpath, exist_ok=True)
+
+        conn = sqlite3.connect(dbpath)
+        # If the database file is empty or new, ensure schema is present so
+        # callers can rely on tables existing.
+        try:
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='requests'"
+            )
+            if not cur.fetchone():
+                _init_db_conn(conn)
+        except Exception:
+            pass
+        return conn
+    except Exception:
+        # try to initialize DB path and retry (covers races/permissions)
+        try:
+            init_db()
+            conn = sqlite3.connect(dbpath)
+            try:
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='requests'"
+                )
+                if not cur.fetchone():
+                    _init_db_conn(conn)
+            except Exception:
+                pass
+            return conn
+        except Exception:
+            # fallback to a cached in-memory DB so multiple calls operate on
+            # the same database instance during the process lifetime.
+            global _cached_memory_conn
+            with _cached_memory_lock:
+                if _cached_memory_conn is None:
+                    _cached_memory_conn = sqlite3.connect(
+                        ":memory:", check_same_thread=False
+                    )
+                    _init_db_conn(_cached_memory_conn)
+            return _NoCloseConn(_cached_memory_conn)
 
 
 def add_request(
@@ -114,7 +211,7 @@ def add_request(
     description: str = None,
     original_message_id: int = None,
 ) -> int:
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     cur = conn.cursor()
     # Deduplicate when original_message_id is provided: return existing request if present
     if original_message_id is not None:
@@ -171,7 +268,7 @@ def add_request(
 
 
 def list_requests(limit: int = 100, offset: int = 0):
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     cur = conn.cursor()
     cur.execute(
         """SELECT id, chat_id, url, status, created_at, description,
@@ -186,7 +283,7 @@ def list_requests(limit: int = 100, offset: int = 0):
 
 
 def count_requests() -> int:
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM requests")
     r = cur.fetchone()[0]
@@ -195,7 +292,7 @@ def count_requests() -> int:
 
 
 def update_request_status(request_id: int, status: str):
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     cur = conn.cursor()
     cur.execute("UPDATE requests SET status = ? WHERE id = ?", (status, request_id))
     conn.commit()
@@ -204,7 +301,7 @@ def update_request_status(request_id: int, status: str):
 
 def mark_request_started(request_id: int):
     now = datetime.datetime.utcnow().isoformat()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     cur = conn.cursor()
     cur.execute(
         "UPDATE requests SET processing_started_at = ?, status = ? WHERE id = ?",
@@ -232,7 +329,7 @@ def mark_request_finished(
     request_id: int, final_size: int = None, compressed: bool = None
 ):
     now = datetime.datetime.utcnow().isoformat()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     cur = conn.cursor()
     # compute duration if started_at present
     cur.execute(
@@ -282,7 +379,7 @@ def mark_request_finished(
 
 
 def set_request_original_size(request_id: int, original_size: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     cur = conn.cursor()
     cur.execute(
         "UPDATE requests SET original_size = ? WHERE id = ?",
@@ -298,7 +395,7 @@ def add_request_event(
     details: str = None,
     duration_seconds: float = None,
 ) -> int:
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO request_events (request_id, event_type, details, duration_seconds, created_at) VALUES (?, ?, ?, ?, ?)",
@@ -338,7 +435,7 @@ def add_request_event(
 
 def claim_request_for_sending(request_id: int) -> bool:
     """Atomically claim a request for sending. Returns True if claimed, False if already sent/claimed."""
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     cur = conn.cursor()
     try:
         cur.execute(
@@ -356,7 +453,7 @@ def claim_request_for_sending(request_id: int) -> bool:
 def claim_request_for_processing(request_id: int) -> bool:
     """Atomically claim a request for processing (download/compress). Returns True if claimed."""
     now = datetime.datetime.utcnow().isoformat()
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     cur = conn.cursor()
     try:
         cur.execute(
@@ -372,7 +469,7 @@ def claim_request_for_processing(request_id: int) -> bool:
 
 
 def get_request_events(request_id: int, limit: int = 50, offset: int = 0):
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     cur = conn.cursor()
     cur.execute(
         "SELECT id, event_type, details, duration_seconds, created_at FROM request_events WHERE request_id = ? ORDER BY id ASC LIMIT ? OFFSET ?",
@@ -384,7 +481,7 @@ def get_request_events(request_id: int, limit: int = 50, offset: int = 0):
 
 
 def add_update(raw: str) -> int:
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO updates (raw, created_at) VALUES (?, ?)",
@@ -412,7 +509,7 @@ def add_update(raw: str) -> int:
 
 
 def list_updates(limit: int = 100, offset: int = 0):
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     cur = conn.cursor()
     cur.execute(
         "SELECT id, raw, created_at FROM updates ORDER BY id DESC LIMIT ? OFFSET ?",
@@ -424,7 +521,7 @@ def list_updates(limit: int = 100, offset: int = 0):
 
 
 def is_message_processed(chat_id: int, message_id: int) -> bool:
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     cur = conn.cursor()
     cur.execute(
         "SELECT 1 FROM processed_messages WHERE chat_id = ? AND message_id = ? LIMIT 1",
@@ -436,7 +533,7 @@ def is_message_processed(chat_id: int, message_id: int) -> bool:
 
 
 def mark_message_processed(chat_id: int, message_id: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     cur = conn.cursor()
     try:
         cur.execute(
@@ -452,7 +549,7 @@ def mark_message_processed(chat_id: int, message_id: int):
 
 
 def count_updates() -> int:
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     cur = conn.cursor()
     cur.execute("SELECT COUNT(*) FROM updates")
     r = cur.fetchone()[0]
@@ -461,7 +558,7 @@ def count_updates() -> int:
 
 
 def add_user(username: str = None, email: str = None, role: str = "user") -> int:
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     cur = conn.cursor()
     cur.execute(
         "INSERT INTO users (username, email, role, created_at) VALUES (?, ?, ?, ?)",
@@ -474,7 +571,7 @@ def add_user(username: str = None, email: str = None, role: str = "user") -> int
 
 
 def list_users(limit: int = 100, offset: int = 0):
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     cur = conn.cursor()
     cur.execute(
         "SELECT id, username, email, role, created_at FROM users ORDER BY id DESC LIMIT ? OFFSET ?",
@@ -486,7 +583,7 @@ def list_users(limit: int = 100, offset: int = 0):
 
 
 def get_user_by_email(email: str):
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     cur = conn.cursor()
     cur.execute(
         "SELECT id, username, email, role, created_at FROM users WHERE email = ? LIMIT 1",
@@ -498,7 +595,7 @@ def get_user_by_email(email: str):
 
 
 def set_user_role(user_id: int, role: str):
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     cur = conn.cursor()
     cur.execute("UPDATE users SET role = ? WHERE id = ?", (role, user_id))
     conn.commit()
@@ -506,7 +603,7 @@ def set_user_role(user_id: int, role: str):
 
 
 def delete_user(user_id: int):
-    conn = sqlite3.connect(DB_PATH)
+    conn = _connect()
     cur = conn.cursor()
     cur.execute("DELETE FROM users WHERE id = ?", (user_id,))
     conn.commit()

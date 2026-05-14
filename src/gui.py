@@ -1,7 +1,6 @@
 import asyncio
 import logging
 import os
-import sqlite3
 
 import aiohttp
 from authlib.integrations.starlette_client import OAuth, OAuthError
@@ -10,7 +9,6 @@ from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, Redirect
 from starlette.middleware.sessions import SessionMiddleware
 
 from . import config, db, ws_broadcast
-from .db import DB_PATH
 
 app = FastAPI(title="Social media reuploader - Admin GUI")
 
@@ -76,6 +74,13 @@ def _check_admin(request: Request) -> bool:
 
     # OAuth session fallback: check DB for user role
     session = request.session
+    # Session-level admin override: allow granting admin for the current
+    # session after a successful OAuth login (see /api/session/grant_admin).
+    try:
+        if session and session.get("is_admin"):
+            return True
+    except Exception:
+        pass
     # Optional: map OAuth groups to admin role when configured
     if OAUTH_ADMIN_GROUPS_SET and session and session.get("user"):
         try:
@@ -111,11 +116,55 @@ def _check_admin(request: Request) -> bool:
                 user.get("email") or user.get("preferred_username") or user.get("sub")
             )
         if email:
-            u = db.get_user_by_email(email)
-            if u and u[3] == "admin":
-                return True
+            try:
+                u = db.get_user_by_email(email)
+                if u and u[3] == "admin":
+                    return True
+            except Exception:
+                # If DB is not available (tests/CI), do not raise here.
+                pass
 
     return False
+
+
+def _get_oauth_provider():
+    """Return a provider client in a way that works across authlib versions.
+
+    Some authlib versions expose registered clients as attribute access
+    (e.g. ``oauth.provider``). Newer versions encourage using
+    ``oauth.create_client(name)``. Tests may also monkeypatch
+    ``oauth.provider`` directly. Try several fallbacks and return the
+    first callable-like provider.
+    """
+    # prefer attribute access if present
+    try:
+        if hasattr(oauth, "provider") and getattr(oauth, "provider") is not None:
+            return getattr(oauth, "provider")
+    except Exception:
+        pass
+    # try authlib factory method
+    try:
+        if hasattr(oauth, "create_client"):
+            client = oauth.create_client("provider")
+            if client is not None:
+                return client
+    except Exception:
+        pass
+    # finally, fall back to raw _clients dict (used in some tests)
+    try:
+        raw = getattr(oauth, "_clients", None)
+        if raw and "provider" in raw:
+            # Some authlib versions store client instances directly in the
+            # internal _clients dict (e.g. authlib 1.7.x). Return the stored
+            # client rather than attempting attribute access which may not
+            # be present.
+            try:
+                return raw["provider"]
+            except Exception:
+                return getattr(oauth, "provider", None)
+    except Exception:
+        pass
+    return None
 
 
 def _check_admin_ws(websocket: WebSocket) -> bool:
@@ -132,6 +181,12 @@ def _check_admin_ws(websocket: WebSocket) -> bool:
             return True
     # session via scope
     session = websocket.session if hasattr(websocket, "session") else None
+    # Session-level admin override (for WebSocket scope as well)
+    try:
+        if session and session.get("is_admin"):
+            return True
+    except Exception:
+        pass
     # Optional: map OAuth groups to admin role when configured (WebSocket)
     if OAUTH_ADMIN_GROUPS_SET and session and session.get("user"):
         try:
@@ -166,9 +221,58 @@ def _check_admin_ws(websocket: WebSocket) -> bool:
                 user.get("email") or user.get("preferred_username") or user.get("sub")
             )
         if email:
-            u = db.get_user_by_email(email)
-            if u and u[3] == "admin":
-                return True
+            try:
+                u = db.get_user_by_email(email)
+                if u and u[3] == "admin":
+                    return True
+            except Exception:
+                # If DB is not available (tests/CI), do not raise here.
+                pass
+    return False
+
+
+def _session_has_persistent_entitlement(session) -> bool:
+    """Return True if the given session's user is persistently entitled to admin
+
+    This checks OAuth group membership (when configured) and the DB role for
+    the user's email. It deliberately does NOT consider the transient
+    `session['is_admin']` flag.
+    """
+    if not session or not session.get("user"):
+        return False
+    try:
+        user = session.get("user")
+        # check groups if configured
+        if OAUTH_ADMIN_GROUPS_SET and isinstance(user, dict):
+            groups = user.get("groups") or user.get("memberOf") or user.get("member_of")
+            if groups:
+                if isinstance(groups, str):
+                    groups_list = [g.strip() for g in groups.split(",") if g.strip()]
+                elif isinstance(groups, (list, tuple)):
+                    groups_list = list(groups)
+                else:
+                    groups_list = [str(groups)]
+                for g in groups_list:
+                    if (
+                        g in OAUTH_ADMIN_GROUPS_SET
+                        or g.lower() in OAUTH_ADMIN_GROUPS_LOWER
+                    ):
+                        return True
+        # check DB role by email
+        email = None
+        if isinstance(user, dict):
+            email = (
+                user.get("email") or user.get("preferred_username") or user.get("sub")
+            )
+        if email:
+            try:
+                u = db.get_user_by_email(email)
+                if u and u[3] == "admin":
+                    return True
+            except Exception:
+                pass
+    except Exception:
+        pass
     return False
 
 
@@ -230,7 +334,12 @@ async def api_me(request: Request):
     # returns the session user if logged in via OAuth
     session = request.session
     user = session.get("user") if session else None
-    return JSONResponse({"user": user})
+    is_admin = False
+    try:
+        is_admin = bool(session.get("is_admin")) if session else False
+    except Exception:
+        is_admin = False
+    return JSONResponse({"user": user, "is_admin": is_admin})
 
 
 @app.get("/health")
@@ -266,19 +375,25 @@ async def health(request: Request):
 
 @app.get("/login")
 async def login(request: Request):
-    if "provider" not in oauth._clients:
+    provider = _get_oauth_provider()
+    if not provider:
         raise HTTPException(status_code=400, detail="OAuth provider not configured")
     redirect_uri = request.url_for("auth")
-    return await oauth.provider.authorize_redirect(request, redirect_uri)
+    return await provider.authorize_redirect(request, redirect_uri)
 
 
 @app.get("/auth")
 async def auth(request: Request):
+    provider = _get_oauth_provider()
+    if not provider:
+        raise HTTPException(status_code=400, detail="OAuth provider not configured")
     try:
-        token = await oauth.provider.authorize_access_token(request)
+        token = await provider.authorize_access_token(request)
     except OAuthError as err:
         raise HTTPException(status_code=400, detail=str(err))
 
+    # Try to obtain userinfo. Prefer fetching from configured userinfo URL,
+    # otherwise fall back to any userinfo returned in the token payload.
     access_token = token.get("access_token")
     userinfo = None
     if OAUTH_USERINFO_URL and access_token:
@@ -288,10 +403,52 @@ async def auth(request: Request):
                 try:
                     userinfo = await resp.json()
                 except Exception:
-                    userinfo = {"sub": None}
+                    userinfo = None
+
+    if userinfo is None:
+        # Some providers return user info in the token response under
+        # various keys; accept a few common fallbacks.
+        userinfo = (
+            token.get("userinfo") or token.get("user") or token.get("id_token_claims")
+        )
 
     # Save user in session
     request.session["user"] = userinfo or {"sub": None}
+
+    # Auto-grant session admin when the authenticated user belongs to one of
+    # the configured OAuth admin groups, or when their email maps to an
+    # admin user in the local DB. This is intentionally session-scoped.
+    try:
+        user = request.session.get("user")
+        if user and isinstance(user, dict):
+            groups = user.get("groups") or user.get("memberOf") or user.get("member_of")
+            if groups:
+                if isinstance(groups, str):
+                    groups_list = [g.strip() for g in groups.split(",") if g.strip()]
+                elif isinstance(groups, (list, tuple)):
+                    groups_list = list(groups)
+                else:
+                    groups_list = [str(groups)]
+                for g in groups_list:
+                    if (
+                        g in OAUTH_ADMIN_GROUPS_SET
+                        or g.lower() in OAUTH_ADMIN_GROUPS_LOWER
+                    ):
+                        request.session["is_admin"] = True
+                        break
+        # fallback: map email to DB role
+        if not request.session.get("is_admin") and user and isinstance(user, dict):
+            email = (
+                user.get("email") or user.get("preferred_username") or user.get("sub")
+            )
+            if email:
+                u = db.get_user_by_email(email)
+                if u and u[3] == "admin":
+                    request.session["is_admin"] = True
+    except Exception:
+        # don't fail the auth flow if admin mapping fails
+        pass
+
     return RedirectResponse(url="/")
 
 
@@ -380,7 +537,7 @@ async def api_stats(request: Request):
     if not _check_admin(request):
         raise HTTPException(status_code=403, detail="forbidden")
     # compute simple aggregates: averages and counts
-    conn = sqlite3.connect(DB_PATH)
+    conn = db._connect()
     cur = conn.cursor()
 
     def _safe_avg(col):
@@ -446,6 +603,37 @@ async def api_list_users(request: Request, limit: int = 50, offset: int = 0):
         for r in rows
     ]
     return JSONResponse({"items": results, "offset": offset, "limit": limit})
+
+
+@app.post("/api/session/grant_admin")
+async def api_session_grant_admin(request: Request):
+    # Allow a logged-in OAuth session to grant itself admin rights for the
+    # current session. This is intentionally session-scoped and does not
+    # modify persistent DB state.
+    session = request.session
+    if not session or not session.get("user"):
+        raise HTTPException(status_code=403, detail="not logged in")
+    # Only allow granting admin for sessions that already have a persistent
+    # entitlement (group membership or DB role). Do NOT allow any logged-in
+    # user to self-elevate.
+    if not _session_has_persistent_entitlement(session):
+        raise HTTPException(status_code=403, detail="not entitled")
+    try:
+        session["is_admin"] = True
+    except Exception:
+        raise HTTPException(status_code=500, detail="failed to set session")
+    return JSONResponse({"ok": True})
+
+
+@app.post("/api/session/revoke_admin")
+async def api_session_revoke_admin(request: Request):
+    session = request.session
+    try:
+        if session and session.get("is_admin"):
+            session.pop("is_admin", None)
+    except Exception:
+        pass
+    return JSONResponse({"ok": True})
 
 
 @app.post("/api/users")

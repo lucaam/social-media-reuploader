@@ -14,13 +14,10 @@
   </head>
   <body class="bg-light">
     <div class="container">
-      <div class="d-flex justify-content-between align-items-center mb-3">
-        <h2>Social media reuploader — Admin</h2>
-        <div>
-          <input id="tokenInput" class="form-control d-inline-block" style="width:280px" placeholder="Admin token (optional)" />
-          <button id="saveToken" class="btn btn-sm btn-primary">Save</button>
+        <div class="d-flex justify-content-between align-items-center mb-3">
+          <h2>Social media reuploader — Admin</h2>
+          <div id="authControls"></div>
         </div>
-      </div>
 
       <div class="row">
         <div class="col-md-6">
@@ -95,8 +92,7 @@
     </div>
 
     <script>
-    const saveBtn = document.getElementById('saveToken')
-    const tokenInput = document.getElementById('tokenInput')
+    const authControls = document.getElementById('authControls')
     const requestsTable = document.querySelector('#requestsTable tbody')
     const updatesEl = document.getElementById('updates')
     const searchInput = document.getElementById('searchInput')
@@ -106,18 +102,11 @@
 
     let timeSeriesChart = null
 
-    // load stored token
-    tokenInput.value = localStorage.getItem('admin_token') || ''
-    saveBtn.onclick = () => {
-      localStorage.setItem('admin_token', tokenInput.value)
-      alert('Token saved to localStorage')
-      loadAll()
-    }
-
-    function authHeaders() {
-      const token = localStorage.getItem('admin_token')
-      if (token) return { 'Authorization': 'Bearer ' + token }
-      return {}
+    // helper: use cookie-based session (same-origin credentials)
+    function fetchWithCreds(url, opts) {
+      opts = opts || {}
+      opts.credentials = opts.credentials || 'same-origin'
+      return fetch(url, opts)
     }
 
     async function loadRequests(page = 1) {
@@ -125,7 +114,7 @@
         const limit = parseInt(pageSizeSelect.value, 10)
         const offset = (page - 1) * limit
         const q = `/requests?limit=${limit}&offset=${offset}`
-        const resp = await fetch(q, { headers: authHeaders() })
+        const resp = await fetchWithCreds(q)
         if (!resp.ok) throw new Error('unauthorized')
         const data = await resp.json()
         return data
@@ -139,7 +128,7 @@
       try {
         const limit = 50
         const offset = (page - 1) * limit
-        const resp = await fetch(`/api/updates?limit=${limit}&offset=${offset}`, { headers: authHeaders() })
+        const resp = await fetchWithCreds(`/api/updates?limit=${limit}&offset=${offset}`)
         if (!resp.ok) throw new Error('unauthorized')
         const data = await resp.json()
         updatesEl.textContent = data.items.slice(0,50).map(u => `${u.created_at}\n${u.raw}\n---`).join('\n')
@@ -273,7 +262,7 @@
 
     async function loadStats() {
       try {
-        const resp = await fetch('/stats', { headers: authHeaders() })
+        const resp = await fetchWithCreds('/stats')
         if (!resp.ok) return
         const s = await resp.json()
         document.getElementById('statAvgOrig').textContent = s.avg_original_size_mb ? (s.avg_original_size_mb + ' MB') : '—'
@@ -293,14 +282,28 @@
     // display login if oauth configured
     async function initAuth() {
       try {
-        const cfg = await (await fetch('/config')).json()
-        const me = await (await fetch('/api/me')).json()
+        const cfg = await (await fetchWithCreds('/config')).json()
+        const me = await (await fetchWithCreds('/api/me')).json()
         if (cfg.oauth_configured) {
           const btn = document.createElement('a')
-          btn.href = '/login'
           btn.className = 'btn btn-sm btn-outline-primary ms-2'
-          btn.textContent = me.user && me.user.login ? ('Logout ' + (me.user.login || '')) : 'Login with OAuth'
-          document.querySelector('.d-flex.justify-content-between').appendChild(btn)
+          if (me && me.user) {
+            // logged in -> show logout
+            const display = me.user.name || me.user.preferred_username || me.user.email || (me.user.sub || '')
+            btn.href = '/logout'
+            btn.textContent = 'Logout ' + (display || '')
+          } else {
+            btn.href = '/login'
+            btn.textContent = 'Login with OAuth'
+          }
+          authControls.appendChild(btn)
+          // show small status if logged-in
+          if (me && me.user) {
+            const span = document.createElement('span')
+            span.className = 'ms-2 small text-muted'
+            span.textContent = me.is_admin ? 'Admin' : 'Authenticated'
+            authControls.appendChild(span)
+          }
         }
       } catch (e) {
         // ignore
@@ -310,9 +313,8 @@
     // WebSocket for realtime updates with polling fallback
     let ws = null
     function wsUrl() {
-      const token = localStorage.getItem('admin_token') || ''
       const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-      return `${proto}//${location.host}/ws/updates${token ? '?token=' + encodeURIComponent(token) : ''}`
+      return `${proto}//${location.host}/ws/updates`
     }
 
     function setupWs() {

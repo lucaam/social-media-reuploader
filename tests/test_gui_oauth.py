@@ -1,0 +1,189 @@
+import pytest
+
+# Skip whole module if FastAPI is not installed in the environment where tests
+# are executed. This keeps CI/local runs resilient when dependencies are not
+# available; CI should install requirements before running tests.
+pytest.importorskip("fastapi")
+import os
+
+from fastapi.testclient import TestClient
+from starlette.responses import RedirectResponse
+
+from src import db as _db
+from src import gui
+
+
+@pytest.fixture(scope="module", autouse=True)
+def init_db(tmp_path_factory):
+    # ensure the DB is created in a writable temporary location for tests
+    tmpdir = tmp_path_factory.mktemp("requests_db")
+    dbfile = tmpdir / "requests.db"
+    prev = os.environ.get("REQUESTS_DB")
+    os.environ["REQUESTS_DB"] = str(dbfile)
+    _db.init_db()
+    yield
+    try:
+        # restore previous env value
+        if prev is None:
+            os.environ.pop("REQUESTS_DB", None)
+        else:
+            os.environ["REQUESTS_DB"] = prev
+        if dbfile.exists():
+            dbfile.unlink()
+    except Exception:
+        pass
+
+
+def test_config_and_login_not_configured(monkeypatch):
+    # ensure provider absent for this test
+    orig = dict(gui.oauth._clients)
+    gui.oauth._clients.pop("provider", None)
+
+    client = TestClient(gui.app)
+    r = client.get("/config")
+    assert r.status_code == 200
+    data = r.json()
+    assert data.get("oauth_configured") is False
+
+    # /login should return 400 when provider not configured
+    r2 = client.get("/login")
+    assert r2.status_code == 400
+
+    # restore
+    gui.oauth._clients.clear()
+    gui.oauth._clients.update(orig)
+
+
+def test_login_and_auth_flow_sets_session(monkeypatch):
+    # Register a fake provider and monkeypatch provider methods
+    gui.oauth._clients["provider"] = {}
+
+    class Provider:
+        async def authorize_redirect(self, request, redirect_uri):
+            return RedirectResponse(url="/auth")
+
+        async def authorize_access_token(self, request):
+            # simulate token return with embedded userinfo
+            return {
+                "access_token": "tok123",
+                "userinfo": {
+                    "sub": "u1",
+                    "email": "me@example.com",
+                    "preferred_username": "tester",
+                },
+            }
+
+    monkeypatch.setattr(gui.oauth, "provider", Provider(), raising=False)
+
+    client = TestClient(gui.app)
+
+    # /login should return a redirect response (307/302)
+    r = client.get("/login", follow_redirects=False)
+    assert r.status_code in (302, 307)
+
+    # Calling /auth should set the session user and redirect to '/'
+    r2 = client.get("/auth", follow_redirects=False)
+    assert r2.status_code in (302, 307)
+
+    # Now /api/me should return a user in the session
+    r3 = client.get("/api/me")
+    assert r3.status_code == 200
+    j = r3.json()
+    assert "user" in j
+    assert j["user"]["email"] == "me@example.com"
+    assert j.get("is_admin") in (True, False)
+
+
+def test_grant_admin_allows_requests(monkeypatch):
+    # Ensure provider and simulate login
+    gui.oauth._clients["provider"] = {}
+
+    # Note: session self-grant now requires persistent entitlement. We'll
+    # first verify a non-entitled user cannot self-grant, then add a DB
+    # admin mapping and verify access/grant succeed.
+
+    class Provider:
+        async def authorize_redirect(self, request, redirect_uri):
+            return RedirectResponse(url="/auth")
+
+        async def authorize_access_token(self, request):
+            return {
+                "access_token": "tok123",
+                "userinfo": {"sub": "u2", "email": "u2@example.com"},
+            }
+
+    monkeypatch.setattr(gui.oauth, "provider", Provider(), raising=False)
+
+    client = TestClient(gui.app)
+
+    # login/auth -> session created
+    client.get("/login", follow_redirects=False)
+    client.get("/auth", follow_redirects=False)
+
+    # before granting admin the /requests endpoint should be forbidden
+    r = client.get("/requests")
+    assert r.status_code == 403
+    # grant admin for session should be forbidden for non-entitled user
+    r2 = client.post("/api/session/grant_admin")
+    assert r2.status_code == 403
+
+    # add persistent admin mapping in DB for this user's email
+    _db.add_user(username="u2", email="u2@example.com", role="admin")
+
+    # now the requests endpoint should be accessible (DB role applied)
+    r3 = client.get("/requests")
+    assert r3.status_code == 200
+    data = r3.json()
+    assert "items" in data
+
+    # and granting admin for the session should now succeed
+    r4 = client.post("/api/session/grant_admin")
+    assert r4.status_code == 200
+    assert r4.json().get("ok") is True
+
+
+def test_oauth_group_auto_admin(monkeypatch):
+    # ensure provider and simulate login with groups
+    gui.oauth._clients["provider"] = {}
+
+    class Provider:
+        async def authorize_redirect(self, request, redirect_uri):
+            return RedirectResponse(url="/auth")
+
+        async def authorize_access_token(self, request):
+            return {
+                "access_token": "tok123",
+                "userinfo": {
+                    "sub": "g1",
+                    "email": "g1@example.com",
+                    "groups": ["admins"],
+                },
+            }
+
+    monkeypatch.setattr(gui.oauth, "provider", Provider(), raising=False)
+    # inject admin group config into module for the test
+    orig_groups = set(gui.OAUTH_ADMIN_GROUPS_SET)
+    orig_groups_lower = set(gui.OAUTH_ADMIN_GROUPS_LOWER)
+    gui.OAUTH_ADMIN_GROUPS_SET.clear()
+    gui.OAUTH_ADMIN_GROUPS_LOWER.clear()
+    gui.OAUTH_ADMIN_GROUPS_SET.add("admins")
+    gui.OAUTH_ADMIN_GROUPS_LOWER.add("admins")
+
+    client = TestClient(gui.app)
+    client.get("/login", follow_redirects=False)
+    client.get("/auth", follow_redirects=False)
+
+    r = client.get("/api/me")
+    assert r.status_code == 200
+    j = r.json()
+    assert j.get("is_admin") is True
+
+    # requests endpoint should be accessible
+    r2 = client.get("/requests")
+    assert r2.status_code == 200
+
+    # restore
+    gui.OAUTH_ADMIN_GROUPS_SET.clear()
+    gui.OAUTH_ADMIN_GROUPS_SET.update(orig_groups)
+    gui.OAUTH_ADMIN_GROUPS_LOWER.clear()
+    gui.OAUTH_ADMIN_GROUPS_LOWER.update(orig_groups_lower)

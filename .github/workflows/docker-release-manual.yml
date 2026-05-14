@@ -43,6 +43,12 @@ jobs:
           CLEAN_TAG=${CLEAN_TAG#V}
           echo "CLEAN_TAG=${CLEAN_TAG}" >> "$GITHUB_ENV"
 
+      - name: Set build metadata
+        run: |
+          # use UTC timestamp as build date to avoid relying on github.run_started_at
+          echo "BUILD_DATE=$(date -u +'%Y-%m-%dT%H:%M:%SZ')" >> "$GITHUB_ENV"
+        shell: bash
+
       - name: Build and push to GHCR
         uses: docker/build-push-action@v7
         with:
@@ -54,13 +60,13 @@ jobs:
             ghcr.io/${{ github.repository }}:latest
           build-args: |
             VCS_REF=${{ github.sha }}
-            BUILD_DATE=${{ github.run_started_at }}
+            BUILD_DATE=${{ env.BUILD_DATE }}
             VERSION=${{ env.CLEAN_TAG }}
           labels: |
             org.opencontainers.image.version=${{ env.CLEAN_TAG }}
             org.opencontainers.image.revision=${{ github.sha }}
             org.opencontainers.image.source=https://github.com/${{ github.repository }}
-            org.opencontainers.image.created=${{ github.run_started_at }}
+            org.opencontainers.image.created=${{ env.BUILD_DATE }}
 
       - name: Make GHCR package public (optional via GHCR_PAT)
         env:
