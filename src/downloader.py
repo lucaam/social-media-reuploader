@@ -474,8 +474,13 @@ async def download(
                 except Exception:
                     vb = "1780k"
 
-                # Preserve original aspect ratio; avoid forcing fixed-pad frames
-                scale_filter = f"scale=w={target_w}:h=-2:force_original_aspect_ratio=decrease,setsar=1"
+                # Preserve original aspect ratio; avoid forcing fixed-pad frames.
+                # Respect config.AVOID_RESIZE to skip automatic resolution changes.
+                if getattr(config, "AVOID_RESIZE", False):
+                    # Avoid changing resolution; only ensure sample aspect ratio is set.
+                    scale_filter = "setsar=1"
+                else:
+                    scale_filter = f"scale=w={target_w}:h=-2:force_original_aspect_ratio=decrease,setsar=1"
 
                 ffmpeg_cmd = [
                     ffmpeg_bin,
@@ -777,11 +782,12 @@ async def download(
                 base = os.path.splitext(os.path.basename(input_path))[0]
                 out_path = os.path.join(dest_dir, f"{base}.recompressed.mp4")
 
-                # try decreasing quality and resolution combinations
+                # try decreasing quality and (optionally) resolution combinations
                 scale_heights = [360, 240, 180]
                 crf_values = [28, 30, 32, 34, 36]
 
-                for h in scale_heights:
+                if getattr(config, "AVOID_RESIZE", False):
+                    # Preserve original resolution; only vary CRF to reduce size.
                     for crf in crf_values:
                         if os.path.exists(out_path):
                             try:
@@ -796,7 +802,7 @@ async def download(
                             "-i",
                             input_path,
                             "-vf",
-                            "scale=w=640:h=-2:force_original_aspect_ratio=decrease,setsar=1",
+                            "setsar=1",
                             "-c:v",
                             "libx264",
                             "-preset",
@@ -821,6 +827,47 @@ async def download(
                             "+faststart",
                             out_path,
                         ]
+                else:
+                    for h in scale_heights:
+                        for crf in crf_values:
+                            if os.path.exists(out_path):
+                                try:
+                                    os.remove(out_path)
+                                except Exception:
+                                    pass
+                            cmd = [
+                                ffmpeg_bin,
+                                "-y",
+                                "-max_muxing_queue_size",
+                                "9999",
+                                "-i",
+                                input_path,
+                                "-vf",
+                                "scale=w=640:h=-2:force_original_aspect_ratio=decrease,setsar=1",
+                                "-c:v",
+                                "libx264",
+                                "-preset",
+                                "faster",
+                                "-crf",
+                                str(crf),
+                                "-maxrate",
+                                "4.5M",
+                                "-flags",
+                                "+global_header",
+                                "-pix_fmt",
+                                "yuv420p",
+                                "-profile:v",
+                                "baseline",
+                                "-c:a",
+                                "aac",
+                                "-ac",
+                                "2",
+                                "-b:a",
+                                "128k",
+                                "-movflags",
+                                "+faststart",
+                                out_path,
+                            ]
                         logger.debug("Running ffmpeg recompress: %s", " ".join(cmd))
                         try:
                             proc = await _spawn(*cmd)

@@ -222,6 +222,12 @@ class WorkerPool:
             )
 
         # 3) full transcode to baseline H.264
+        # Respect config.AVOID_RESIZE: avoid changing resolution when requested.
+        if getattr(config, "AVOID_RESIZE", False):
+            vf_filter = "setsar=1"
+        else:
+            vf_filter = "scale=w=640:h=-2:force_original_aspect_ratio=decrease,setsar=1"
+
         cmd_full = [
             ffmpeg_bin,
             "-y",
@@ -242,7 +248,7 @@ class WorkerPool:
             "-pix_fmt",
             "yuv420p",
             "-vf",
-            "scale=w=640:h=-2:force_original_aspect_ratio=decrease,setsar=1",
+            vf_filter,
             "-c:a",
             "aac",
             "-b:a",
