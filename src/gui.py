@@ -1,4 +1,5 @@
 import asyncio
+import logging
 import os
 import sqlite3
 
@@ -118,6 +119,24 @@ async def startup_event():
     # set ws_broadcast loop
     try:
         ws_broadcast.loop = asyncio.get_event_loop()
+    except Exception:
+        pass
+    # suppress uvicorn access logs for frequent /health probes unless debug enabled
+    try:
+
+        class _HealthProbeFilter(logging.Filter):
+            def filter(self, record):
+                try:
+                    msg = record.getMessage()
+                    if "/health" in msg:
+                        if "kube-probe" in msg.lower() or "get /health" in msg.lower():
+                            return False
+                except Exception:
+                    pass
+                return True
+
+        if not getattr(config, "HEALTH_DEBUG", False):
+            logging.getLogger("uvicorn.access").addFilter(_HealthProbeFilter())
     except Exception:
         pass
 

@@ -291,6 +291,28 @@ async def main():
             )
     except Exception:
         root_logger.debug("Could not create RotatingFileHandler")
+    # Install a lightweight filter to suppress noisy access logs for
+    # Kubernetes liveness/readiness probes on /health unless explicitly
+    # enabled via HEALTH_DEBUG. This avoids cluttering logs with frequent
+    # kube-probe requests while keeping other access logs intact.
+    try:
+
+        class _HealthProbeFilter(logging.Filter):
+            def filter(self, record):
+                try:
+                    msg = record.getMessage()
+                    if "/health" in msg:
+                        # suppress kube-probe UA or generic health GET entries
+                        if "kube-probe" in msg.lower() or "get /health" in msg.lower():
+                            return False
+                except Exception:
+                    pass
+                return True
+
+        if not getattr(config, "HEALTH_DEBUG", False):
+            logging.getLogger("aiohttp.access").addFilter(_HealthProbeFilter())
+    except Exception:
+        root_logger.debug("Could not attach health probe log filter")
     if not config.BOT_TOKEN:
         raise RuntimeError("BOT_TOKEN is not set in config")
 
