@@ -39,8 +39,15 @@ def test_login_and_auth_flow_sets_session(monkeypatch):
             return RedirectResponse(url="/auth")
 
         async def authorize_access_token(self, request):
-            # simulate token return
-            return {"access_token": "tok123"}
+            # simulate token return with embedded userinfo
+            return {
+                "access_token": "tok123",
+                "userinfo": {
+                    "sub": "u1",
+                    "email": "me@example.com",
+                    "preferred_username": "tester",
+                },
+            }
 
     monkeypatch.setattr(gui.oauth, "provider", Provider())
 
@@ -59,6 +66,8 @@ def test_login_and_auth_flow_sets_session(monkeypatch):
     assert r3.status_code == 200
     j = r3.json()
     assert "user" in j
+    assert j["user"]["email"] == "me@example.com"
+    assert j.get("is_admin") in (True, False)
 
 
 def test_grant_admin_allows_requests(monkeypatch):
@@ -70,7 +79,10 @@ def test_grant_admin_allows_requests(monkeypatch):
             return RedirectResponse(url="/auth")
 
         async def authorize_access_token(self, request):
-            return {"access_token": "tok123"}
+            return {
+                "access_token": "tok123",
+                "userinfo": {"sub": "u2", "email": "u2@example.com"},
+            }
 
     monkeypatch.setattr(gui.oauth, "provider", Provider())
 
@@ -94,3 +106,50 @@ def test_grant_admin_allows_requests(monkeypatch):
     assert r3.status_code == 200
     data = r3.json()
     assert "items" in data
+
+
+def test_oauth_group_auto_admin(monkeypatch):
+    # ensure provider and simulate login with groups
+    gui.oauth._clients["provider"] = {}
+
+    class Provider:
+        async def authorize_redirect(self, request, redirect_uri):
+            return RedirectResponse(url="/auth")
+
+        async def authorize_access_token(self, request):
+            return {
+                "access_token": "tok123",
+                "userinfo": {
+                    "sub": "g1",
+                    "email": "g1@example.com",
+                    "groups": ["admins"],
+                },
+            }
+
+    monkeypatch.setattr(gui.oauth, "provider", Provider())
+    # inject admin group config into module for the test
+    orig_groups = set(gui.OAUTH_ADMIN_GROUPS_SET)
+    orig_groups_lower = set(gui.OAUTH_ADMIN_GROUPS_LOWER)
+    gui.OAUTH_ADMIN_GROUPS_SET.clear()
+    gui.OAUTH_ADMIN_GROUPS_LOWER.clear()
+    gui.OAUTH_ADMIN_GROUPS_SET.add("admins")
+    gui.OAUTH_ADMIN_GROUPS_LOWER.add("admins")
+
+    client = TestClient(gui.app)
+    client.get("/login", allow_redirects=False)
+    client.get("/auth", allow_redirects=False)
+
+    r = client.get("/api/me")
+    assert r.status_code == 200
+    j = r.json()
+    assert j.get("is_admin") is True
+
+    # requests endpoint should be accessible
+    r2 = client.get("/requests")
+    assert r2.status_code == 200
+
+    # restore
+    gui.OAUTH_ADMIN_GROUPS_SET.clear()
+    gui.OAUTH_ADMIN_GROUPS_SET.update(orig_groups)
+    gui.OAUTH_ADMIN_GROUPS_LOWER.clear()
+    gui.OAUTH_ADMIN_GROUPS_LOWER.update(orig_groups_lower)

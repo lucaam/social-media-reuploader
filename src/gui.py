@@ -243,7 +243,12 @@ async def api_me(request: Request):
     # returns the session user if logged in via OAuth
     session = request.session
     user = session.get("user") if session else None
-    return JSONResponse({"user": user})
+    is_admin = False
+    try:
+        is_admin = bool(session.get("is_admin")) if session else False
+    except Exception:
+        is_admin = False
+    return JSONResponse({"user": user, "is_admin": is_admin})
 
 
 @app.get("/health")
@@ -292,6 +297,8 @@ async def auth(request: Request):
     except OAuthError as err:
         raise HTTPException(status_code=400, detail=str(err))
 
+    # Try to obtain userinfo. Prefer fetching from configured userinfo URL,
+    # otherwise fall back to any userinfo returned in the token payload.
     access_token = token.get("access_token")
     userinfo = None
     if OAUTH_USERINFO_URL and access_token:
@@ -301,10 +308,52 @@ async def auth(request: Request):
                 try:
                     userinfo = await resp.json()
                 except Exception:
-                    userinfo = {"sub": None}
+                    userinfo = None
+
+    if userinfo is None:
+        # Some providers return user info in the token response under
+        # various keys; accept a few common fallbacks.
+        userinfo = (
+            token.get("userinfo") or token.get("user") or token.get("id_token_claims")
+        )
 
     # Save user in session
     request.session["user"] = userinfo or {"sub": None}
+
+    # Auto-grant session admin when the authenticated user belongs to one of
+    # the configured OAuth admin groups, or when their email maps to an
+    # admin user in the local DB. This is intentionally session-scoped.
+    try:
+        user = request.session.get("user")
+        if user and isinstance(user, dict):
+            groups = user.get("groups") or user.get("memberOf") or user.get("member_of")
+            if groups:
+                if isinstance(groups, str):
+                    groups_list = [g.strip() for g in groups.split(",") if g.strip()]
+                elif isinstance(groups, (list, tuple)):
+                    groups_list = list(groups)
+                else:
+                    groups_list = [str(groups)]
+                for g in groups_list:
+                    if (
+                        g in OAUTH_ADMIN_GROUPS_SET
+                        or g.lower() in OAUTH_ADMIN_GROUPS_LOWER
+                    ):
+                        request.session["is_admin"] = True
+                        break
+        # fallback: map email to DB role
+        if not request.session.get("is_admin") and user and isinstance(user, dict):
+            email = (
+                user.get("email") or user.get("preferred_username") or user.get("sub")
+            )
+            if email:
+                u = db.get_user_by_email(email)
+                if u and u[3] == "admin":
+                    request.session["is_admin"] = True
+    except Exception:
+        # don't fail the auth flow if admin mapping fails
+        pass
+
     return RedirectResponse(url="/")
 
 
