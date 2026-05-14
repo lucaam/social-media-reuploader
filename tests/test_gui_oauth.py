@@ -137,7 +137,7 @@ def test_oauth_group_auto_admin(monkeypatch):
 
     client = TestClient(gui.app)
     client.get("/login", follow_redirects=False)
-    client.get("/auth", allow_redirects=False)
+    client.get("/auth", follow_redirects=False)
 
     r = client.get("/api/me")
     assert r.status_code == 200

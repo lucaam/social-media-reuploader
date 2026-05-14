@@ -118,9 +118,13 @@ def _check_admin(request: Request) -> bool:
                 user.get("email") or user.get("preferred_username") or user.get("sub")
             )
         if email:
-            u = db.get_user_by_email(email)
-            if u and u[3] == "admin":
-                return True
+            try:
+                u = db.get_user_by_email(email)
+                if u and u[3] == "admin":
+                    return True
+            except Exception:
+                # If DB is not available (tests/CI), do not raise here.
+                pass
 
     return False
 
@@ -212,9 +216,13 @@ def _check_admin_ws(websocket: WebSocket) -> bool:
                 user.get("email") or user.get("preferred_username") or user.get("sub")
             )
         if email:
-            u = db.get_user_by_email(email)
-            if u and u[3] == "admin":
-                return True
+            try:
+                u = db.get_user_by_email(email)
+                if u and u[3] == "admin":
+                    return True
+            except Exception:
+                # If DB is not available (tests/CI), do not raise here.
+                pass
     return False
 
 
