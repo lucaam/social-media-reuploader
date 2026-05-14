@@ -4,6 +4,8 @@ import pytest
 # are executed. This keeps CI/local runs resilient when dependencies are not
 # available; CI should install requirements before running tests.
 pytest.importorskip("fastapi")
+import os
+
 from fastapi.testclient import TestClient
 from starlette.responses import RedirectResponse
 
@@ -12,14 +14,20 @@ from src import gui
 
 
 @pytest.fixture(scope="module", autouse=True)
-def init_db(tmp_path_factory, monkeypatch):
+def init_db(tmp_path_factory):
     # ensure the DB is created in a writable temporary location for tests
     tmpdir = tmp_path_factory.mktemp("requests_db")
     dbfile = tmpdir / "requests.db"
-    monkeypatch.setenv("REQUESTS_DB", str(dbfile))
+    prev = os.environ.get("REQUESTS_DB")
+    os.environ["REQUESTS_DB"] = str(dbfile)
     _db.init_db()
     yield
     try:
+        # restore previous env value
+        if prev is None:
+            os.environ.pop("REQUESTS_DB", None)
+        else:
+            os.environ["REQUESTS_DB"] = prev
         if dbfile.exists():
             dbfile.unlink()
     except Exception:
