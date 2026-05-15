@@ -128,34 +128,58 @@ async def send_video(
     # so Telegram can correctly interpret orientation and sizing.
     try:
         if isinstance(meta, dict):
-            # duration in seconds (integer)
-            dur = meta.get("duration") or meta.get("format_duration") or None
-            if dur is None:
-                # try format.duration string path
-                try:
-                    fd = (
-                        meta.get("format", {}).get("duration")
+            # duration in seconds (integer) — handle 0 and string values explicitly
+            dur = None
+            try:
+                if "duration" in meta and meta.get("duration") is not None:
+                    dur = float(meta.get("duration"))
+                else:
+                    fmt = (
+                        meta.get("format")
                         if isinstance(meta.get("format"), dict)
                         else None
                     )
-                    if fd:
-                        dur = float(fd)
-                except Exception:
-                    dur = None
+                    if fmt and fmt.get("duration") is not None:
+                        dur = float(fmt.get("duration"))
+            except Exception:
+                dur = None
             if dur is not None:
                 try:
                     data.add_field("duration", str(int(float(dur))))
                 except Exception:
                     pass
-            # width/height from ffprobe
-            w = meta.get("video_width") or meta.get("width")
-            h = meta.get("video_height") or meta.get("height")
-            if w:
-                data.add_field("width", str(int(w)))
-            if h:
-                data.add_field("height", str(int(h)))
+
+            # width/height from ffprobe — preserve zeros if explicit
+            w = None
+            h = None
+            try:
+                if "video_width" in meta and meta.get("video_width") is not None:
+                    w = meta.get("video_width")
+                elif "width" in meta and meta.get("width") is not None:
+                    w = meta.get("width")
+                if "video_height" in meta and meta.get("video_height") is not None:
+                    h = meta.get("video_height")
+                elif "height" in meta and meta.get("height") is not None:
+                    h = meta.get("height")
+            except Exception:
+                w = None
+                h = None
+            try:
+                if w is not None:
+                    data.add_field("width", str(int(w)))
+            except Exception:
+                pass
+            try:
+                if h is not None:
+                    data.add_field("height", str(int(h)))
+            except Exception:
+                pass
+
             # hint to Telegram that this supports streaming
-            data.add_field("supports_streaming", "true")
+            try:
+                data.add_field("supports_streaming", "true")
+            except Exception:
+                pass
     except Exception:
         logger.debug("Could not attach ffprobe meta fields to sendVideo multipart")
     session = await http_client.get_session()

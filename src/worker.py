@@ -43,7 +43,8 @@ class WorkerPool:
         self._last_rate_warning: dict = {}
         # start dispatcher task if event loop is running
         try:
-            self._dispatch_task = asyncio.create_task(self._dispatch_loop())
+            loop = asyncio.get_running_loop()
+            self._dispatch_task = loop.create_task(self._dispatch_loop())
         except RuntimeError:
             # not in a running loop; dispatcher will be started later
             self._dispatch_task = None
@@ -800,15 +801,24 @@ class WorkerPool:
                     max_bytes=getattr(config, "TELEGRAM_MAX_FILE_SIZE", None),
                 )
 
+                # Ensure meta-derived flags are present (default to True)
+                has_video = True
+                has_audio = True
+                if isinstance(meta, dict):
+                    try:
+                        if meta.get("has_video") is not None:
+                            has_video = bool(meta.get("has_video"))
+                        if meta.get("has_audio") is not None:
+                            has_audio = bool(meta.get("has_audio"))
+                    except Exception:
+                        pass
+
                 # If yt-dlp selected an audio-only format because we passed
                 # a --max-filesize limit (common for Instagram reels larger
                 # than Telegram's limit), try one redownload without the
                 # filesize limit to let yt-dlp pick the best video stream.
                 try:
                     if not getattr(config, "SIMPLE_YTDLP_ONLY", False):
-                        has_video = (
-                            meta.get("has_video") if isinstance(meta, dict) else True
-                        )
                         if not has_video:
                             lowurl = (url or "").lower()
                             if "instagram.com" in lowurl or "reel" in lowurl:
@@ -828,6 +838,7 @@ class WorkerPool:
                                         )
                                         file_path = file_path2
                                         meta = meta2
+                                        # reflect that we redownloaded (event)
                                         try:
                                             if request_id:
                                                 db.add_request_event(
@@ -1134,18 +1145,7 @@ class WorkerPool:
                 except Exception:
                     logger.debug("compression notify failed")
 
-            # store final stats
-            try:
-                if request_id:
-                    db.mark_request_finished(
-                        request_id,
-                        final_size=final_size,
-                        compressed=(
-                            meta.get("compressed") if isinstance(meta, dict) else False
-                        ),
-                    )
-            except Exception:
-                pass
+            # Final stats will be recorded after a successful upload
 
             # attempt to claim the request for sending to avoid duplicates
             claimed = True
@@ -1277,6 +1277,11 @@ class WorkerPool:
                                 ext = "mp4"
                                 size = os.path.getsize(file_path)
                                 final_size = size
+                                try:
+                                    if isinstance(meta, dict):
+                                        meta["compressed"] = True
+                                except Exception:
+                                    pass
                                 # We intentionally do not regenerate thumbnails here
                                 # since thumbnailing is disabled per user request.
                             except Exception:
@@ -1461,6 +1466,26 @@ class WorkerPool:
                         metrics.files_sent_total.inc()
                         try:
                             if request_id:
+                                # record finished telemetry (final size and compressed flag)
+                                try:
+                                    compressed_val = False
+                                    try:
+                                        if (
+                                            isinstance(meta, dict)
+                                            and meta.get("compressed") is not None
+                                        ):
+                                            compressed_val = bool(
+                                                meta.get("compressed")
+                                            )
+                                    except Exception:
+                                        compressed_val = False
+                                    db.mark_request_finished(
+                                        request_id,
+                                        final_size=final_size,
+                                        compressed=compressed_val,
+                                    )
+                                except Exception:
+                                    pass
                                 db.update_request_status(request_id, "done")
                         except Exception:
                             pass

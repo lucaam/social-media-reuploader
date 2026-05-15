@@ -10,6 +10,9 @@ const statusCtx = document.getElementById('statusChart')
 const topChatsCtx = document.getElementById('topChatsChart')
 const durationCtx = document.getElementById('durationChart')
 const statusFilterSelect = document.getElementById('statusFilter')
+const queueQueuedEl = document.getElementById('queueQueued')
+const queueRunningEl = document.getElementById('queueRunning')
+const refreshQueueBtn = document.getElementById('refreshQueueBtn')
 
 let timeSeriesChart = null
 let statusChart = null
@@ -27,6 +30,10 @@ async function loadRequests(page = 1) {
     const limit = parseInt(pageSizeSelect.value, 10)
     const offset = (page - 1) * limit
     let q = `/requests?limit=${limit}&offset=${offset}`
+    try {
+      const sVal = (searchInput && searchInput.value) ? searchInput.value.trim() : ''
+      if (sVal) q += '&q=' + encodeURIComponent(sVal)
+    } catch (e) {}
     try {
       const sf = (statusFilterSelect && statusFilterSelect.value) ? statusFilterSelect.value : 'all'
       if (sf && sf !== 'all') q += '&status=' + encodeURIComponent(sf)
@@ -146,6 +153,7 @@ async function loadAll() {
     }
 
     await renderTablePage(currentPage)
+    await loadQueue()
     const reqData = await loadRequests(currentPage)
     await loadUpdates()
     await loadStats()
@@ -155,6 +163,101 @@ async function loadAll() {
     renderTimeSeries(items)
   } catch (err) {
     // ignore errors — keep UI readable
+  }
+}
+
+async function loadQueue() {
+  try {
+    if (!queueQueuedEl && !queueRunningEl) return
+    const resp = await fetchWithCreds('/api/queue')
+    if (!resp.ok) {
+      queueQueuedEl.innerHTML = '<li class="list-group-item">No access</li>'
+      queueRunningEl.innerHTML = ''
+      return
+    }
+    const d = await resp.json()
+    renderQueue(d)
+  } catch (e) {
+    try { if (queueQueuedEl) queueQueuedEl.innerHTML = '<li class="list-group-item">Error</li>' } catch (e) {}
+  }
+}
+
+function formatTimeAgo(iso) {
+  try {
+    const t = new Date(iso).getTime()
+    const diff = Math.floor((Date.now() - t) / 1000)
+    if (diff < 5) return 'now'
+    if (diff < 60) return diff + 's'
+    if (diff < 3600) return Math.floor(diff/60) + 'm'
+    if (diff < 86400) return Math.floor(diff/3600) + 'h'
+    return Math.floor(diff/86400) + 'd'
+  } catch (e) { return '' }
+}
+
+function renderQueue(d) {
+  try {
+    const queued = (d && d.queued) || []
+    const running = (d && d.running) || []
+    if (queueQueuedEl) {
+      queueQueuedEl.innerHTML = ''
+      if (queued.length === 0) {
+        const li = document.createElement('li'); li.className='list-group-item small text-muted'; li.textContent='(vuota)'; queueQueuedEl.appendChild(li)
+      } else {
+        for (const it of queued.slice(0,50)) {
+          const li = document.createElement('li')
+          li.className = 'list-group-item d-flex justify-content-between align-items-start'
+          const left = document.createElement('div')
+          left.style.maxWidth = '60%'
+          const a = document.createElement('a')
+          a.href = it.url || '#'
+          a.target = '_blank'
+          a.className = 'text-truncate-link'
+          a.textContent = it.url || ('id:' + (it.request_id || ''))
+          left.appendChild(a)
+          const meta = document.createElement('div')
+          meta.className = 'small text-muted'
+          meta.textContent = it.chat_id ? ('chat:' + it.chat_id) : ''
+          left.appendChild(meta)
+          const right = document.createElement('div')
+          right.className = 'small text-muted text-end'
+          right.textContent = formatTimeAgo(it.enqueued_at || it.created_at || new Date().toISOString())
+          li.appendChild(left)
+          li.appendChild(right)
+          queueQueuedEl.appendChild(li)
+        }
+      }
+    }
+    if (queueRunningEl) {
+      queueRunningEl.innerHTML = ''
+      if (running.length === 0) {
+        const li = document.createElement('li'); li.className='list-group-item small text-muted'; li.textContent='(nessun job in esecuzione)'; queueRunningEl.appendChild(li)
+      } else {
+        for (const it of running.slice(0,50)) {
+          const li = document.createElement('li')
+          li.className = 'list-group-item d-flex justify-content-between align-items-start'
+          const left = document.createElement('div')
+          left.style.maxWidth = '60%'
+          const a = document.createElement('a')
+          a.href = it.url || '#'
+          a.target = '_blank'
+          a.className = 'text-truncate-link'
+          a.textContent = it.url || ('id:' + (it.request_id || ''))
+          left.appendChild(a)
+          const meta = document.createElement('div')
+          meta.className = 'small text-muted'
+          meta.textContent = it.chat_id ? ('chat:' + it.chat_id) : ''
+          left.appendChild(meta)
+          const right = document.createElement('div')
+          right.className = 'small text-muted text-end'
+          right.textContent = formatTimeAgo(it.enqueued_at || new Date().toISOString())
+          li.appendChild(left)
+          li.appendChild(right)
+          queueRunningEl.appendChild(li)
+        }
+      }
+    }
+  } catch (e) {
+    // ignore
   }
 }
 
@@ -225,7 +328,7 @@ async function renderTablePage(page = 1) {
   const total = data.total || 0
   const items = data.items || []
   requestsTable.innerHTML = ''
-  for (const r of items) {
+    for (const r of items) {
     const tr = document.createElement('tr')
     const orig = r.original_size_mb !== null && r.original_size_mb !== undefined ? r.original_size_mb + ' MB' : ''
     const fin = r.final_size_mb !== null && r.final_size_mb !== undefined ? r.final_size_mb + ' MB' : ''
@@ -237,7 +340,17 @@ async function renderTablePage(page = 1) {
     else if (r.status === 'failed' || r.status === 'error') statusClass = 'bg-danger'
     else if (r.status === 'running' || r.status === 'processing' || r.status === 'in_progress') statusClass = 'bg-info'
     else if (r.status === 'queued' || r.status === 'pending') statusClass = 'bg-warning text-dark'
-    tr.innerHTML = `<td>${r.id}</td><td>${r.chat_id}</td><td><a href="${r.url}" target="_blank" class="text-truncate-link">${r.url}</a></td><td><span class="badge ${statusClass}">${r.status}</span></td><td>${orig}</td><td>${fin}</td><td>${comp}</td><td>${proc}</td><td>${r.created_at}</td>`
+
+    // build cells safely to avoid HTML injection
+    const tdId = document.createElement('td'); tdId.textContent = String(r.id); tr.appendChild(tdId)
+    const tdChat = document.createElement('td'); tdChat.textContent = String(r.chat_id); tr.appendChild(tdChat)
+    const tdUrl = document.createElement('td'); const a = document.createElement('a'); a.href = r.url || '#'; a.target = '_blank'; a.className = 'text-truncate-link'; a.rel = 'noopener noreferrer'; a.textContent = r.url || ''; tdUrl.appendChild(a); tr.appendChild(tdUrl)
+    const tdStatus = document.createElement('td'); const span = document.createElement('span'); span.className = 'badge ' + statusClass; span.textContent = r.status || ''; tdStatus.appendChild(span); tr.appendChild(tdStatus)
+    const tdOrig = document.createElement('td'); tdOrig.textContent = orig; tr.appendChild(tdOrig)
+    const tdFin = document.createElement('td'); tdFin.textContent = fin; tr.appendChild(tdFin)
+    const tdComp = document.createElement('td'); tdComp.textContent = comp; tr.appendChild(tdComp)
+    const tdProc = document.createElement('td'); tdProc.textContent = proc; tr.appendChild(tdProc)
+    const tdCreated = document.createElement('td'); tdCreated.textContent = r.created_at || ''; tr.appendChild(tdCreated)
     if (eventsSummary) tr.title = eventsSummary
     requestsTable.appendChild(tr)
   }
@@ -493,6 +606,7 @@ function setupWs() {
       } else if (msg.type === 'request_created' || msg.type === 'request_started' || msg.type === 'request_finished' || msg.type === 'request_event') {
         // refresh current page on request lifecycle changes
         renderTablePage(currentPage)
+        try { loadQueue() } catch (e) {}
       } else if (msg.type === 'update_created') {
         loadUpdates()
       }
@@ -519,4 +633,5 @@ setInterval(async () => {
 try {
   const refreshBtnSidebar = document.getElementById('refreshBtnSidebar')
   if (refreshBtnSidebar) refreshBtnSidebar.onclick = () => { loadAll() }
+  if (refreshQueueBtn) refreshQueueBtn.onclick = () => { loadQueue() }
 } catch (e) { /* ignore */ }

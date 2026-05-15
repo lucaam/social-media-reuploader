@@ -617,23 +617,37 @@ def clear_history():
     """
     conn = _connect()
     cur = conn.cursor()
+    success = False
     try:
         cur.execute("DELETE FROM request_events")
         cur.execute("DELETE FROM requests")
         cur.execute("DELETE FROM updates")
         cur.execute("DELETE FROM processed_messages")
         conn.commit()
-    finally:
-        conn.close()
-    # broadcast an event so connected GUIs can refresh
-    try:
-        from . import ws_broadcast
-
-        if getattr(ws_broadcast, "loop", None):
-            import asyncio
-
-            asyncio.run_coroutine_threadsafe(
-                ws_broadcast.broadcast({"type": "db_cleared"}), ws_broadcast.loop
-            )
+        success = True
     except Exception:
-        pass
+        try:
+            conn.rollback()
+        except Exception:
+            pass
+        conn.close()
+        raise
+    finally:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+    # broadcast an event so connected GUIs can refresh (only on success)
+    if success:
+        try:
+            from . import ws_broadcast
+
+            if getattr(ws_broadcast, "loop", None):
+                import asyncio
+
+                asyncio.run_coroutine_threadsafe(
+                    ws_broadcast.broadcast({"type": "db_cleared"}), ws_broadcast.loop
+                )
+        except Exception:
+            pass

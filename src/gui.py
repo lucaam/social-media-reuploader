@@ -39,21 +39,24 @@ if OAUTH_ADMIN_GROUPS:
 else:
     OAUTH_ADMIN_GROUPS_SET = set()
     OAUTH_ADMIN_GROUPS_LOWER = set()
-if OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET and OAUTH_AUTHORIZE_URL and OAUTH_TOKEN_URL:
-    # support optional OIDC discovery URL (server_metadata_url) so authlib
-    # can fetch `jwks_uri` and other endpoints automatically. If you run
-    # against an OpenID Connect provider, set `OAUTH_SERVER_METADATA_URL`
-    # (e.g. https://<issuer>/.well-known/openid-configuration).
+if (
+    OAUTH_CLIENT_ID
+    and OAUTH_CLIENT_SECRET
+    and ((OAUTH_AUTHORIZE_URL and OAUTH_TOKEN_URL) or OAUTH_SERVER_METADATA_URL)
+):
+    # Register provider. Support either explicit authorize/token endpoints
+    # OR a discovery `server_metadata_url` for OIDC providers.
     register_kwargs = dict(
         name="provider",
         client_id=OAUTH_CLIENT_ID,
         client_secret=OAUTH_CLIENT_SECRET,
-        authorize_url=OAUTH_AUTHORIZE_URL,
-        access_token_url=OAUTH_TOKEN_URL,
         client_kwargs={"scope": OAUTH_SCOPE},
     )
     if OAUTH_SERVER_METADATA_URL:
         register_kwargs["server_metadata_url"] = OAUTH_SERVER_METADATA_URL
+    else:
+        register_kwargs["authorize_url"] = OAUTH_AUTHORIZE_URL
+        register_kwargs["access_token_url"] = OAUTH_TOKEN_URL
     oauth.register(**register_kwargs)
 
 # static SPA directory
