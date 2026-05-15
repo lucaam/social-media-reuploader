@@ -69,9 +69,9 @@ KEEP_DOWNLOADED_FILES = os.getenv("KEEP_DOWNLOADED_FILES", "false").lower() in (
 MAX_PENDING_PER_CHAT = int(os.getenv("MAX_PENDING_PER_CHAT", "1"))
 
 # Duplicate detection window (seconds) for same chat+url. Default: 90 minutes.
-DUUPLICATE_DEFAULT = 90 * 60
+DUPLICATE_DEFAULT = 90 * 60
 DUPLICATE_WINDOW_SECONDS = int(
-    os.getenv("DUPLICATE_WINDOW_SECONDS", str(DUUPLICATE_DEFAULT))
+    os.getenv("DUPLICATE_WINDOW_SECONDS", str(DUPLICATE_DEFAULT))
 )
 
 # Throttle durations for notifications sent to users (seconds).

@@ -371,51 +371,37 @@ async def set_message_reaction(
         reaction_for_aiogram = _to_aiogram_reaction(payload_reaction)
         logger.debug("set_message_reaction payload (aiogram): %s", reaction_for_aiogram)
         try:
-            # Some aiogram versions accept a `remove` kwarg, others do not.
-            # Inspect the bound method signature at runtime and call accordingly
-            import inspect
-
+            # aiogram 3.28.2 does not support a `remove` kwarg on set_message_reaction.
+            # To remove reactions, pass an empty list. To set reactions, pass the list.
             method = getattr(bot, "set_message_reaction")
-            supports_remove = False
-            try:
-                sig = inspect.signature(method)
-                supports_remove = "remove" in sig.parameters
-            except Exception:
-                supports_remove = False
 
-            if supports_remove:
-                # Preferred: call with explicit remove kwarg
+            if remove:
+                # Remove reactions by setting an empty list
+                try:
+                    res = await method(
+                        chat_id=chat_id,
+                        message_id=int(message_id),
+                        reaction=[],
+                    )
+                except Exception as e:
+                    # If setting empty list fails, try using DeleteMessageReaction method directly
+                    try:
+                        from aiogram.methods.delete_message_reaction import DeleteMessageReaction
+                        delete_method = DeleteMessageReaction(
+                            chat_id=chat_id,
+                            message_id=int(message_id),
+                        )
+                        res = await bot(delete_method)
+                    except Exception:
+                        # Fallback: re-raise original exception
+                        raise e
+            else:
+                # Set reactions normally
                 res = await method(
                     chat_id=chat_id,
                     message_id=int(message_id),
                     reaction=reaction_for_aiogram,
-                    remove=remove,
                 )
-            else:
-                # Method does not accept `remove`. Use alternative aiogram-only
-                # approaches: for removal attempt to set an empty reaction list,
-                # otherwise call the method with the reaction list.
-                if remove:
-                    try:
-                        res = await method(
-                            chat_id=chat_id,
-                            message_id=int(message_id),
-                            reaction=[],
-                        )
-                    except TypeError:
-                        # As a last resort, try delete_message_reaction()
-                        try:
-                            res = await bot.delete_message_reaction(
-                                chat_id=chat_id, message_id=int(message_id)
-                            )
-                        except Exception:
-                            raise
-                else:
-                    res = await method(
-                        chat_id=chat_id,
-                        message_id=int(message_id),
-                        reaction=reaction_for_aiogram,
-                    )
         except Exception as e:
             # Log and disable reactions for this chat for a while to avoid spam
             logger.exception("aiogram set_message_reaction failed: %s", e)

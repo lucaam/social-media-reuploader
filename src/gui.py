@@ -16,6 +16,9 @@ from . import config, db, ws_broadcast
 
 app = FastAPI(title="Social media reuploader - Admin GUI")
 
+# Keep strong references to background tasks to prevent garbage collection
+_background_tasks = set()
+
 # Session secret for cookie storage
 SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
@@ -467,22 +470,6 @@ async def index(request: Request):
     # fallback minimal page
     html = "<html><body><h1>Admin GUI</h1><p>Static UI missing.</p></body></html>"
     return HTMLResponse(html)
-
-
-@app.get("/config")
-async def gui_config(request: Request):
-    # Reuse the richer /api/config view so the SPA's "Mostra" button
-    # returns the same runtime information (worker settings, env, etc.).
-    try:
-        return await api_config(request)
-    except Exception:
-        # fallback minimal view
-        oauth_conf = _oauth_enabled()
-        admin_token_present = bool(os.environ.get("ADMIN_TOKEN"))
-        admin_token_effective = admin_token_present and not oauth_conf
-        return JSONResponse(
-            {"oauth_configured": oauth_conf, "admin_token_set": admin_token_effective}
-        )
 
 
 @app.get("/api/me")
@@ -1022,9 +1009,28 @@ async def api_db_clear(request: Request):
         raise HTTPException(status_code=403, detail="forbidden")
     try:
         db.clear_history()
-        return JSONResponse({"ok": True})
+    except Exception as e:
+        logging.exception("Failed to clear database: %s", e)
+        raise HTTPException(status_code=500, detail=f"failed to clear database: {e}")
+
+    # persist audit row
+    try:
+        db.add_update(json.dumps({"type": "db_cleared"}))
     except Exception:
-        raise HTTPException(status_code=500, detail="failed to clear database")
+        pass
+
+    # broadcast event so GUIs refresh
+    try:
+        if getattr(ws_broadcast, "loop", None):
+            import asyncio as _asyncio
+            _asyncio.run_coroutine_threadsafe(
+                ws_broadcast.broadcast({"type": "db_cleared"}),
+                ws_broadcast.loop,
+            )
+    except Exception:
+        pass
+
+    return JSONResponse({"ok": True})
 
 
 @app.get("/config")
@@ -1142,16 +1148,6 @@ async def api_unlimit_chat(request: Request):
                                     asyncio.create_task(w2._queue.put(item))
                                 except Exception:
                                     pass
-                            try:
-                                if getattr(
-                                    config, "WORKER_REHYDRATE_ON_UNLIMIT", False
-                                ):
-                                    try:
-                                        getattr(w2, "trigger_rehydrate", lambda: None)()
-                                    except Exception:
-                                        pass
-                            except Exception:
-                                pass
                             # If worker supports a trigger method, ask it to pick up
                             # persisted queued items immediately. This is a noop
                             # when GUI/worker are different processes but helps
@@ -1437,7 +1433,19 @@ async def api_clear_queue(request: Request):
 
     # schedule the blocking work on a thread and return immediately
     try:
-        asyncio.create_task(asyncio.to_thread(_clear_queue_sync, only_chat))
+        task = asyncio.create_task(asyncio.to_thread(_clear_queue_sync, only_chat))
+        _background_tasks.add(task)
+
+        def _task_done_callback(t):
+            _background_tasks.discard(t)
+            try:
+                exc = t.exception()
+                if exc:
+                    logging.exception("Background clear_queue task raised exception: %s", exc)
+            except Exception:
+                pass
+
+        task.add_done_callback(_task_done_callback)
     except Exception:
         # fallback: run synchronously if scheduling fails (best-effort)
         try:
