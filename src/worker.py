@@ -102,7 +102,9 @@ class WorkerPool:
                                 db.add_request_event(
                                     rid,
                                     "aborted_on_startup",
-                                    details=("aborted at startup because WORKER_REHYDRATE_ON_START=false"),
+                                    details=(
+                                        "aborted at startup because WORKER_REHYDRATE_ON_START=false"
+                                    ),
                                 )
                             except Exception:
                                 pass
@@ -110,7 +112,10 @@ class WorkerPool:
                         except Exception:
                             pass
                     try:
-                        logger.info("Marked %s persisted queued requests as aborted on startup", aborted)
+                        logger.info(
+                            "Marked %s persisted queued requests as aborted on startup",
+                            aborted,
+                        )
                     except Exception:
                         pass
             except Exception:
@@ -124,7 +129,9 @@ class WorkerPool:
         # into the in-memory queue. This helps when the GUI or another
         # process requeues items and the worker runs in a separate process.
         try:
-            interval = float(getattr(config, "WORKER_PERIODIC_REHYDRATE_SECONDS", 0) or 0)
+            interval = float(
+                getattr(config, "WORKER_PERIODIC_REHYDRATE_SECONDS", 0) or 0
+            )
             if interval and interval > 0:
                 try:
                     loop.create_task(self._periodic_rehydrate_loop(interval))
@@ -232,7 +239,9 @@ class WorkerPool:
                         db.add_request_event(
                             rid,
                             "rate_limited",
-                            details=(f"enqueue blocked by active rate-limit; next_in={int(max(0, float(next_allowed) - now))}s"),
+                            details=(
+                                f"enqueue blocked by active rate-limit; next_in={int(max(0, float(next_allowed) - now))}s"
+                            ),
                         )
                     except Exception:
                         pass
@@ -242,7 +251,9 @@ class WorkerPool:
                 # Throttled notification to chat about active rate limit
                 try:
                     last_warn = self._last_rate_warning.get(chat_id)
-                    if not last_warn or (now - last_warn) > int(self._notify_rate_throttle or 60):
+                    if not last_warn or (now - last_warn) > int(
+                        self._notify_rate_throttle or 60
+                    ):
                         try:
                             asyncio.create_task(
                                 self._notify_rate_limit(
@@ -302,18 +313,23 @@ class WorkerPool:
                                     try:
                                         created_iso = recent[2]
                                         if created_iso:
-                                            created_at = datetime.fromisoformat(created_iso)
+                                            created_at = datetime.fromisoformat(
+                                                created_iso
+                                            )
                                     except Exception:
                                         created_at = None
                                     remaining = int(self._dedupe_window_seconds)
                                     if created_at is not None:
                                         try:
                                             now_dt = datetime.utcnow()
-                                            elapsed = (now_dt - created_at).total_seconds()
+                                            elapsed = (
+                                                now_dt - created_at
+                                            ).total_seconds()
                                             remaining = int(
                                                 max(
                                                     0,
-                                                    int(self._dedupe_window_seconds) - int(elapsed),
+                                                    int(self._dedupe_window_seconds)
+                                                    - int(elapsed),
                                                 )
                                             )
                                         except Exception:
@@ -336,7 +352,9 @@ class WorkerPool:
                                 db.add_request_event(
                                     rid,
                                     "rate_limited",
-                                    details=(f"re-attempt blocked; prior rate_limited; next_in={remaining}s"),
+                                    details=(
+                                        f"re-attempt blocked; prior rate_limited; next_in={remaining}s"
+                                    ),
                                 )
                             except Exception:
                                 pass
@@ -345,10 +363,14 @@ class WorkerPool:
 
                         try:
                             last_warn = self._last_rate_warning.get(chat_id)
-                            if not last_warn or (now - last_warn) > int(self._notify_rate_throttle or 60):
+                            if not last_warn or (now - last_warn) > int(
+                                self._notify_rate_throttle or 60
+                            ):
                                 try:
                                     asyncio.create_task(
-                                        self._notify_rate_limit(chat_id, original_message_id, remaining)
+                                        self._notify_rate_limit(
+                                            chat_id, original_message_id, remaining
+                                        )
                                     )
                                 except Exception:
                                     pass
@@ -408,7 +430,8 @@ class WorkerPool:
                                     remaining = int(
                                         max(
                                             0,
-                                            int(self._dedupe_window_seconds) - int(elapsed),
+                                            int(self._dedupe_window_seconds)
+                                            - int(elapsed),
                                         )
                                     )
                                 except Exception:
@@ -518,11 +541,13 @@ class WorkerPool:
                     from . import ws_broadcast
 
                     try:
-                        ws_broadcast.publish_sync({
-                            "type": "rate_limit_changed",
-                            "chat_id": chat_id,
-                            "next": self._last_rate_limited_next.get(chat_id),
-                        })
+                        ws_broadcast.publish_sync(
+                            {
+                                "type": "rate_limit_changed",
+                                "chat_id": chat_id,
+                                "next": self._last_rate_limited_next.get(chat_id),
+                            }
+                        )
                     except Exception:
                         pass
                 except Exception:
@@ -634,11 +659,13 @@ class WorkerPool:
                     from . import ws_broadcast
 
                     try:
-                        ws_broadcast.publish_sync({
-                            "type": "rate_limit_changed",
-                            "chat_id": chat_id,
-                            "next": self._last_rate_limited_next.get(chat_id),
-                        })
+                        ws_broadcast.publish_sync(
+                            {
+                                "type": "rate_limit_changed",
+                                "chat_id": chat_id,
+                                "next": self._last_rate_limited_next.get(chat_id),
+                            }
+                        )
                     except Exception:
                         pass
                 except Exception:
@@ -867,10 +894,15 @@ class WorkerPool:
                                     self._last_rate_limited.pop(cid, None)
                                     self._last_rate_limited_next.pop(cid, None)
                                     self._last_rate_warning.pop(cid, None)
-                                    logger.info("Cleared in-memory rate-limit for chat=%s via DB update", cid)
+                                    logger.info(
+                                        "Cleared in-memory rate-limit for chat=%s via DB update",
+                                        cid,
+                                    )
                                     # rehydrate queued items for this chat immediately
                                     try:
-                                        asyncio.create_task(self._rehydrate_persisted_queue())
+                                        asyncio.create_task(
+                                            self._rehydrate_persisted_queue()
+                                        )
                                     except Exception:
                                         pass
                             except Exception:
@@ -880,9 +912,13 @@ class WorkerPool:
                                 self._last_rate_limited.clear()
                                 self._last_rate_limited_next.clear()
                                 self._last_rate_warning.clear()
-                                logger.info("Cleared all in-memory rate-limits via DB update")
+                                logger.info(
+                                    "Cleared all in-memory rate-limits via DB update"
+                                )
                                 try:
-                                    asyncio.create_task(self._rehydrate_persisted_queue())
+                                    asyncio.create_task(
+                                        self._rehydrate_persisted_queue()
+                                    )
                                 except Exception:
                                     pass
                             except Exception:
@@ -1012,7 +1048,9 @@ class WorkerPool:
             from . import ws_broadcast
 
             try:
-                ws_broadcast.publish_sync({"type": "queue_rehydrated", "count": requeued})
+                ws_broadcast.publish_sync(
+                    {"type": "queue_rehydrated", "count": requeued}
+                )
             except Exception:
                 pass
         except Exception:
@@ -1034,7 +1072,7 @@ class WorkerPool:
                     msg = f"Sei temporaneamente limitato: riprova tra {d} secondi."
                 else:
                     mins = int((d + 59) // 60)
-                    msg = f"Sei temporaneamente limitato: riprova tra circa {mins} minuto{'' if mins==1 else 'i'}."
+                    msg = f"Sei temporaneamente limitato: riprova tra circa {mins} minuto{'' if mins == 1 else 'i'}."
             except Exception:
                 msg = "Sei temporaneamente limitato: riprova più tardi."
             try:
@@ -1058,7 +1096,7 @@ class WorkerPool:
                 if delay_seconds and delay_seconds > 0:
                     if delay_seconds >= 60:
                         mins = int((delay_seconds + 59) // 60)
-                        msg = f"Hai già inviato questo link di recente. Riprova tra circa {mins} minuto{'' if mins==1 else 'i'}."
+                        msg = f"Hai già inviato questo link di recente. Riprova tra circa {mins} minuto{'' if mins == 1 else 'i'}."
                     else:
                         msg = f"Hai già inviato questo link di recente; riprova tra {int(delay_seconds)} secondi."
                 else:
@@ -1167,7 +1205,9 @@ class WorkerPool:
 
                         next_allowed_ts = self._last_rate_limited_next.get(chat_id)
                         if next_allowed_ts and float(next_allowed_ts) > now:
-                            remaining = int(max(0, math.ceil(float(next_allowed_ts) - now)))
+                            remaining = int(
+                                max(0, math.ceil(float(next_allowed_ts) - now))
+                            )
                         else:
                             remaining = int(max(0, math.ceil(delay_needed)))
                     except Exception:
@@ -1179,7 +1219,11 @@ class WorkerPool:
                     # record a canonical next-allowed time so subsequent checks
                     # and client notifications observe the same window.
                     try:
-                        self._last_rate_limited_next[chat_id] = now + (remaining if remaining and remaining > 0 else int(delay_needed))
+                        self._last_rate_limited_next[chat_id] = now + (
+                            remaining
+                            if remaining and remaining > 0
+                            else int(delay_needed)
+                        )
                     except Exception:
                         pass
 
@@ -1188,18 +1232,22 @@ class WorkerPool:
                         from . import ws_broadcast
 
                         try:
-                            ws_broadcast.publish_sync({
-                                "type": "rate_limit_changed",
-                                "chat_id": chat_id,
-                                "next": self._last_rate_limited_next.get(chat_id),
-                            })
+                            ws_broadcast.publish_sync(
+                                {
+                                    "type": "rate_limit_changed",
+                                    "chat_id": chat_id,
+                                    "next": self._last_rate_limited_next.get(chat_id),
+                                }
+                            )
                         except Exception:
                             pass
                     except Exception:
                         pass
 
                     last_warn = self._last_rate_warning.get(chat_id)
-                    if not last_warn or (now - last_warn) > int(self._notify_rate_throttle or 60):
+                    if not last_warn or (now - last_warn) > int(
+                        self._notify_rate_throttle or 60
+                    ):
                         try:
                             # best-effort notify chat about throttling
                             if remaining and remaining > 0:
@@ -1211,7 +1259,9 @@ class WorkerPool:
                                 msg = "Sei temporaneamente limitato: riprova tra qualche secondo."
                             await telegram_api.send_message(self.token, chat_id, msg)
                         except Exception:
-                            logger.debug("Could not send rate limit warning to chat %s", chat_id)
+                            logger.debug(
+                                "Could not send rate limit warning to chat %s", chat_id
+                            )
                         try:
                             self._last_rate_warning[chat_id] = now
                         except Exception:
@@ -1991,7 +2041,10 @@ class WorkerPool:
                                 try:
                                     try:
                                         radd = await telegram_api.set_message_reaction(
-                                            self.token, chat_id, original_message_id, "🍌"
+                                            self.token,
+                                            chat_id,
+                                            original_message_id,
+                                            "🍌",
                                         )
                                         ok_radd = (
                                             (isinstance(radd, dict) and radd.get("ok"))
@@ -2235,7 +2288,9 @@ class WorkerPool:
                         # file size and the allowed Telegram max as the target.
                         try:
                             orig_sz = size or (
-                                meta.get("original_size") if isinstance(meta, dict) else None
+                                meta.get("original_size")
+                                if isinstance(meta, dict)
+                                else None
                             )
                         except Exception:
                             orig_sz = None
