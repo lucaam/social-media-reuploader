@@ -888,6 +888,69 @@ async def api_aggregates(request: Request, top_limit: int = 10):
     )
 
 
+@app.get("/api/queue")
+async def api_queue(request: Request, limit: int = 50):
+    """Return a snapshot of the current WorkerPool queue and running tasks."""
+    if not _check_admin(request):
+        raise HTTPException(status_code=403, detail="forbidden")
+    try:
+        # import worker module lazily to avoid startup import cycles
+        from . import worker as worker_mod
+
+        w = getattr(worker_mod, "active_worker", None)
+        if not w:
+            return JSONResponse({"queue_length": 0, "queued": [], "running": []})
+
+        # queued items (internal asyncio.Queue deque)
+        try:
+            queued_raw = list(getattr(w._queue, "_queue", []))
+        except Exception:
+            queued_raw = []
+        queued = []
+        for it in queued_raw[:limit]:
+            try:
+                queued.append(
+                    {
+                        "chat_id": it.get("chat_id"),
+                        "url": it.get("url"),
+                        "enqueued_at": it.get("enqueued_at"),
+                    }
+                )
+            except Exception:
+                pass
+
+        running = []
+        try:
+            tasks = list(getattr(w, "_tasks", set()))
+            for t in tasks:
+                try:
+                    if t.done():
+                        continue
+                except Exception:
+                    pass
+                item = getattr(t, "_item", None)
+                if item:
+                    running.append(
+                        {
+                            "chat_id": item.get("chat_id"),
+                            "url": item.get("url"),
+                            "enqueued_at": item.get("enqueued_at"),
+                        }
+                    )
+        except Exception:
+            running = []
+
+        return JSONResponse(
+            {
+                "queue_length": len(queued_raw),
+                "queued": queued,
+                "running": running,
+            }
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/requests/{request_id}")
 async def get_request_detail(request: Request, request_id: int):
     if not _check_admin(request):

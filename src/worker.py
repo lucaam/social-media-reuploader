@@ -10,6 +10,11 @@ from typing import Optional
 
 from . import config, db, downloader, metrics, telegram_api
 
+# module-level pointer to the active WorkerPool instance (if any).
+# WorkerPool.__init__ will assign itself to this so other modules (GUI)
+# can retrieve the running pool for monitoring/debugging.
+active_worker = None
+
 logger = logging.getLogger(__name__)
 
 
@@ -43,6 +48,13 @@ class WorkerPool:
             # not in a running loop; dispatcher will be started later
             self._dispatch_task = None
 
+        # register active pool for external monitoring (GUI/debug)
+        try:
+            global active_worker
+            active_worker = self
+        except Exception:
+            pass
+
     def enqueue(
         self,
         chat_id,
@@ -63,6 +75,12 @@ class WorkerPool:
                 "chat_type": chat_type,
                 "enqueued_at": time.time(),
             }
+            # record enqueue timestamp for rate-limiting at submission time
+            try:
+                ts = self._chat_timestamps.setdefault(chat_id, [])
+                ts.append(item["enqueued_at"])
+            except Exception:
+                pass
             self._queue.put_nowait(item)
             return True
         except Exception:
@@ -193,12 +211,8 @@ class WorkerPool:
                 # if rate check fails, proceed to start task
                 pass
 
-            # allow the task to start: record timestamp and acquire a worker slot
-            try:
-                ts = self._chat_timestamps.setdefault(chat_id, [])
-                ts.append(now)
-            except Exception:
-                pass
+            # timestamps for rate limiting are recorded at enqueue time
+            # (we intentionally do not append here to avoid double-counting)
 
             # wait for a worker slot and start the processing task
             try:
@@ -223,6 +237,11 @@ class WorkerPool:
 
             try:
                 t = asyncio.create_task(_run_item(item))
+                # attach the processed item to the task for monitoring/UI
+                try:
+                    setattr(t, "_item", item)
+                except Exception:
+                    pass
                 self._tasks.add(t)
                 t.add_done_callback(lambda fut: self._tasks.discard(fut))
             except Exception:
@@ -356,7 +375,8 @@ class WorkerPool:
                             ]
                             if lines:
                                 single = " | ".join(lines)
-                                logger.info("ffmpeg: %s", single)
+                                # use DEBUG for verbose ffmpeg output; keep progress at INFO
+                                logger.debug("ffmpeg: %s", single)
                                 # try to parse last occurrence of time=VALUE to show percent
                                 try:
                                     if duration_seconds:
@@ -406,7 +426,7 @@ class WorkerPool:
                             if line.strip()
                         ]
                         if tail_lines:
-                            logger.info("ffmpeg: %s", " | ".join(tail_lines))
+                            logger.debug("ffmpeg: %s", " | ".join(tail_lines))
                     except Exception:
                         pass
 
