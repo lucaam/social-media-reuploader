@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import re
 import shutil
 import tempfile
 import time
@@ -27,6 +28,20 @@ class WorkerPool:
         self._sem = asyncio.Semaphore(workers)
         self._tasks = set()
         self._closing = False
+        # queue for incoming requests (FIFO)
+        self._queue: asyncio.Queue = asyncio.Queue()
+        # ensure only one transcode runs at a time
+        self._transcode_lock: asyncio.Lock = asyncio.Lock()
+        # per-chat timestamps for rate limiting (chat_id -> [ts, ...])
+        self._chat_timestamps: dict = {}
+        # last time we warned a chat about rate limiting (chat_id -> ts)
+        self._last_rate_warning: dict = {}
+        # start dispatcher task if event loop is running
+        try:
+            self._dispatch_task = asyncio.create_task(self._dispatch_loop())
+        except RuntimeError:
+            # not in a running loop; dispatcher will be started later
+            self._dispatch_task = None
 
     def enqueue(
         self,
@@ -40,26 +55,18 @@ class WorkerPool:
         if self._closing:
             return False
         try:
-
-            async def _worker_wrapper():
-                await self._sem.acquire()
-                try:
-                    await self._process(
-                        chat_id, url, description, original_message_id, chat_type
-                    )
-                finally:
-                    try:
-                        self._sem.release()
-                    except Exception:
-                        pass
-
-            t = asyncio.create_task(_worker_wrapper())
-        except RuntimeError:
-            # not in a running loop
+            item = {
+                "chat_id": chat_id,
+                "url": url,
+                "description": description,
+                "original_message_id": original_message_id,
+                "chat_type": chat_type,
+                "enqueued_at": time.time(),
+            }
+            self._queue.put_nowait(item)
+            return True
+        except Exception:
             return False
-        self._tasks.add(t)
-        t.add_done_callback(lambda fut: self._tasks.discard(fut))
-        return True
 
     async def shutdown(self, timeout: int | None = None):
         """Gracefully wait for currently running tasks to finish.
@@ -69,6 +76,19 @@ class WorkerPool:
         cancels remaining tasks.
         """
         self._closing = True
+        # cancel dispatcher if running
+        try:
+            if getattr(self, "_dispatch_task", None):
+                try:
+                    self._dispatch_task.cancel()
+                except Exception:
+                    pass
+                try:
+                    await self._dispatch_task
+                except Exception:
+                    pass
+        except Exception:
+            pass
         if timeout is None:
             timeout = getattr(config, "WORKER_SHUTDOWN_TIMEOUT", 30)
         start = time.time()
@@ -84,6 +104,133 @@ class WorkerPool:
             )
         except Exception:
             pass
+
+    async def _delayed_requeue(self, item: dict, delay: float):
+        try:
+            if delay and delay > 0:
+                await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        try:
+            if not self._closing:
+                await self._queue.put(item)
+        except Exception:
+            pass
+
+    async def _dispatch_loop(self):
+        """Background dispatcher that pulls items from the queue, enforces per-chat rate limits
+        and starts worker tasks honoring the semaphore (max concurrent workers).
+        """
+        # rate limits (counts) -> (limit, window_seconds)
+        limits = [
+            (5, 10),
+            (15, 60),
+            (50, 24 * 3600),
+            (100, 30 * 24 * 3600),
+        ]
+        while not self._closing:
+            try:
+                item = await self._queue.get()
+            except asyncio.CancelledError:
+                break
+            if item is None:
+                continue
+            chat_id = item.get("chat_id")
+            now = time.time()
+
+            # prune old timestamps for chat
+            try:
+                ts = self._chat_timestamps.setdefault(chat_id, [])
+                cutoff = now - (30 * 24 * 3600)
+                # keep timestamps newer than cutoff
+                self._chat_timestamps[chat_id] = [t for t in ts if t >= cutoff]
+                ts = self._chat_timestamps[chat_id]
+            except Exception:
+                ts = []
+
+            # check limits
+            exceeded = False
+            delay_needed = 0
+            try:
+                for limit, window in limits:
+                    cnt = sum(1 for t in ts if t >= now - window)
+                    if cnt >= limit:
+                        # compute earliest time when next slot frees
+                        oldest = min(t for t in ts if t >= now - window)
+                        d = (oldest + window) - now
+                        if d > delay_needed:
+                            delay_needed = d
+                        exceeded = True
+                # if exceeded, warn (once per minute) and requeue after delay
+                if exceeded and delay_needed > 0:
+                    last_warn = self._last_rate_warning.get(chat_id)
+                    if not last_warn or (now - last_warn) > 60:
+                        try:
+                            # best-effort notify chat about throttling
+                            msg = (
+                                f"Rate limit: troppi link inviati. "
+                                f"Il tuo link sarà processato tra {int(delay_needed)} secondi."
+                            )
+                            await telegram_api.send_message(self.token, chat_id, msg)
+                        except Exception:
+                            logger.debug(
+                                "Could not send rate limit warning to chat %s", chat_id
+                            )
+                        try:
+                            self._last_rate_warning[chat_id] = now
+                        except Exception:
+                            pass
+                    # requeue with delay
+                    try:
+                        asyncio.create_task(self._delayed_requeue(item, delay_needed))
+                    except Exception:
+                        try:
+                            await self._queue.put(item)
+                        except Exception:
+                            pass
+                    continue
+            except Exception:
+                # if rate check fails, proceed to start task
+                pass
+
+            # allow the task to start: record timestamp and acquire a worker slot
+            try:
+                ts = self._chat_timestamps.setdefault(chat_id, [])
+                ts.append(now)
+            except Exception:
+                pass
+
+            # wait for a worker slot and start the processing task
+            try:
+                await self._sem.acquire()
+            except asyncio.CancelledError:
+                break
+
+            async def _run_item(itm: dict):
+                try:
+                    await self._process(
+                        itm.get("chat_id"),
+                        itm.get("url"),
+                        itm.get("description"),
+                        itm.get("original_message_id"),
+                        itm.get("chat_type"),
+                    )
+                finally:
+                    try:
+                        self._sem.release()
+                    except Exception:
+                        pass
+
+            try:
+                t = asyncio.create_task(_run_item(item))
+                self._tasks.add(t)
+                t.add_done_callback(lambda fut: self._tasks.discard(fut))
+            except Exception:
+                try:
+                    self._sem.release()
+                except Exception:
+                    pass
+                logger.exception("Could not start worker task for item %s", item)
 
     async def _generate_thumbnail(
         self, ffmpeg_bin: str, src_path: str, dst_dir: str
@@ -126,7 +273,12 @@ class WorkerPool:
         return None
 
     async def _transcode_to_baseline(
-        self, src_path: str, dst_path: str, tmpdir: str, meta: dict | None = None
+        self,
+        src_path: str,
+        dst_path: str,
+        tmpdir: str,
+        meta: dict | None = None,
+        target_size: int | None = None,
     ) -> bool:
         """Ensure `dst_path` is an MP4 file compatible with Telegram.
 
@@ -152,26 +304,155 @@ class WorkerPool:
             pass
 
         async def _run_cmd(cmd, timeout):
-            logger.debug("running ffmpeg cmd: %s", " ".join(cmd))
+            # Run ffmpeg and stream stderr in real-time to logs so users can
+            # observe progress. Also capture full stderr to return on failure.
+            logger.info("running ffmpeg cmd: %s", " ".join(cmd))
             try:
                 p = await asyncio.create_subprocess_exec(*cmd, stdout=PIPE, stderr=PIPE)
+            except Exception as e:
+                logger.exception("ffmpeg invocation failed: %s", e)
+                return False, b"", b""
+
+            full_err = bytearray()
+            buffer = bytearray()
+
+            # try to obtain duration from meta for progress percentage
+            duration_seconds = None
+            try:
+                if isinstance(meta, dict):
+                    duration_seconds = meta.get("duration")
+                    if duration_seconds is None:
+                        fmt = meta.get("format") or {}
+                        if isinstance(fmt, dict):
+                            try:
+                                duration_seconds = float(fmt.get("duration"))
+                            except Exception:
+                                duration_seconds = None
+            except Exception:
+                duration_seconds = None
+
+            async def _reader():
+                nonlocal buffer, full_err
                 try:
-                    out, err = await asyncio.wait_for(p.communicate(), timeout=timeout)
+                    while True:
+                        chunk = await p.stderr.read(1024)
+                        if not chunk:
+                            break
+                        full_err.extend(chunk)
+                        buffer.extend(chunk)
+                        # find last newline/carriage return
+                        last_sep = max(buffer.rfind(b"\n"), buffer.rfind(b"\r"))
+                        if last_sep != -1:
+                            part = bytes(buffer[: last_sep + 1])
+                            try:
+                                text = part.decode(errors="ignore")
+                            except Exception:
+                                text = ""
+                            # compress multiple lines into a single concise log entry
+                            lines = [
+                                line.strip()
+                                for line in re.split(r"[\r\n]+", text)
+                                if line.strip()
+                            ]
+                            if lines:
+                                single = " | ".join(lines)
+                                logger.info("ffmpeg: %s", single)
+                                # try to parse last occurrence of time=VALUE to show percent
+                                try:
+                                    if duration_seconds:
+                                        idx = single.rfind("time=")
+                                        if idx != -1:
+                                            token = single[idx + 5 :].split()[0]
+                                            parts = token.split(":")
+                                            secs = 0.0
+                                            if len(parts) == 3:
+                                                secs = (
+                                                    float(parts[0]) * 3600
+                                                    + float(parts[1]) * 60
+                                                    + float(parts[2])
+                                                )
+                                            elif len(parts) == 2:
+                                                secs = float(parts[0]) * 60 + float(
+                                                    parts[1]
+                                                )
+                                            else:
+                                                secs = float(parts[0])
+                                            pct = min(
+                                                100.0,
+                                                max(
+                                                    0.0,
+                                                    (secs / float(duration_seconds))
+                                                    * 100.0,
+                                                ),
+                                            )
+                                            logger.info(
+                                                "ffmpeg progress: time=%s (%.1f%%)",
+                                                token,
+                                                pct,
+                                            )
+                                except Exception:
+                                    pass
+                            # keep remainder after last_sep
+                            buffer = bytearray(buffer[last_sep + 1 :])
+                except Exception as e:
+                    logger.exception("error reading ffmpeg stderr: %s", e)
+                # log any leftover compressed into a single line
+                if buffer:
+                    try:
+                        tail = bytes(buffer).decode(errors="ignore")
+                        tail_lines = [
+                            line.strip()
+                            for line in re.split(r"[\r\n]+", tail)
+                            if line.strip()
+                        ]
+                        if tail_lines:
+                            logger.info("ffmpeg: %s", " | ".join(tail_lines))
+                    except Exception:
+                        pass
+
+            reader_task = asyncio.create_task(_reader())
+
+            try:
+                try:
+                    await asyncio.wait_for(p.wait(), timeout=timeout)
                 except asyncio.TimeoutError:
                     try:
                         p.kill()
                     except Exception:
                         pass
                     try:
-                        await p.communicate()
+                        await p.wait()
                     except Exception:
                         pass
                     logger.warning("ffmpeg timed out for %s", src_path)
-                    return False, b"", b""
-                return p.returncode == 0, out, err
+                    # ensure reader finishes
+                    try:
+                        await reader_task
+                    except Exception:
+                        pass
+                    return False, b"", bytes(full_err)
+                # ensure reader finished reading remaining stderr
+                try:
+                    await reader_task
+                except Exception:
+                    pass
+                # read remaining stdout
+                try:
+                    out = await p.stdout.read()
+                except Exception:
+                    out = b""
+                return p.returncode == 0, out, bytes(full_err)
             except Exception as e:
-                logger.exception("ffmpeg invocation failed: %s", e)
-                return False, b"", b""
+                logger.exception("ffmpeg run failed: %s", e)
+                try:
+                    p.kill()
+                except Exception:
+                    pass
+                try:
+                    await reader_task
+                except Exception:
+                    pass
+                return False, b"", bytes(full_err)
 
         # 1) attempt fast remux (copy) when codecs look compatible
         if video_codec == "h264" and (audio_codec in (None, "aac", "mp3")):
@@ -221,16 +502,114 @@ class WorkerPool:
                 (err.decode(errors="ignore")[:1000] if err else ""),
             )
 
-        # 3) full transcode to baseline H.264
-        # Default: do not change resolution; only ensure SAR is set. If
-        # needed, callers may implement scaled transcode as a separate step.
+        # 3) full transcode to baseline
+        # Compute an orientation-aware scale+pad filter when we have stream
+        # dimensions available (keeps visual content and pads to Telegram-friendly sizes).
         vf_filter = "setsar=1"
+        try:
+            if isinstance(meta, dict):
+                vw = meta.get("video_width")
+                vh = meta.get("video_height")
+                vrot = meta.get("video_rotation")
+                try:
+                    w = int(vw) if vw else None
+                    h = int(vh) if vh else None
+                except Exception:
+                    w = None
+                    h = None
+                # account for rotation metadata swapping w/h
+                try:
+                    r = int(vrot) if vrot is not None else 0
+                except Exception:
+                    r = 0
+                if r in (90, -270, 270, -90) and w is not None and h is not None:
+                    w, h = h, w
+
+                is_portrait = False
+                try:
+                    if w and h:
+                        is_portrait = int(h) >= int(w)
+                except Exception:
+                    is_portrait = False
+
+                if is_portrait:
+                    pad_w = 720
+                    pad_h = 1280
+                else:
+                    pad_w = 640
+                    pad_h = 360
+
+                max_w = pad_w
+                max_h = pad_h
+
+                if w and h:
+                    scale_ratio = min(
+                        1.0, float(max_w) / float(w), float(max_h) / float(h)
+                    )
+                    new_w = max(2, int((w * scale_ratio) // 2 * 2))
+                    new_h = max(2, int((h * scale_ratio) // 2 * 2))
+                    if new_w == w and new_h == h:
+                        if new_w == pad_w and new_h == pad_h:
+                            vf_filter = "setsar=1"
+                        else:
+                            pad_x = max(0, (pad_w - new_w) // 2)
+                            pad_y = max(0, (pad_h - new_h) // 2)
+                            vf_filter = (
+                                f"setsar=1,pad={pad_w}:{pad_h}:{pad_x}:{pad_y}:black"
+                            )
+                    else:
+                        pad_x = max(0, (pad_w - new_w) // 2)
+                        pad_y = max(0, (pad_h - new_h) // 2)
+                        vf_filter = f"scale={new_w}:{new_h},setsar=1,pad={pad_w}:{pad_h}:{pad_x}:{pad_y}:black"
+                else:
+                    # fallback: keep simple SAR reset
+                    vf_filter = "setsar=1"
+        except Exception:
+            vf_filter = "setsar=1"
+
+        # Optionally compute a target video bitrate to fit `target_size` bytes
+        # given the media duration and a fixed audio bitrate. This tries to
+        # produce an MP4 small enough for Telegram when we need to reduce
+        # filesize.
+        bitrate_args: list[str] = []
+        try:
+            if target_size and isinstance(meta, dict):
+                dur = meta.get("duration")
+                if dur is None:
+                    # try nested format.duration
+                    fmt = meta.get("format") or {}
+                    try:
+                        dur = (
+                            float(fmt.get("duration"))
+                            if isinstance(fmt, dict) and fmt.get("duration")
+                            else None
+                        )
+                    except Exception:
+                        dur = None
+                if dur and dur > 0:
+                    # Reserve a small headroom and subtract audio bitrate (128k)
+                    audio_bps = 128000
+                    total_target_bps = (float(target_size) * 8.0) / float(dur)
+                    # headroom factor to account for container overhead
+                    total_target_bps *= 0.95
+                    video_bps = int(max(100000, total_target_bps - audio_bps))
+                    video_k = max(100, int(video_bps / 1000))
+                    maxrate_k = int(video_k * 1.5)
+                    bufsize_k = int(video_k * 2)
+                    bitrate_args = [
+                        "-b:v",
+                        f"{video_k}k",
+                        "-maxrate",
+                        f"{maxrate_k}k",
+                        "-bufsize",
+                        f"{bufsize_k}k",
+                    ]
+        except Exception:
+            bitrate_args = []
 
         cmd_full = [
             ffmpeg_bin,
             "-y",
-            "-max_muxing_queue_size",
-            "9999",
             "-i",
             src_path,
             "-map",
@@ -247,6 +626,7 @@ class WorkerPool:
             "yuv420p",
             "-vf",
             vf_filter,
+            *bitrate_args,
             "-c:a",
             "aac",
             "-b:a",
@@ -307,7 +687,7 @@ class WorkerPool:
         chat_type: Optional[str] = None,
     ):
         request_id = None
-        tmpdir = tempfile.mkdtemp()
+        tmpdir = tempfile.mkdtemp(dir=getattr(config, "TMP_DIR", None))
         # track which reaction we added on the original message (None, 'eyes', 'banana')
         reaction_current: Optional[str] = None
         status_msg_id = None
@@ -322,6 +702,12 @@ class WorkerPool:
                 )
             except Exception:
                 request_id = None
+            # mark processing started early so telemetry records processing_started_at
+            try:
+                if request_id:
+                    db.mark_request_started(request_id)
+            except Exception:
+                pass
 
             # Try to add an eyes reaction to the original message; fallback to status message
             if original_message_id:
@@ -336,9 +722,6 @@ class WorkerPool:
                     if ok:
                         reaction_current = "eyes"
                     else:
-                        logger.debug(
-                            "set_message_reaction returned non-ok; falling back to status message"
-                        )
                         try:
                             status_res = await telegram_api.send_message(
                                 self.token,
@@ -377,8 +760,58 @@ class WorkerPool:
                     tmpdir,
                     max_bytes=getattr(config, "TELEGRAM_MAX_FILE_SIZE", None),
                 )
+
+                # If yt-dlp selected an audio-only format because we passed
+                # a --max-filesize limit (common for Instagram reels larger
+                # than Telegram's limit), try one redownload without the
+                # filesize limit to let yt-dlp pick the best video stream.
+                try:
+                    if not getattr(config, "SIMPLE_YTDLP_ONLY", False):
+                        has_video = (
+                            meta.get("has_video") if isinstance(meta, dict) else True
+                        )
+                        if not has_video:
+                            lowurl = (url or "").lower()
+                            if "instagram.com" in lowurl or "reel" in lowurl:
+                                logger.info(
+                                    "No video stream detected; attempting redownload without size limit for %s",
+                                    url,
+                                )
+                                try:
+                                    file_path2, meta2 = await downloader.download(
+                                        url, tmpdir, max_bytes=None
+                                    )
+                                    if isinstance(meta2, dict) and meta2.get(
+                                        "has_video"
+                                    ):
+                                        logger.info(
+                                            "Redownload succeeded and contains a video stream; switching to redownloaded file"
+                                        )
+                                        file_path = file_path2
+                                        meta = meta2
+                                        try:
+                                            if request_id:
+                                                db.add_request_event(
+                                                    request_id,
+                                                    "redownload",
+                                                    details="redownload without filesize limit",
+                                                    duration_seconds=None,
+                                                )
+                                        except Exception:
+                                            logger.debug(
+                                                "Could not record redownload event for request %s",
+                                                request_id,
+                                            )
+                                    else:
+                                        logger.debug(
+                                            "Redownload did not produce a video stream"
+                                        )
+                                except Exception as e:
+                                    logger.debug("Redownload attempt failed: %s", e)
+                except Exception:
+                    pass
             except Exception as e:
-                # Special-case auth/impersonation errors so we can notify the chat
+                # Special-case auth/impersonation and oversized file errors so we can notify the chat
                 msg = str(e)
                 low = msg.lower()
                 auth_indicators = [
@@ -398,6 +831,28 @@ class WorkerPool:
                 is_auth = any(sub in low for sub in auth_indicators) or (
                     "login" in low and "tiktok" in (url or "").lower()
                 )
+
+                # If downloader reported the file is too large, send a friendly
+                # fallback message with the original link instead of attempting
+                # to upload as a document (we never send videos as documents).
+                if "downloaded file too large" in low or "too large" in low:
+                    try:
+                        logger.info(
+                            "File too large to send; posting fallback link to chat %s",
+                            chat_id,
+                        )
+                        text = f"Couldn't send the video. Download it here: {url}"
+                        await telegram_api.send_message(self.token, chat_id, text)
+                    except Exception:
+                        logger.debug(
+                            "Failed to send fallback link message for large file"
+                        )
+                    try:
+                        if request_id:
+                            db.update_request_status(request_id, "failed")
+                    except Exception:
+                        pass
+                    return
 
                 try:
                     if request_id:
@@ -591,130 +1046,25 @@ class WorkerPool:
                 meta.get("final_size") if isinstance(meta, dict) else None
             ) or size
 
-            # mark started
+            # persist original size in the DB for telemetry/debugging
             try:
-                if request_id:
-                    db.mark_request_started(request_id)
+                if request_id and isinstance(meta, dict):
+                    orig = meta.get("original_size") or size
+                    if orig is not None:
+                        try:
+                            db.set_request_original_size(request_id, int(orig))
+                        except Exception:
+                            logger.debug(
+                                "Could not persist original_size to DB for request %s",
+                                request_id,
+                            )
             except Exception:
                 pass
-
-            # If the downloaded file lacks a video stream but has an mp4 extension,
-            # attempt to add a minimal black video track so mobile clients can play it.
-            try:
-                has_video = meta.get("has_video") if isinstance(meta, dict) else True
-            except Exception:
-                has_video = True
-
             if not has_video:
                 logger.info(
-                    "Downloaded file appears to have no video stream; attempting wrapper for %s",
+                    "Downloaded file has no video stream — wrapper disabled, sending original file as-is: %s",
                     file_path,
                 )
-                ffmpeg_bin = shutil.which("ffmpeg")
-                if ffmpeg_bin:
-                    try:
-                        base = os.path.splitext(os.path.basename(file_path))[0]
-                        wrapper = os.path.join(
-                            os.path.dirname(file_path), f"{base}_withvideo.mp4"
-                        )
-                        ffmpeg_cmd = [
-                            ffmpeg_bin,
-                            "-y",
-                            "-max_muxing_queue_size",
-                            "9999",
-                            "-f",
-                            "lavfi",
-                            "-i",
-                            "color=c=black:s=640x360:r=25",
-                            "-i",
-                            file_path,
-                            "-map",
-                            "0:v:0",
-                            "-map",
-                            "1:a:0?",
-                            "-c:v",
-                            "libx264",
-                            "-preset",
-                            "faster",
-                            "-crf",
-                            "23",
-                            "-maxrate",
-                            "4.5M",
-                            "-flags",
-                            "+global_header",
-                            "-pix_fmt",
-                            "yuv420p",
-                            "-profile:v",
-                            "baseline",
-                            "-c:a",
-                            "aac",
-                            "-ac",
-                            "2",
-                            "-b:a",
-                            "128k",
-                            "-vf",
-                            "setsar=1",
-                            "-shortest",
-                            "-movflags",
-                            "+faststart",
-                            wrapper,
-                        ]
-                        logger.info("Running ffmpeg wrapper: %s", " ".join(ffmpeg_cmd))
-                        pwrap = await asyncio.create_subprocess_exec(
-                            *ffmpeg_cmd, stdout=PIPE, stderr=PIPE
-                        )
-                        try:
-                            outw, errw = await asyncio.wait_for(
-                                pwrap.communicate(), timeout=120
-                            )
-                        except asyncio.TimeoutError:
-                            try:
-                                pwrap.kill()
-                            except Exception:
-                                pass
-                            try:
-                                await pwrap.communicate()
-                            except Exception:
-                                pass
-                            logger.warning("ffmpeg wrapper timed out for %s", file_path)
-                        except asyncio.CancelledError:
-                            try:
-                                pwrap.kill()
-                            except Exception:
-                                pass
-                            try:
-                                await pwrap.communicate()
-                            except Exception:
-                                pass
-                            raise
-                        else:
-                            if pwrap.returncode == 0 and os.path.exists(wrapper):
-                                file_path = wrapper
-                                size = os.path.getsize(file_path)
-                                final_size = size
-                                logger.info(
-                                    "Created wrapper video %s (%d bytes)",
-                                    file_path,
-                                    size,
-                                )
-                            else:
-                                try:
-                                    errtxt = (
-                                        errw.decode(errors="ignore") if errw else ""
-                                    )
-                                except Exception:
-                                    errtxt = ""
-                                logger.warning(
-                                    "ffmpeg wrapper failed for %s: %s",
-                                    file_path,
-                                    errtxt[:1000],
-                                )
-                    except Exception:
-                        logger.exception("Exception while attempting ffmpeg wrapper")
-                else:
-                    logger.info(
-                        "ffmpeg not available; will send file as document (no video stream)"
-                    )
 
             # helper: send compression notice in private chats
             async def _maybe_notify_compression():
@@ -775,109 +1125,84 @@ class WorkerPool:
                 return
 
             ext = os.path.splitext(file_path)[1].lower().lstrip(".")
-            # generate thumbnail for mp4 (optional, controlled by config)
+            # Thumbnail generation disabled by user request — skip entirely
             thumb_path = None
-            if (
-                getattr(config, "WORKER_GENERATE_THUMBNAIL", True)
-                and ext == "mp4"
-                and shutil.which("ffmpeg")
-            ):
-                try:
-                    thumb_path = await self._generate_thumbnail(
-                        shutil.which("ffmpeg"), file_path, tmpdir
-                    )
-                except Exception:
-                    logger.debug("thumbnail generation failed for %s", file_path)
-            else:
-                if not getattr(config, "WORKER_GENERATE_THUMBNAIL", True):
-                    logger.debug(
-                        "Skipping thumbnail generation (WORKER_GENERATE_THUMBNAIL=False)"
-                    )
+            logger.debug("Skipping thumbnail generation (disabled)")
 
-            # check codec/profile
-            non_baseline = False
+            # Decide whether we must convert/remux for Telegram compatibility.
+            # Prefer to preserve the original file whenever possible. Only
+            # transcode when ffprobe-derived `meta` indicates incompatibility
+            # (non-h264 video, non-aac audio, rotation, SAR/DAR issues, or
+            # file too large).
             try:
-                if isinstance(meta, dict):
-                    meta_profile = (meta.get("video_profile") or "").lower()
-                    non_baseline = bool(meta_profile and "baseline" not in meta_profile)
-            except Exception:
-                meta_profile = ""
-                non_baseline = False
+                preferred_video = ("h264", "mpeg4")
+                preferred_audio = ("aac", "mp3", "mp4a")
+                has_video = meta.get("has_video") if isinstance(meta, dict) else True
+                has_audio = meta.get("has_audio") if isinstance(meta, dict) else True
+                video_codec = (
+                    (meta.get("video_codec") or "").lower()
+                    if isinstance(meta, dict)
+                    else ""
+                )
+                audio_codec = (
+                    (meta.get("audio_codec") or "").lower()
+                    if isinstance(meta, dict)
+                    else ""
+                )
+                fmt = (
+                    (meta.get("format") or "").lower() if isinstance(meta, dict) else ""
+                )
+                size_ok = (
+                    True
+                    if final_size is None
+                    else final_size
+                    <= getattr(config, "TELEGRAM_MAX_FILE_SIZE", 50 * 1024 * 1024)
+                )
 
-            # track whether we performed a transcode here (not used elsewhere)
-            # Ensure final file is an MP4 compatible with Telegram. If the file is not
-            # MP4 or has a non-baseline profile, attempt a baseline transcode here.
-            if ext != "mp4" or non_baseline:
-                ffmpeg_bin = shutil.which("ffmpeg")
-                if not ffmpeg_bin:
-                    logger.warning(
-                        "Cannot convert to MP4 baseline: ffmpeg not available for %s",
-                        file_path,
+                codec_ok = True
+                if has_video:
+                    codec_ok = (video_codec in preferred_video) and (
+                        (not has_audio) or (audio_codec in preferred_audio)
                     )
-                    try:
-                        status_msg_id = await self._edit_status(
-                            self.token,
-                            chat_id,
-                            status_msg_id,
-                            "👀 conversion failed: ffmpeg missing",
-                        )
-                    except Exception:
-                        pass
-                    try:
-                        if request_id:
-                            db.update_request_status(request_id, "failed")
-                    except Exception:
-                        pass
-                    return
-                try:
-                    base = os.path.splitext(os.path.basename(file_path))[0]
-                    trans_path = os.path.join(tmpdir, f"{base}_tg_transcoded.mp4")
-                    ok = await self._transcode_to_baseline(
-                        file_path, trans_path, tmpdir, meta=meta
+                container_ok = ("mp4" in fmt) or (ext == "mp4")
+
+                logger.debug(
+                    "telegram rules: has_video=%s has_audio=%s video_codec=%s audio_codec=%s format=%s size_ok=%s",
+                    has_video,
+                    has_audio,
+                    video_codec,
+                    audio_codec,
+                    fmt,
+                    size_ok,
+                )
+
+                need_conversion = not (
+                    has_video and size_ok and codec_ok and container_ok
+                )
+
+                # Do not attempt to convert/remux audio-only files. The
+                # wrapper/transcode logic expects a video stream and will
+                # fail on pure-audio inputs (e.g. .m4a). If there's no
+                # video stream, preserve original bytes and send as media.
+                if not has_video:
+                    logger.debug(
+                        "Audio-only file detected; skipping conversion/transcode"
                     )
-                    if ok and os.path.exists(trans_path):
-                        try:
-                            file_path = trans_path
-                            ext = "mp4"
-                            size = os.path.getsize(file_path)
-                            final_size = size
-                            # regenerate thumbnail if possible
-                            if thumb_path and os.path.exists(thumb_path):
-                                try:
-                                    os.remove(thumb_path)
-                                except Exception:
-                                    pass
-                            if getattr(
-                                config, "WORKER_GENERATE_THUMBNAIL", True
-                            ) and shutil.which("ffmpeg"):
-                                try:
-                                    thumb_path = await self._generate_thumbnail(
-                                        shutil.which("ffmpeg"), file_path, tmpdir
-                                    )
-                                except Exception:
-                                    logger.debug(
-                                        "thumbnail regen failed after transcode"
-                                    )
-                            else:
-                                if not getattr(
-                                    config, "WORKER_GENERATE_THUMBNAIL", True
-                                ):
-                                    logger.debug(
-                                        "Skipping thumbnail regen after transcode (WORKER_GENERATE_THUMBNAIL=False)"
-                                    )
-                            # transcode succeeded
-                        except Exception:
-                            pass
-                    else:
+                    need_conversion = False
+
+                if need_conversion:
+                    ffmpeg_bin = shutil.which("ffmpeg")
+                    if not ffmpeg_bin:
                         logger.warning(
-                            "Worker ffmpeg transcode failed for %s", file_path
+                            "File requires conversion for Telegram but ffmpeg is not available: %s",
+                            file_path,
                         )
                         try:
                             status_msg_id = await self._edit_status(
                                 self.token,
                                 chat_id,
                                 status_msg_id,
-                                "👀 conversion to mp4 failed",
+                                "👀 conversion failed: ffmpeg missing",
                             )
                         except Exception:
                             pass
@@ -887,49 +1212,46 @@ class WorkerPool:
                         except Exception:
                             pass
                         return
-                except Exception:
-                    logger.exception("Worker transcode exception")
 
-            # send media (only send as Telegram video; do not fall back to document)
-            try:
-                if size is not None and size <= getattr(
-                    config, "TELEGRAM_MAX_FILE_SIZE", 50 * 1024 * 1024
-                ):
-                    if ext != "mp4":
-                        logger.warning(
-                            "Final file is not MP4; cannot send as video: %s", file_path
+                    # Use _transcode_to_baseline which first tries fast remux, then audio transcode, then full transcode.
+                    try:
+                        base = os.path.splitext(os.path.basename(file_path))[0]
+                        trans_path = os.path.join(tmpdir, f"{base}_tg_transcoded.mp4")
+                        max_sz = getattr(
+                            config, "TELEGRAM_MAX_FILE_SIZE", 50 * 1024 * 1024
                         )
+                        # ensure only one transcode runs at a time
                         try:
-                            status_msg_id = await self._edit_status(
-                                self.token,
-                                chat_id,
-                                status_msg_id,
-                                "👀 upload failed — incompatible format",
-                            )
+                            async with self._transcode_lock:
+                                ok = await self._transcode_to_baseline(
+                                    file_path,
+                                    trans_path,
+                                    tmpdir,
+                                    meta=meta,
+                                    target_size=max_sz,
+                                )
                         except Exception:
-                            pass
-                        try:
-                            if request_id:
-                                db.update_request_status(request_id, "failed")
-                        except Exception:
-                            pass
-                    else:
-                        try:
-                            res = await telegram_api.send_video(
-                                self.token,
-                                chat_id,
-                                file_path,
-                                reply_to_message_id=original_message_id,
-                                thumbnail_path=thumb_path,
+                            ok = False
+                        if ok and os.path.exists(trans_path):
+                            try:
+                                file_path = trans_path
+                                ext = "mp4"
+                                size = os.path.getsize(file_path)
+                                final_size = size
+                                # We intentionally do not regenerate thumbnails here
+                                # since thumbnailing is disabled per user request.
+                            except Exception:
+                                pass
+                        else:
+                            logger.warning(
+                                "Worker ffmpeg transcode/remux failed for %s", file_path
                             )
-                        except Exception as e:
-                            logger.exception("send_video failed: %s", e)
                             try:
                                 status_msg_id = await self._edit_status(
                                     self.token,
                                     chat_id,
                                     status_msg_id,
-                                    "👀 upload failed",
+                                    "👀 conversion to mp4 failed",
                                 )
                             except Exception:
                                 pass
@@ -939,10 +1261,41 @@ class WorkerPool:
                             except Exception:
                                 pass
                             return
+                    except Exception:
+                        logger.exception("Worker transcode exception")
+            except Exception:
+                logger.debug(
+                    "Could not evaluate Telegram compatibility rules; proceeding with original behavior"
+                )
 
-                        ok = isinstance(res, dict) and res.get("ok")
-                        if not ok:
-                            logger.warning("send_video returned non-ok: %s", res)
+            # send media — prefer inline `sendVideo` when ffprobe `meta` says it's
+            # compatible, otherwise send as a document. Fail only when the file
+            # exceeds Telegram size limits.
+            try:
+                max_sz = getattr(config, "TELEGRAM_MAX_FILE_SIZE", 50 * 1024 * 1024)
+                if size is not None and size <= max_sz:
+                    # If this is audio-only, send via send_media() which will
+                    # choose the appropriate API (document/audio) instead of
+                    # attempting to send as a video.
+                    try:
+                        is_audio_only = False
+                        if isinstance(meta, dict):
+                            is_audio_only = not bool(meta.get("has_video"))
+                    except Exception:
+                        is_audio_only = False
+
+                    if is_audio_only:
+                        try:
+                            res = await telegram_api.send_media(
+                                self.token,
+                                chat_id,
+                                file_path,
+                                caption=None,
+                                reply_to_message_id=original_message_id,
+                                meta=meta,
+                            )
+                        except Exception as e:
+                            logger.exception("send_media (audio-only) failed: %s", e)
                             try:
                                 status_msg_id = await self._edit_status(
                                     self.token,
@@ -957,38 +1310,146 @@ class WorkerPool:
                                     db.update_request_status(request_id, "failed")
                             except Exception:
                                 pass
-                        else:
-                            metrics.files_sent_total.inc()
+                            res = {"ok": False}
+                    else:
+                        # decide if we can send as a Telegram video
+                        try:
+                            video_ok = False
+                            if isinstance(meta, dict):
+                                has_video = meta.get("has_video")
+                                fmt = (meta.get("format") or "").lower()
+                                # Be permissive: prefer to send mp4 inline even if codec
+                                # isn't H.264. Some bots send VP9-in-mp4 successfully.
+                                video_ok = bool(has_video) and ("mp4" in fmt)
+                            else:
+                                video_ok = ext == "mp4"
+                        except Exception:
+                            video_ok = ext == "mp4"
+
+                        if video_ok:
                             try:
-                                if request_id:
-                                    db.update_request_status(request_id, "done")
-                            except Exception:
-                                pass
-                            try:
-                                await _maybe_notify_compression()
-                            except Exception:
-                                pass
-                            try:
-                                if reaction_current == "eyes" and original_message_id:
-                                    try:
-                                        await telegram_api.set_message_reaction(
-                                            self.token,
-                                            chat_id,
-                                            original_message_id,
-                                            "👀",
-                                            remove=True,
-                                        )
-                                    except Exception:
-                                        pass
-                            except Exception:
-                                pass
-                            if status_msg_id:
+                                res = await telegram_api.send_video(
+                                    self.token,
+                                    chat_id,
+                                    file_path,
+                                    reply_to_message_id=original_message_id,
+                                    thumbnail_path=thumb_path,
+                                    meta=meta,
+                                )
+                            except Exception as e:
+                                logger.exception("send_video failed: %s", e)
                                 try:
-                                    await telegram_api.delete_message(
-                                        self.token, chat_id, status_msg_id
+                                    status_msg_id = await self._edit_status(
+                                        self.token,
+                                        chat_id,
+                                        status_msg_id,
+                                        "👀 upload failed",
                                     )
                                 except Exception:
                                     pass
+                                try:
+                                    if request_id:
+                                        db.update_request_status(request_id, "failed")
+                                except Exception:
+                                    pass
+                                res = {"ok": False}
+                        else:
+                            # We do not send videos as documents. If the file is an
+                            # MP4, attempt to upload inline anyway; otherwise send
+                            # a fallback message with the original URL so users can
+                            # download it themselves.
+                            if ext == "mp4":
+                                try:
+                                    res = await telegram_api.send_video(
+                                        self.token,
+                                        chat_id,
+                                        file_path,
+                                        reply_to_message_id=original_message_id,
+                                        thumbnail_path=thumb_path,
+                                        meta=meta,
+                                    )
+                                except Exception as e:
+                                    logger.exception(
+                                        "send_video (fallback) failed: %s", e
+                                    )
+                                    try:
+                                        await telegram_api.send_message(
+                                            self.token,
+                                            chat_id,
+                                            f"Couldn't send the video. Download it here: {url}",
+                                            reply_to_message_id=original_message_id,
+                                        )
+                                    except Exception:
+                                        logger.debug(
+                                            "Failed to send fallback link message after send_video error"
+                                        )
+                                    res = {"ok": False}
+                            else:
+                                try:
+                                    await telegram_api.send_message(
+                                        self.token,
+                                        chat_id,
+                                        f"Couldn't send the video. Download it here: {url}",
+                                        reply_to_message_id=original_message_id,
+                                    )
+                                except Exception:
+                                    logger.debug(
+                                        "Failed to send fallback link message for non-mp4 file"
+                                    )
+                                res = {"ok": False}
+                    # evaluate send result (only when upload was attempted)
+                    try:
+                        ok = isinstance(res, dict) and res.get("ok")
+                    except Exception:
+                        ok = False
+                    if not ok:
+                        logger.warning("send returned non-ok: %s", res)
+                        try:
+                            status_msg_id = await self._edit_status(
+                                self.token,
+                                chat_id,
+                                status_msg_id,
+                                "👀 upload failed",
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            if request_id:
+                                db.update_request_status(request_id, "failed")
+                        except Exception:
+                            pass
+                    else:
+                        metrics.files_sent_total.inc()
+                        try:
+                            if request_id:
+                                db.update_request_status(request_id, "done")
+                        except Exception:
+                            pass
+                        try:
+                            await _maybe_notify_compression()
+                        except Exception:
+                            pass
+                        try:
+                            if reaction_current == "eyes" and original_message_id:
+                                try:
+                                    await telegram_api.set_message_reaction(
+                                        self.token,
+                                        chat_id,
+                                        original_message_id,
+                                        "👀",
+                                        remove=True,
+                                    )
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+                        if status_msg_id:
+                            try:
+                                await telegram_api.delete_message(
+                                    self.token, chat_id, status_msg_id
+                                )
+                            except Exception:
+                                pass
                 else:
                     logger.warning("File too large (%s). Sending fallback link.", size)
                     metrics.files_too_large_total.inc()
@@ -1171,7 +1632,12 @@ class WorkerPool:
                         pass
             finally:
                 try:
-                    shutil.rmtree(tmpdir)
+                    if getattr(config, "KEEP_DOWNLOADED_FILES", False):
+                        logger.info(
+                            "Preserving tmpdir per KEEP_DOWNLOADED_FILES: %s", tmpdir
+                        )
+                    else:
+                        shutil.rmtree(tmpdir)
                 except Exception:
                     pass
 
@@ -1219,6 +1685,11 @@ class WorkerPool:
                     pass
             finally:
                 try:
-                    shutil.rmtree(tmpdir)
+                    if getattr(config, "KEEP_DOWNLOADED_FILES", False):
+                        logger.info(
+                            "Preserving tmpdir per KEEP_DOWNLOADED_FILES: %s", tmpdir
+                        )
+                    else:
+                        shutil.rmtree(tmpdir)
                 except Exception:
                     pass
