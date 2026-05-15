@@ -2,7 +2,6 @@ import asyncio
 import logging
 import os
 import re
-import time
 
 from aiogram import Bot, Dispatcher
 from aiogram.types import ChatMemberUpdated, Message, Update

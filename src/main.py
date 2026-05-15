@@ -1,5 +1,4 @@
 import logging
-import time
 
 from aiohttp import web
 from prometheus_client import CONTENT_TYPE_LATEST, generate_latest
@@ -34,7 +33,9 @@ async def handle_webhook(request: web.Request) -> web.Response:
         message_id = message.get("message_id")
         for url in links:
             try:
-                request.app["worker"].enqueue(chat_id, url, original_message_id=message_id)
+                request.app["worker"].enqueue(
+                    chat_id, url, original_message_id=message_id
+                )
             except Exception:
                 # enqueue failure: rely on worker to persist and notify (throttled)
                 pass
