@@ -39,3 +39,27 @@ YTDLP_COOKIES = os.getenv("YTDLP_COOKIES_PATH")
 YTDLP_COOKIES_FROM_BROWSER = os.getenv("YTDLP_COOKIES_FROM_BROWSER")
 # Optional extra headers for yt-dlp (format: 'Header: Value|Other: Value')
 YTDLP_HEADERS = os.getenv("YTDLP_HEADERS")
+
+# When true, the downloader will only run a plain `yt-dlp` download and
+# skip any remux/recode/transcode steps. Useful for debugging or when you
+# want to upload the exact yt-dlp output verbatim.
+SIMPLE_YTDLP_ONLY = os.getenv("SIMPLE_YTDLP_ONLY", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+
+# When true and the downloader returned an untouched yt-dlp file (see
+# SIMPLE_YTDLP_ONLY), the worker will upload the file as a document
+# (sendDocument) instead of `sendVideo`. This preserves the original
+# bytes and avoids any inline/telegram re-processing.
+# NOTE: removed SEND_ORIGINAL_AS_DOCUMENT option — videos should not be sent as documents.
+
+# When true, the worker will keep downloaded files and temporary directories
+# instead of deleting them after processing. Useful for debugging or
+# forensic inspection of downloaded media. Default: false.
+KEEP_DOWNLOADED_FILES = os.getenv("KEEP_DOWNLOADED_FILES", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)

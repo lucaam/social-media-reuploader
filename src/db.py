@@ -608,3 +608,32 @@ def delete_user(user_id: int):
     cur.execute("DELETE FROM users WHERE id = ?", (user_id,))
     conn.commit()
     conn.close()
+
+
+def clear_history():
+    """Clear historical request data (requests, events, updates, processed messages).
+
+    This is intended for operator/debug use from the Admin GUI.
+    """
+    conn = _connect()
+    cur = conn.cursor()
+    try:
+        cur.execute("DELETE FROM request_events")
+        cur.execute("DELETE FROM requests")
+        cur.execute("DELETE FROM updates")
+        cur.execute("DELETE FROM processed_messages")
+        conn.commit()
+    finally:
+        conn.close()
+    # broadcast an event so connected GUIs can refresh
+    try:
+        from . import ws_broadcast
+
+        if getattr(ws_broadcast, "loop", None):
+            import asyncio
+
+            asyncio.run_coroutine_threadsafe(
+                ws_broadcast.broadcast({"type": "db_cleared"}), ws_broadcast.loop
+            )
+    except Exception:
+        pass

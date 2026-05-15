@@ -95,6 +95,7 @@ async def send_video(
     caption: Optional[str] = None,
     reply_to_message_id: Optional[int] = None,
     thumbnail_path: Optional[str] = None,
+    meta: Optional[dict] = None,
 ):
     url = f"https://api.telegram.org/bot{token}/sendVideo"
     data = aiohttp.FormData()
@@ -123,6 +124,40 @@ async def send_video(
             )
         except Exception:
             logger.debug("Could not attach thumbnail %s", thumbnail_path)
+    # If ffprobe/meta information is available, include explicit fields
+    # so Telegram can correctly interpret orientation and sizing.
+    try:
+        if isinstance(meta, dict):
+            # duration in seconds (integer)
+            dur = meta.get("duration") or meta.get("format_duration") or None
+            if dur is None:
+                # try format.duration string path
+                try:
+                    fd = (
+                        meta.get("format", {}).get("duration")
+                        if isinstance(meta.get("format"), dict)
+                        else None
+                    )
+                    if fd:
+                        dur = float(fd)
+                except Exception:
+                    dur = None
+            if dur is not None:
+                try:
+                    data.add_field("duration", str(int(float(dur))))
+                except Exception:
+                    pass
+            # width/height from ffprobe
+            w = meta.get("video_width") or meta.get("width")
+            h = meta.get("video_height") or meta.get("height")
+            if w:
+                data.add_field("width", str(int(w)))
+            if h:
+                data.add_field("height", str(int(h)))
+            # hint to Telegram that this supports streaming
+            data.add_field("supports_streaming", "true")
+    except Exception:
+        logger.debug("Could not attach ffprobe meta fields to sendVideo multipart")
     session = await http_client.get_session()
     async with session.post(url, data=data) as resp:
         try:
@@ -145,8 +180,26 @@ async def send_media(
     file_path: str,
     caption: Optional[str] = None,
     reply_to_message_id: Optional[int] = None,
+    meta: Optional[dict] = None,
 ):
-    # choose sendVideo for mp4 files to enable inline playback, otherwise sendDocument
+    # If meta from ffprobe is provided, prefer it to decide inline-video vs document.
+    try:
+        if isinstance(meta, dict):
+            fmt = (meta.get("format") or "").lower()
+            has_video = meta.get("has_video")
+            if has_video and "mp4" in fmt:
+                return await send_video(
+                    token,
+                    chat_id,
+                    file_path,
+                    caption=caption,
+                    reply_to_message_id=reply_to_message_id,
+                    meta=meta,
+                )
+    except Exception:
+        pass
+
+    # fallback: choose sendVideo for mp4 files to enable inline playback, otherwise sendDocument
     ext = os.path.splitext(file_path)[1].lower().lstrip(".")
     if ext == "mp4":
         return await send_video(
@@ -155,6 +208,7 @@ async def send_media(
             file_path,
             caption=caption,
             reply_to_message_id=reply_to_message_id,
+            meta=meta,
         )
     logger.info(
         "send_media: file %s is not mp4 (.%s); sending as document. Consider converting to mp4 for inline playback",
