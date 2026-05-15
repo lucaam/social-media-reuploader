@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import time
 
 import aiohttp
 from authlib.integrations.starlette_client import OAuth, OAuthError
@@ -949,6 +950,135 @@ async def api_queue(request: Request, limit: int = 50):
                 "queued": queued,
                 "running": running,
             }
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@app.get("/api/rate_limits")
+async def api_rate_limits(request: Request, per_chat_limit: int = 200):
+    """Return current in-memory rate-limit state and recent rate-limited requests.
+
+    Exposes per-chat counters for configured windows and lists recent
+    `requests` rows that were persisted with status='rate_limited'.
+    """
+    if not _check_admin(request):
+        raise HTTPException(status_code=403, detail="forbidden")
+    try:
+        from . import worker as worker_mod
+
+        w = getattr(worker_mod, "active_worker", None)
+
+        # If no active worker is present (GUI running as a separate process),
+        # still return persisted recent rate_limited/duplicate rows from DB.
+        if not w:
+            limits = []
+            per_chat = []
+        else:
+            limits = list(getattr(w, "_rate_limits", []))
+            now = time.time()
+
+            # collect chat ids known in memory
+            chat_ids = set()
+            try:
+                chat_ids.update(getattr(w, "_chat_timestamps", {}).keys())
+            except Exception:
+                pass
+            try:
+                chat_ids.update(getattr(w, "_last_rate_limited", {}).keys())
+            except Exception:
+                pass
+            try:
+                chat_ids.update(getattr(w, "_last_rate_warning", {}).keys())
+            except Exception:
+                pass
+
+            per_chat = []
+            for cid in list(chat_ids)[:per_chat_limit]:
+                try:
+                    ts = list(getattr(w, "_chat_timestamps", {}).get(cid, []))
+                except Exception:
+                    ts = []
+                counters = []
+                next_available_seconds = None
+                try:
+                    for limit, window in limits:
+                        cnt = sum(1 for t in ts if t >= now - window)
+                        # compute next free slot if limit reached
+                        next_in = 0
+                        if cnt >= limit:
+                            relevant = [t for t in ts if t >= now - window]
+                            if relevant:
+                                oldest = min(relevant)
+                                next_in = int(max(0, (oldest + window) - now))
+                        counters.append(
+                            {
+                                "limit": limit,
+                                "window_seconds": window,
+                                "count": int(cnt),
+                                "next_in_seconds": next_in,
+                            }
+                        )
+                        if next_in and (
+                            next_available_seconds is None
+                            or next_in > next_available_seconds
+                        ):
+                            next_available_seconds = next_in
+                except Exception:
+                    counters = []
+
+                last_l = None
+                try:
+                    last_l = getattr(w, "_last_rate_limited", {}).get(cid)
+                except Exception:
+                    last_l = None
+                last_next = None
+                try:
+                    last_next = getattr(w, "_last_rate_limited_next", {}).get(cid)
+                except Exception:
+                    last_next = None
+                last_warn = None
+                try:
+                    last_warn = getattr(w, "_last_rate_warning", {}).get(cid)
+                except Exception:
+                    last_warn = None
+
+                per_chat.append(
+                    {
+                        "chat_id": cid,
+                        "counters": counters,
+                        "next_available_seconds": next_available_seconds,
+                        "last_rate_limited_at": last_l,
+                        "last_rate_limited_next": last_next,
+                        "last_rate_warning_at": last_warn,
+                    }
+                )
+
+        # recent persisted rate_limited or duplicate requests
+        recent = []
+        try:
+            conn = db._connect()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, chat_id, url, status, created_at FROM requests WHERE status IN ('rate_limited','duplicate') ORDER BY created_at DESC LIMIT ?",
+                (per_chat_limit,),
+            )
+            for r in cur.fetchall():
+                recent.append(
+                    {
+                        "id": r[0],
+                        "chat_id": r[1],
+                        "url": r[2],
+                        "status": r[3],
+                        "created_at": r[4],
+                    }
+                )
+            conn.close()
+        except Exception:
+            recent = []
+
+        return JSONResponse(
+            {"limits": limits, "per_chat": per_chat, "recent_rate_limited": recent}
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
