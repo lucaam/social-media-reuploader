@@ -81,6 +81,25 @@ class WorkerPool:
                 ts.append(item["enqueued_at"])
             except Exception:
                 pass
+            # persist a queued request in DB so external GUIs/processes can
+            # observe pending items even when worker and GUI run in different
+            # processes. db.add_request will deduplicate by original_message_id
+            # if present and return the existing request id.
+            try:
+                rid = db.add_request(
+                    chat_id,
+                    url,
+                    status="queued",
+                    description=description,
+                    original_message_id=original_message_id,
+                )
+                try:
+                    item["request_id"] = rid
+                except Exception:
+                    pass
+            except Exception:
+                # non-fatal: continue even if DB write fails
+                pass
             self._queue.put_nowait(item)
             return True
         except Exception:
