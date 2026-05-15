@@ -143,13 +143,18 @@ async def handle_message(message: Message):
                     if TELEGRAM_URL_RE.search(url):
                         logger.info("Ignoring telegram internal link: %s", url)
                         continue
-                    app_worker.enqueue(
-                        chat_id,
-                        url,
-                        description=description,
-                        original_message_id=message_id,
-                        chat_type=ctype,
-                    )
+                    try:
+                        app_worker.enqueue(
+                            chat_id,
+                            url,
+                            description=description,
+                            original_message_id=message_id,
+                            chat_type=ctype,
+                        )
+                    except Exception:
+                        logger.exception(
+                            "Failed to enqueue link %s for chat=%s", url, chat_id
+                        )
                 except Exception:
                     logger.exception(
                         "Failed to enqueue link %s for chat=%s", url, chat_id

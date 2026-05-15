@@ -107,6 +107,17 @@ env:
   # Keep false in production since kube probes call /health frequently.
   HEALTH_DEBUG: false
 
+  # Worker rehydrate settings
+  # When true, the worker will rehydrate persisted queued requests on startup.
+  WORKER_REHYDRATE_ON_START: true
+  # Periodic interval (seconds) used by the worker to poll the DB for
+  # persisted queued items when GUI/operator requeues items. Set to 0 to
+  # disable periodic rehydrate. Default: 10s (responsive without spamming logs).
+  WORKER_PERIODIC_REHYDRATE_SECONDS: 10.0
+  # When true, the GUI will attempt to trigger an immediate rehydrate on
+  # unlimit operations when the worker runs in the same process.
+  WORKER_REHYDRATE_ON_UNLIMIT: "true"
+
   # yt-dlp helper options (for sites requiring impersonation/cookies)
   # Set to a browser-like user-agent string when necessary.
   YTDLP_USER_AGENT: ""
