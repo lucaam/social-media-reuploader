@@ -245,7 +245,17 @@ def add_request(
     # persist an updates row so other processes (GUI) watching the DB
     # can detect the new request and broadcast it to connected clients.
     try:
-        add_update(json.dumps({"type": "request_created", "id": rowid, "chat_id": chat_id, "url": url, "status": status}))
+        add_update(
+            json.dumps(
+                {
+                    "type": "request_created",
+                    "id": rowid,
+                    "chat_id": chat_id,
+                    "url": url,
+                    "status": status,
+                }
+            )
+        )
     except Exception:
         pass
     # Publish event to websocket broadcaster if available
@@ -307,7 +317,9 @@ def update_request_status(request_id: int, status: str):
     # persist a lightweight update record so other processes (e.g. GUI)
     # watching the DB can detect and re-broadcast this change.
     try:
-        add_update(json.dumps({"type": "request_status", "id": request_id, "status": status}))
+        add_update(
+            json.dumps({"type": "request_status", "id": request_id, "status": status})
+        )
     except Exception:
         pass
     # Broadcast status change to connected GUI clients if websocket loop present
@@ -424,7 +436,11 @@ def set_request_original_size(request_id: int, original_size: int):
 
             asyncio.run_coroutine_threadsafe(
                 ws_broadcast.broadcast(
-                    {"type": "request_updated", "id": request_id, "original_size": original_size}
+                    {
+                        "type": "request_updated",
+                        "id": request_id,
+                        "original_size": original_size,
+                    }
                 ),
                 ws_broadcast.loop,
             )
@@ -475,7 +491,17 @@ def add_request_event(
         pass
     # persist to updates so cross-process GUIs pick up the event
     try:
-        add_update(json.dumps({"type": "request_event", "id": rowid, "request_id": request_id, "event_type": event_type, "duration_seconds": duration_seconds}))
+        add_update(
+            json.dumps(
+                {
+                    "type": "request_event",
+                    "id": rowid,
+                    "request_id": request_id,
+                    "event_type": event_type,
+                    "duration_seconds": duration_seconds,
+                }
+            )
+        )
     except Exception:
         pass
     return rowid
@@ -503,7 +529,9 @@ def claim_request_for_sending(request_id: int) -> bool:
             import asyncio
 
             asyncio.run_coroutine_threadsafe(
-                ws_broadcast.broadcast({"type": "request_status", "id": request_id, "status": "sending"}),
+                ws_broadcast.broadcast(
+                    {"type": "request_status", "id": request_id, "status": "sending"}
+                ),
                 ws_broadcast.loop,
             )
     except Exception:
@@ -534,7 +562,9 @@ def claim_request_for_processing(request_id: int) -> bool:
             import asyncio
 
             asyncio.run_coroutine_threadsafe(
-                ws_broadcast.broadcast({"type": "request_status", "id": request_id, "status": "processing"}),
+                ws_broadcast.broadcast(
+                    {"type": "request_status", "id": request_id, "status": "processing"}
+                ),
                 ws_broadcast.loop,
             )
     except Exception:
