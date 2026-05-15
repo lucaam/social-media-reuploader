@@ -1,4 +1,5 @@
 import datetime
+import json
 import os
 import sqlite3
 import threading
@@ -241,6 +242,12 @@ def add_request(
     conn.commit()
     rowid = cur.lastrowid
     conn.close()
+    # persist an updates row so other processes (GUI) watching the DB
+    # can detect the new request and broadcast it to connected clients.
+    try:
+        add_update(json.dumps({"type": "request_created", "id": rowid, "chat_id": chat_id, "url": url, "status": status}))
+    except Exception:
+        pass
     # Publish event to websocket broadcaster if available
     try:
         # import here to avoid circular imports at module load
@@ -297,6 +304,27 @@ def update_request_status(request_id: int, status: str):
     cur.execute("UPDATE requests SET status = ? WHERE id = ?", (status, request_id))
     conn.commit()
     conn.close()
+    # persist a lightweight update record so other processes (e.g. GUI)
+    # watching the DB can detect and re-broadcast this change.
+    try:
+        add_update(json.dumps({"type": "request_status", "id": request_id, "status": status}))
+    except Exception:
+        pass
+    # Broadcast status change to connected GUI clients if websocket loop present
+    try:
+        from . import ws_broadcast
+
+        if getattr(ws_broadcast, "loop", None):
+            import asyncio
+
+            asyncio.run_coroutine_threadsafe(
+                ws_broadcast.broadcast(
+                    {"type": "request_status", "id": request_id, "status": status}
+                ),
+                ws_broadcast.loop,
+            )
+    except Exception:
+        pass
 
 
 def mark_request_started(request_id: int):
@@ -387,6 +415,21 @@ def set_request_original_size(request_id: int, original_size: int):
     )
     conn.commit()
     conn.close()
+    # Broadcast update so GUIs can refresh size column
+    try:
+        from . import ws_broadcast
+
+        if getattr(ws_broadcast, "loop", None):
+            import asyncio
+
+            asyncio.run_coroutine_threadsafe(
+                ws_broadcast.broadcast(
+                    {"type": "request_updated", "id": request_id, "original_size": original_size}
+                ),
+                ws_broadcast.loop,
+            )
+    except Exception:
+        pass
 
 
 def add_request_event(
@@ -430,6 +473,11 @@ def add_request_event(
             )
     except Exception:
         pass
+    # persist to updates so cross-process GUIs pick up the event
+    try:
+        add_update(json.dumps({"type": "request_event", "id": rowid, "request_id": request_id, "event_type": event_type, "duration_seconds": duration_seconds}))
+    except Exception:
+        pass
     return rowid
 
 
@@ -447,6 +495,19 @@ def claim_request_for_sending(request_id: int) -> bool:
     except Exception:
         ok = False
     conn.close()
+    # notify GUIs that a request moved to 'sending' (claimed)
+    try:
+        from . import ws_broadcast
+
+        if ok and getattr(ws_broadcast, "loop", None):
+            import asyncio
+
+            asyncio.run_coroutine_threadsafe(
+                ws_broadcast.broadcast({"type": "request_status", "id": request_id, "status": "sending"}),
+                ws_broadcast.loop,
+            )
+    except Exception:
+        pass
     return ok
 
 
@@ -465,6 +526,19 @@ def claim_request_for_processing(request_id: int) -> bool:
     except Exception:
         ok = False
     conn.close()
+    # notify GUIs that a request was claimed for processing
+    try:
+        from . import ws_broadcast
+
+        if ok and getattr(ws_broadcast, "loop", None):
+            import asyncio
+
+            asyncio.run_coroutine_threadsafe(
+                ws_broadcast.broadcast({"type": "request_status", "id": request_id, "status": "processing"}),
+                ws_broadcast.loop,
+            )
+    except Exception:
+        pass
     return ok
 
 
@@ -518,6 +592,37 @@ def list_updates(limit: int = 100, offset: int = 0):
     rows = cur.fetchall()
     conn.close()
     return rows
+
+
+def find_recent_request_by_chat_url(chat_id: int, url: str, since_seconds: int = 0):
+    """Return the most recent request row (id, status, created_at) for the given
+    chat_id and url which was created within the last `since_seconds`. Returns
+    None if no such request exists.
+    """
+    try:
+        cutoff = None
+        if since_seconds and since_seconds > 0:
+            cutoff_dt = datetime.datetime.utcnow() - datetime.timedelta(
+                seconds=int(since_seconds)
+            )
+            cutoff = cutoff_dt.isoformat()
+        conn = _connect()
+        cur = conn.cursor()
+        if cutoff:
+            cur.execute(
+                "SELECT id, status, created_at FROM requests WHERE chat_id = ? AND url = ? AND created_at >= ? ORDER BY created_at DESC LIMIT 1",
+                (chat_id, url, cutoff),
+            )
+        else:
+            cur.execute(
+                "SELECT id, status, created_at FROM requests WHERE chat_id = ? AND url = ? ORDER BY created_at DESC LIMIT 1",
+                (chat_id, url),
+            )
+        row = cur.fetchone()
+        conn.close()
+        return row
+    except Exception:
+        return None
 
 
 def is_message_processed(chat_id: int, message_id: int) -> bool:

@@ -13,6 +13,9 @@ const statusFilterSelect = document.getElementById('statusFilter')
 const queueQueuedEl = document.getElementById('queueQueued')
 const queueRunningEl = document.getElementById('queueRunning')
 const refreshQueueBtn = document.getElementById('refreshQueueBtn')
+const clearQueueBtn = document.getElementById('clearQueueBtn')
+const startQueueBtn = document.getElementById('startQueueBtn')
+const showConfigBtn = document.getElementById('showConfigBtn')
 
 let timeSeriesChart = null
 let statusChart = null
@@ -160,6 +163,7 @@ async function loadAll() {
     const items = (reqData && reqData.items) || []
     // prefer server-side aggregates when available
     await loadAggregates()
+    await loadRateLimits()
     renderTimeSeries(items)
   } catch (err) {
     // ignore errors — keep UI readable
@@ -287,6 +291,165 @@ async function loadAggregates() {
   }
 }
 
+async function loadRateLimits() {
+  try {
+    const resp = await fetchWithCreds('/api/rate_limits')
+    const el = document.getElementById('rateLimitsList')
+    if (!el) return
+    if (!resp.ok) {
+      el.innerHTML = '<div class="small text-muted">No access</div>'
+      return
+    }
+    const d = await resp.json()
+    renderRateLimits(d)
+  } catch (e) {
+    const el = document.getElementById('rateLimitsList')
+    if (el) el.innerHTML = '<div class="small text-danger">Error fetching rate limits</div>'
+  }
+}
+
+function renderRateLimits(d) {
+  const el = document.getElementById('rateLimitsList')
+  if (!el) return
+  el.innerHTML = ''
+  try {
+    // Global unlimit action
+    const topActions = document.createElement('div')
+    topActions.className = 'd-flex justify-content-end mb-2'
+    const unlimitAllBtn = document.createElement('button')
+    unlimitAllBtn.className = 'btn btn-sm btn-outline-primary'
+    unlimitAllBtn.textContent = 'Sblocca tutti (requeue)'
+    unlimitAllBtn.onclick = async () => {
+      try {
+        unlimitAllBtn.disabled = true
+        await fetchWithCreds('/api/unlimit_all', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ requeue: true }) })
+        await loadRateLimits(); await loadQueue()
+      } catch (e) { console.debug('unlimit_all failed', e) }
+      unlimitAllBtn.disabled = false
+    }
+    topActions.appendChild(unlimitAllBtn)
+    el.appendChild(topActions)
+    // currently limited chats (in-memory worker data)
+    const curr = d.currently_limited || []
+    if (curr.length > 0) {
+      const hdr = document.createElement('div'); hdr.className='mb-2 small text-muted'; hdr.textContent = `Currently limited chats: ${curr.length}`; el.appendChild(hdr)
+        for (const c of curr.slice(0,50)) {
+        const div = document.createElement('div'); div.className='d-flex justify-content-between align-items-center mb-1'
+        const left = document.createElement('div'); left.className='small'; left.textContent = `chat: ${c.chat_id}`
+        const right = document.createElement('div'); right.className='d-flex gap-2 align-items-center'
+        const info = document.createElement('div'); info.className='small text-muted'; info.textContent = c.next_in_seconds ? `blocked for ${c.next_in_seconds}s` : ''
+        const btn = document.createElement('button'); btn.className='btn btn-sm btn-outline-primary'; btn.style.fontSize='0.8rem'; btn.textContent = 'Sblocca';
+        btn.onclick = async () => {
+          try {
+            btn.disabled = true
+            const requeue = confirm('Rimettere in coda le richieste persistenti per questa chat? OK = Sì, Annulla = No')
+            await unlimitChat(c.chat_id, requeue)
+            await loadRateLimits(); await loadQueue()
+          } catch(e){ console.debug('unlimit failed', e) }
+          finally { btn.disabled = false }
+        }
+        right.appendChild(info); right.appendChild(btn);
+        div.appendChild(left); div.appendChild(right); el.appendChild(div)
+      }
+      const sep = document.createElement('hr'); sep.className='my-2'; el.appendChild(sep)
+    }
+    const per = d.per_chat || []
+    if (per.length === 0) {
+      const div = document.createElement('div'); div.className='small text-muted'; div.textContent='No recent activity'; el.appendChild(div);
+    } else {
+      for (const p of per.slice(0,50)) {
+        const item = document.createElement('div')
+        item.className = 'mb-2'
+        const h = document.createElement('div'); h.className='d-flex justify-content-between align-items-center'
+        const left = document.createElement('div'); left.className='small'; left.textContent = 'chat: ' + p.chat_id
+        const right = document.createElement('div'); right.className='d-flex gap-2 align-items-center small text-muted';
+        const nowSec = Math.floor(Date.now()/1000)
+        let rightText = ''
+        if (p.last_rate_limited_next) {
+          const next = Math.floor(p.last_rate_limited_next)
+          if (next > nowSec) {
+            rightText = 'blocked for ' + (next - nowSec) + 's'
+          }
+        } else if (p.next_available_seconds) {
+          rightText = 'next_in ' + p.next_available_seconds + 's'
+        }
+        const infoDiv = document.createElement('div'); infoDiv.textContent = rightText
+        const btn = document.createElement('button'); btn.className='btn btn-sm btn-outline-primary'; btn.style.fontSize='0.8rem'; btn.textContent = 'Sblocca';
+        btn.onclick = async () => { try { btn.disabled = true; await unlimitChat(p.chat_id, true); await loadRateLimits(); await loadQueue() } catch(e){ console.debug('unlimit failed', e) } finally { btn.disabled = false } }
+        right.appendChild(infoDiv); right.appendChild(btn)
+        h.appendChild(left); h.appendChild(right)
+        item.appendChild(h)
+        // counters (compact)
+        const cnts = document.createElement('div'); cnts.className = 'small text-muted'
+        const parts = []
+        for (const c of (p.counters || [])) {
+          parts.push(`${c.count}/${c.limit}@${Math.floor(c.window_seconds/60) || c.window_seconds}s`)
+        }
+        cnts.textContent = parts.join(' | ')
+        item.appendChild(cnts)
+        el.appendChild(item)
+      }
+    }
+
+    // show a short link to persisted rate_limited rows (no per-link actions)
+    const persisted = d.persisted_limited_chats || []
+    if (persisted.length > 0) {
+      const hdr2 = document.createElement('div'); hdr2.className='mt-2 small text-muted'; hdr2.textContent = 'Persisted blocked chats (DB):'; el.appendChild(hdr2)
+      const list = document.createElement('div'); list.className = 'small';
+      list.style.maxHeight = '160px'; list.style.overflow = 'auto'; list.style.paddingLeft = '0.5rem'
+      for (const p of persisted.slice(0,50)) {
+        const dline = document.createElement('div'); dline.style.marginBottom='6px'; dline.className='d-flex justify-content-between align-items-center'
+        const span = document.createElement('div'); span.textContent = `chat: ${p.chat_id} (${p.count} items)`
+        const actions = document.createElement('div')
+        const btnRe = document.createElement('button'); btnRe.className='btn btn-sm btn-outline-primary me-1'; btnRe.textContent = 'Sblocca (requeue)'
+        btnRe.onclick = async () => { try { btnRe.disabled = true; await unlimitChat(p.chat_id, true); await loadRateLimits(); await loadQueue() } catch(e){ console.debug('unlimit failed', e) } finally { btnRe.disabled = false } }
+        const btnNo = document.createElement('button'); btnNo.className='btn btn-sm btn-outline-secondary'; btnNo.textContent = 'Sblocca (no requeue)'
+        btnNo.onclick = async () => { try { btnNo.disabled = true; await unlimitChat(p.chat_id, false); await loadRateLimits(); await loadQueue() } catch(e){ console.debug('unlimit failed', e) } finally { btnNo.disabled = false } }
+        actions.appendChild(btnRe); actions.appendChild(btnNo)
+        dline.appendChild(span); dline.appendChild(actions); list.appendChild(dline)
+      }
+      el.appendChild(list)
+    }
+  } catch (e) {
+    el.innerHTML = '<div class="small text-danger">Error rendering rate limits</div>'
+  }
+}
+
+async function unlimitChat(chatId, requeue) {
+  try {
+    await fetchWithCreds('/api/unlimit_chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, requeue: !!requeue }) })
+    await loadRateLimits(); await loadQueue()
+  } catch (e) { console.debug('unlimitChat failed', e) }
+}
+
+async function clearQueue(chatId) {
+  const btn = document.getElementById('clearQueueBtn')
+  try {
+    if (btn) { btn.disabled = true; btn.textContent = 'Svuotando…' }
+    const body = chatId ? { chat_id: chatId } : {}
+    const resp = await fetchWithCreds('/api/clear_queue', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
+    if (!resp.ok) throw new Error('server error')
+    // refresh only the queue and rate-limits to avoid triggering broad reloads
+    await loadQueue()
+    await loadRateLimits()
+  } catch (e) {
+    console.debug('clearQueue failed', e)
+    alert('Errore durante lo svuotamento della coda')
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Svuota coda' }
+  }
+}
+
+async function showConfig() {
+  try {
+    const resp = await fetchWithCreds('/config')
+    if (!resp.ok) return
+    const cfg = await resp.json()
+    const el = document.getElementById('configDump')
+    if (el) el.textContent = JSON.stringify(cfg, null, 2)
+  } catch (e) { console.debug('showConfig failed', e) }
+}
+
 let topChatsChart = null
 function renderTopChats(topChats) {
   try {
@@ -330,9 +493,7 @@ async function renderTablePage(page = 1) {
   requestsTable.innerHTML = ''
     for (const r of items) {
     const tr = document.createElement('tr')
-    const orig = r.original_size_mb !== null && r.original_size_mb !== undefined ? r.original_size_mb + ' MB' : ''
-    const fin = r.final_size_mb !== null && r.final_size_mb !== undefined ? r.final_size_mb + ' MB' : ''
-    const comp = r.compressed ? 'yes' : (r.compressed === false ? 'no' : '')
+      const comp = r.compressed ? 'yes' : (r.compressed === false ? 'no' : '')
     const proc = r.processing_duration_seconds ? (r.processing_duration_seconds.toFixed(1) + 's') : ''
     const eventsSummary = (r.events || []).map(e => `${e.type}${e.duration_seconds ? `:${e.duration_seconds.toFixed(1)}s` : ''}`).join(', ')
     let statusClass = 'bg-secondary'
@@ -345,10 +506,13 @@ async function renderTablePage(page = 1) {
     const tdId = document.createElement('td'); tdId.textContent = String(r.id); tr.appendChild(tdId)
     const tdChat = document.createElement('td'); tdChat.textContent = String(r.chat_id); tr.appendChild(tdChat)
     const tdUrl = document.createElement('td'); const a = document.createElement('a'); a.href = r.url || '#'; a.target = '_blank'; a.className = 'text-truncate-link'; a.rel = 'noopener noreferrer'; a.textContent = r.url || ''; tdUrl.appendChild(a); tr.appendChild(tdUrl)
+    // original size (MB)
+    const tdOrig = document.createElement('td'); tdOrig.className = 'mono'; tdOrig.textContent = (r.original_size_mb !== null && r.original_size_mb !== undefined) ? (String(r.original_size_mb) + ' MB') : '—'; tr.appendChild(tdOrig)
+    // final size (MB)
+    const tdFinal = document.createElement('td'); tdFinal.className = 'mono'; tdFinal.textContent = (r.final_size_mb !== null && r.final_size_mb !== undefined) ? (String(r.final_size_mb) + ' MB') : '—'; tr.appendChild(tdFinal)
+    // compressed flag
+    const tdComp = document.createElement('td'); tdComp.textContent = (r.compressed === true) ? 'yes' : (r.compressed === false ? 'no' : '—'); tr.appendChild(tdComp)
     const tdStatus = document.createElement('td'); const span = document.createElement('span'); span.className = 'badge ' + statusClass; span.textContent = r.status || ''; tdStatus.appendChild(span); tr.appendChild(tdStatus)
-    const tdOrig = document.createElement('td'); tdOrig.textContent = orig; tr.appendChild(tdOrig)
-    const tdFin = document.createElement('td'); tdFin.textContent = fin; tr.appendChild(tdFin)
-    const tdComp = document.createElement('td'); tdComp.textContent = comp; tr.appendChild(tdComp)
     const tdProc = document.createElement('td'); tdProc.textContent = proc; tr.appendChild(tdProc)
     const tdCreated = document.createElement('td'); tdCreated.textContent = r.created_at || ''; tr.appendChild(tdCreated)
     if (eventsSummary) tr.title = eventsSummary
@@ -389,7 +553,14 @@ async function loadStats() {
     document.getElementById('statAvgOrig').textContent = s.avg_original_size_mb ? (s.avg_original_size_mb + ' MB') : '—'
     document.getElementById('statAvgFinal').textContent = s.avg_final_size_mb ? (s.avg_final_size_mb + ' MB') : '—'
     document.getElementById('statAvgProc').textContent = s.avg_processing_seconds ? (s.avg_processing_seconds.toFixed(1) + ' s') : '—'
-    document.getElementById('statNeedProc').textContent = s.requests_need_processing !== undefined ? String(s.requests_need_processing) : '—'
+    try { document.getElementById('statTotalDownloaded').textContent = s.total_downloaded !== undefined ? String(s.total_downloaded) : '—' } catch(e){}
+    try { document.getElementById('statTotalSent').textContent = s.total_sent !== undefined ? String(s.total_sent) : '—' } catch(e){}
+    try { document.getElementById('statTotalDownloadedMB').textContent = s.total_original_mb !== undefined ? (String(s.total_original_mb) + ' MB') : '—' } catch(e){}
+    try { document.getElementById('statTotalUploadedMB').textContent = s.total_final_mb !== undefined ? (String(s.total_final_mb) + ' MB') : '—' } catch(e){}
+    try { document.getElementById('statTotalProcessedMB').textContent = s.total_processed_mb !== undefined ? (String(s.total_processed_mb) + ' MB') : '—' } catch(e){}
+    try { document.getElementById('statTotalRateLimited').textContent = s.total_rate_limited_files !== undefined ? String(s.total_rate_limited_files) : '—' } catch(e){}
+    try { document.getElementById('statTotalChatsLimited').textContent = s.total_chats_rate_limited !== undefined ? String(s.total_chats_rate_limited) : '—' } catch(e){}
+    try { document.getElementById('statTotalDuplicates').textContent = s.total_duplicates !== undefined ? String(s.total_duplicates) : '—' } catch(e){}
   } catch (e) {
     // ignore
   }
@@ -603,10 +774,35 @@ function setupWs() {
           renderTablePage(1)
         }
         if (msg.updates) loadUpdates()
+      } else if (msg.type === 'initial_updates') {
+        // server may send initial_updates separately
+        try { loadUpdates() } catch (e) { }
       } else if (msg.type === 'request_created' || msg.type === 'request_started' || msg.type === 'request_finished' || msg.type === 'request_event') {
         // refresh current page on request lifecycle changes
         renderTablePage(currentPage)
         try { loadQueue() } catch (e) {}
+      } else if (msg.type === 'request_status' || msg.type === 'request_updated') {
+        // more generic request update (status or metadata) -> refresh table and queue
+        try { renderTablePage(currentPage) } catch (e) {}
+        try { loadQueue() } catch (e) {}
+      } else if (msg.type === 'queue_cleared') {
+        // minimal refresh to avoid triggering broad reload loops
+        try { loadQueue() } catch (e) {}
+        try { loadRateLimits() } catch (e) {}
+        try { renderTablePage(currentPage) } catch (e) {}
+      } else if (msg.type === 'unlimited') {
+        // a chat was unlimited by admin; refresh rate limits and queue
+        try { loadRateLimits() } catch (e) {}
+        try { loadQueue() } catch (e) {}
+      } else if (msg.type === 'rate_limit_changed') {
+        // worker in-memory rate limit changed
+        try { loadRateLimits() } catch (e) {}
+        try { loadQueue() } catch (e) {}
+      } else if (msg.type === 'queue_rehydrated') {
+        // worker rehydrated persisted queue on startup
+        try { loadQueue() } catch (e) {}
+        try { loadRateLimits() } catch (e) {}
+        try { renderTablePage(currentPage) } catch (e) {}
       } else if (msg.type === 'update_created') {
         loadUpdates()
       }
@@ -634,4 +830,22 @@ try {
   const refreshBtnSidebar = document.getElementById('refreshBtnSidebar')
   if (refreshBtnSidebar) refreshBtnSidebar.onclick = () => { loadAll() }
   if (refreshQueueBtn) refreshQueueBtn.onclick = () => { loadQueue() }
+  const refreshRateLimitsBtn = document.getElementById('refreshRateLimitsBtn')
+  if (refreshRateLimitsBtn) refreshRateLimitsBtn.onclick = () => { loadRateLimits() }
+    if (startQueueBtn) startQueueBtn.onclick = async () => {
+      try {
+        startQueueBtn.disabled = true
+        startQueueBtn.textContent = 'Avviando…'
+        await fetchWithCreds('/api/queue/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rehydrate: true }) })
+        await loadQueue(); await loadRateLimits()
+      } catch (e) {
+        console.debug('startQueue failed', e)
+        alert('Errore avviando la coda')
+      } finally {
+        startQueueBtn.disabled = false
+        startQueueBtn.textContent = 'Avvia coda'
+      }
+    }
+    if (clearQueueBtn) clearQueueBtn.onclick = async () => { if (confirm('Svuotare la coda? Questa operazione cancella le richieste in coda.')) { await clearQueue(); } }
+    if (showConfigBtn) showConfigBtn.onclick = async () => { await showConfig() }
 } catch (e) { /* ignore */ }

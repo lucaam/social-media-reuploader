@@ -1,4 +1,6 @@
 import asyncio
+import datetime
+import json
 import logging
 import os
 import time
@@ -318,6 +320,94 @@ async def startup_event():
         ws_broadcast.loop = asyncio.get_event_loop()
     except Exception:
         pass
+
+    # Start a background poller that watches the DB `updates` table for
+    # new rows inserted by other processes and re-broadcasts them to
+    # connected websocket clients. This enables real-time UI updates when
+    # the worker runs in a separate process from the GUI.
+    async def _db_updates_poller(poll_interval: float = 1.0):
+        last_id = 0
+        try:
+            conn = db._connect()
+            cur = conn.cursor()
+            cur.execute("SELECT MAX(id) FROM updates")
+            r = cur.fetchone()
+            try:
+                last_id = int(r[0]) if r and r[0] is not None else 0
+            except Exception:
+                last_id = 0
+            try:
+                conn.close()
+            except Exception:
+                pass
+        except Exception:
+            last_id = 0
+
+        while True:
+            try:
+                await asyncio.sleep(poll_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
+            try:
+                conn = db._connect()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id, raw, created_at FROM updates WHERE id > ? ORDER BY id ASC",
+                    (last_id,),
+                )
+                rows = cur.fetchall()
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            except Exception:
+                rows = []
+
+            for r in rows:
+                try:
+                    uid, raw, created = r
+                except Exception:
+                    continue
+                try:
+                    last_id = int(uid)
+                except Exception:
+                    pass
+                # try to decode JSON payloads to re-emit structured events
+                parsed = None
+                try:
+                    parsed = json.loads(raw)
+                except Exception:
+                    parsed = None
+                try:
+                    if isinstance(parsed, dict) and parsed.get("type"):
+                        try:
+                            await ws_broadcast.broadcast(parsed)
+                        except Exception:
+                            pass
+                    else:
+                        try:
+                            await ws_broadcast.broadcast(
+                                {
+                                    "type": "update_created",
+                                    "id": uid,
+                                    "raw": raw,
+                                    "created_at": created,
+                                }
+                            )
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+    try:
+        asyncio.create_task(
+            _db_updates_poller(float(getattr(config, "GUI_DB_POLL_SECONDS", 1.0)))
+        )
+    except Exception:
+        pass
     # suppress uvicorn access logs for frequent /health probes unless debug enabled
     try:
 
@@ -380,17 +470,19 @@ async def index(request: Request):
 
 
 @app.get("/config")
-async def gui_config():
-    oauth_conf = _oauth_enabled()
-    admin_token_present = bool(os.environ.get("ADMIN_TOKEN"))
-    # admin token is only effective when OAuth is NOT configured
-    admin_token_effective = admin_token_present and not oauth_conf
-    return JSONResponse(
-        {
-            "oauth_configured": oauth_conf,
-            "admin_token_set": admin_token_effective,
-        }
-    )
+async def gui_config(request: Request):
+    # Reuse the richer /api/config view so the SPA's "Mostra" button
+    # returns the same runtime information (worker settings, env, etc.).
+    try:
+        return await api_config(request)
+    except Exception:
+        # fallback minimal view
+        oauth_conf = _oauth_enabled()
+        admin_token_present = bool(os.environ.get("ADMIN_TOKEN"))
+        admin_token_effective = admin_token_present and not oauth_conf
+        return JSONResponse(
+            {"oauth_configured": oauth_conf, "admin_token_set": admin_token_effective}
+        )
 
 
 @app.get("/api/me")
@@ -800,6 +892,69 @@ async def api_stats(request: Request):
         need_proc = int(cur.fetchone()[0] or 0)
     except Exception:
         need_proc = 0
+    # additional totals
+    try:
+        cur = conn.cursor()
+        # total downloads started
+        cur.execute(
+            "SELECT COUNT(*) FROM requests WHERE processing_started_at IS NOT NULL"
+        )
+        total_downloaded = int(cur.fetchone()[0] or 0)
+    except Exception:
+        total_downloaded = 0
+    try:
+        # total successfully sent/completed
+        cur.execute(
+            "SELECT COUNT(*) FROM requests WHERE status IN ('done','finished','completed')"
+        )
+        total_sent = int(cur.fetchone()[0] or 0)
+    except Exception:
+        total_sent = 0
+    try:
+        # total rate_limited files
+        cur.execute("SELECT COUNT(*) FROM requests WHERE status = 'rate_limited'")
+        total_rate_limited = int(cur.fetchone()[0] or 0)
+    except Exception:
+        total_rate_limited = 0
+    try:
+        # total distinct chats that have persisted rate_limited rows
+        cur.execute(
+            "SELECT COUNT(DISTINCT chat_id) FROM requests WHERE status = 'rate_limited'"
+        )
+        total_chats_rate_limited = int(cur.fetchone()[0] or 0)
+    except Exception:
+        total_chats_rate_limited = 0
+    try:
+        # total duplicates captured
+        cur.execute("SELECT COUNT(*) FROM requests WHERE status = 'duplicate'")
+        total_duplicates = int(cur.fetchone()[0] or 0)
+    except Exception:
+        total_duplicates = 0
+
+    # total bytes (downloaded/uploaded/processed)
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT SUM(original_size) FROM requests WHERE original_size IS NOT NULL"
+        )
+        total_original_bytes = int(cur.fetchone()[0] or 0)
+    except Exception:
+        total_original_bytes = 0
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT SUM(final_size) FROM requests WHERE final_size IS NOT NULL")
+        total_final_bytes = int(cur.fetchone()[0] or 0)
+    except Exception:
+        total_final_bytes = 0
+    try:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT SUM(original_size) FROM requests WHERE processing_started_at IS NOT NULL AND original_size IS NOT NULL"
+        )
+        total_processed_bytes = int(cur.fetchone()[0] or 0)
+    except Exception:
+        total_processed_bytes = 0
+
     conn.close()
 
     # format and return simple stats
@@ -808,6 +963,33 @@ async def api_stats(request: Request):
             return round(float(v) / (1024 * 1024), 2) if v is not None else None
         except Exception:
             return None
+
+    # compute currently limited chats from in-process worker when available
+    current_limited = []
+    try:
+        from . import worker as worker_mod
+
+        w = getattr(worker_mod, "active_worker", None)
+        now = time.time()
+        if w:
+            try:
+                for cid, next_ts in getattr(w, "_last_rate_limited_next", {}).items():
+                    try:
+                        if next_ts and float(next_ts) > now:
+                            current_limited.append(
+                                {
+                                    "chat_id": cid,
+                                    "next_in_seconds": int(
+                                        max(0, float(next_ts) - now)
+                                    ),
+                                }
+                            )
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+    except Exception:
+        pass
 
     return JSONResponse(
         {
@@ -818,6 +1000,18 @@ async def api_stats(request: Request):
             "avg_final_size_mb": mb(avg_final),
             "avg_processing_seconds": avg_proc,
             "requests_need_processing": need_proc,
+            "total_downloaded": total_downloaded,
+            "total_sent": total_sent,
+            "total_original_bytes": total_original_bytes,
+            "total_final_bytes": total_final_bytes,
+            "total_processed_bytes": total_processed_bytes,
+            "total_original_mb": mb(total_original_bytes),
+            "total_final_mb": mb(total_final_bytes),
+            "total_processed_mb": mb(total_processed_bytes),
+            "total_rate_limited_files": total_rate_limited,
+            "total_chats_rate_limited": total_chats_rate_limited,
+            "total_duplicates": total_duplicates,
+            "currently_limited": current_limited,
         }
     )
 
@@ -831,6 +1025,457 @@ async def api_db_clear(request: Request):
         return JSONResponse({"ok": True})
     except Exception:
         raise HTTPException(status_code=500, detail="failed to clear database")
+
+
+@app.get("/config")
+async def api_config(request: Request):
+    # lightweight view of runtime configuration for the SPA
+    try:
+        cfg = {
+            "oauth_configured": _oauth_enabled(),
+            "admin_token_set": bool(os.environ.get("ADMIN_TOKEN")),
+            "MAX_PENDING_PER_CHAT": getattr(config, "MAX_PENDING_PER_CHAT", None),
+            "DUPLICATE_WINDOW_SECONDS": getattr(
+                config, "DUPLICATE_WINDOW_SECONDS", None
+            ),
+            "TELEGRAM_MAX_FILE_SIZE": getattr(config, "TELEGRAM_MAX_FILE_SIZE", None),
+            "WORKERS": getattr(config, "WORKERS", None),
+            "SIMPLE_YTDLP_ONLY": getattr(config, "SIMPLE_YTDLP_ONLY", None),
+            "WORKER_GENERATE_THUMBNAIL": getattr(
+                config, "WORKER_GENERATE_THUMBNAIL", None
+            ),
+            "TMP_DIR": getattr(config, "TMP_DIR", None),
+        }
+    except Exception:
+        cfg = {}
+    # include in-memory worker details when available
+    try:
+        from . import worker as worker_mod
+
+        w = getattr(worker_mod, "active_worker", None)
+        if w:
+            try:
+                cfg["rate_limits"] = list(getattr(w, "_rate_limits", []))
+                cfg["in_memory_queue_length"] = len(
+                    list(getattr(w._queue, "_queue", []))
+                )
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return JSONResponse(cfg)
+
+
+@app.post("/api/unlimit_chat")
+async def api_unlimit_chat(request: Request):
+    if not _check_admin(request):
+        raise HTTPException(status_code=403, detail="forbidden")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    chat_id = body.get("chat_id")
+    requeue = bool(body.get("requeue", False))
+    if chat_id is None:
+        raise HTTPException(status_code=400, detail="chat_id required")
+
+    updated = 0
+    try:
+        # clear in-memory markers when worker present
+        from . import worker as worker_mod
+
+        w = getattr(worker_mod, "active_worker", None)
+        if w:
+            try:
+                w._last_rate_limited.pop(chat_id, None)
+            except Exception:
+                pass
+            try:
+                w._last_rate_limited_next.pop(chat_id, None)
+            except Exception:
+                pass
+            try:
+                w._last_rate_warning.pop(chat_id, None)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # optionally requeue persisted requests
+    try:
+        conn = db._connect()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, url, description, original_message_id FROM requests WHERE chat_id = ? AND status = 'rate_limited' ORDER BY created_at ASC",
+            (chat_id,),
+        )
+        rows = cur.fetchall()
+        for rid, url, desc, orig_msg in rows:
+            try:
+                if requeue:
+                    db.update_request_status(rid, "queued")
+                    try:
+                        db.add_request_event(
+                            rid, "unlimited", details="unlimited by admin (requeued)"
+                        )
+                    except Exception:
+                        pass
+                    # push into in-memory queue if worker available
+                    try:
+                        from . import worker as worker_mod2
+
+                        w2 = getattr(worker_mod2, "active_worker", None)
+                        if w2:
+                            item = {
+                                "chat_id": chat_id,
+                                "url": url,
+                                "description": desc,
+                                "original_message_id": orig_msg,
+                                "enqueued_at": time.time(),
+                                "request_id": rid,
+                            }
+                            try:
+                                w2._queue.put_nowait(item)
+                            except Exception:
+                                try:
+                                    asyncio.create_task(w2._queue.put(item))
+                                except Exception:
+                                    pass
+                            try:
+                                if getattr(
+                                    config, "WORKER_REHYDRATE_ON_UNLIMIT", False
+                                ):
+                                    try:
+                                        getattr(w2, "trigger_rehydrate", lambda: None)()
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                            # If worker supports a trigger method, ask it to pick up
+                            # persisted queued items immediately. This is a noop
+                            # when GUI/worker are different processes but helps
+                            # when they run together.
+                            try:
+                                if getattr(
+                                    config, "WORKER_REHYDRATE_ON_UNLIMIT", False
+                                ):
+                                    try:
+                                        getattr(w2, "trigger_rehydrate", lambda: None)()
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                else:
+                    # mark event for operator visibility
+                    try:
+                        # mark status to indicate the rate limit was cleared
+                        try:
+                            db.update_request_status(rid, "unlimited")
+                        except Exception:
+                            pass
+                        db.add_request_event(
+                            rid, "unlimited", details="unlimited by admin (no requeue)"
+                        )
+                    except Exception:
+                        pass
+                updated += 1
+            except Exception:
+                pass
+        try:
+            conn.commit()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # notify websocket clients to refresh
+    try:
+        from . import ws_broadcast
+
+        if getattr(ws_broadcast, "loop", None):
+            import asyncio as _asyncio
+
+            _asyncio.run_coroutine_threadsafe(
+                ws_broadcast.broadcast({"type": "unlimited", "chat_id": chat_id}),
+                ws_broadcast.loop,
+            )
+    except Exception:
+        pass
+
+    # persist a DB-level update so other processes (worker) pick up the
+    # unlimit event even when GUI and worker run separately.
+    try:
+        db.add_update(json.dumps({"type": "unlimited", "chat_id": chat_id}))
+    except Exception:
+        pass
+
+    return JSONResponse({"ok": True, "updated": updated})
+
+
+@app.post("/api/unlimit_all")
+async def api_unlimit_all(request: Request):
+    """Clear rate-limit markers for all chats. Optional JSON body: {"requeue": true} to requeue persisted items."""
+    if not _check_admin(request):
+        raise HTTPException(status_code=403, detail="forbidden")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    requeue = bool(body.get("requeue", False))
+
+    updated = 0
+    try:
+        # clear in-memory markers when worker present
+        from . import worker as worker_mod
+
+        w = getattr(worker_mod, "active_worker", None)
+        if w:
+            try:
+                w._last_rate_limited.clear()
+            except Exception:
+                pass
+            try:
+                w._last_rate_limited_next.clear()
+            except Exception:
+                pass
+            try:
+                w._last_rate_warning.clear()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # optionally requeue persisted requests (or just mark as unlimited)
+    try:
+        conn = db._connect()
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT id, chat_id, url, description, original_message_id FROM requests WHERE status = 'rate_limited' ORDER BY created_at ASC"
+        )
+        rows = cur.fetchall()
+        for rid, chat_id, url, desc, orig_msg in rows:
+            try:
+                if requeue:
+                    db.update_request_status(rid, "queued")
+                    try:
+                        db.add_request_event(
+                            rid,
+                            "unlimited",
+                            details="unlimited by admin (requeued all)",
+                        )
+                    except Exception:
+                        pass
+                    # push into in-memory queue if worker available
+                    try:
+                        from . import worker as worker_mod2
+
+                        w2 = getattr(worker_mod2, "active_worker", None)
+                        if w2:
+                            item = {
+                                "chat_id": chat_id,
+                                "url": url,
+                                "description": desc,
+                                "original_message_id": orig_msg,
+                                "enqueued_at": time.time(),
+                                "request_id": rid,
+                            }
+                            try:
+                                w2._queue.put_nowait(item)
+                            except Exception:
+                                try:
+                                    asyncio.create_task(w2._queue.put(item))
+                                except Exception:
+                                    pass
+                    except Exception:
+                        pass
+                else:
+                    try:
+                        try:
+                            db.update_request_status(rid, "unlimited")
+                        except Exception:
+                            pass
+                        db.add_request_event(
+                            rid, "unlimited", details="unlimited by admin (no requeue)"
+                        )
+                    except Exception:
+                        pass
+                updated += 1
+            except Exception:
+                pass
+        try:
+            conn.commit()
+        except Exception:
+            pass
+        try:
+            conn.close()
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    # notify websocket clients to refresh
+    try:
+        from . import ws_broadcast
+
+        if getattr(ws_broadcast, "loop", None):
+            import asyncio as _asyncio
+
+            _asyncio.run_coroutine_threadsafe(
+                ws_broadcast.broadcast({"type": "unlimited_all"}), ws_broadcast.loop
+            )
+    except Exception:
+        pass
+
+    # persist a DB-level update so other processes (worker) pick up the
+    # unlimit_all event even when GUI and worker run separately.
+    try:
+        db.add_update(json.dumps({"type": "unlimited_all"}))
+    except Exception:
+        pass
+
+    return JSONResponse({"ok": True, "updated": updated})
+
+
+@app.post("/api/clear_queue")
+async def api_clear_queue(request: Request):
+    if not _check_admin(request):
+        raise HTTPException(status_code=403, detail="forbidden")
+    body = {}
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    only_chat = body.get("chat_id")
+
+    # Run the heavy clear operation in a background thread to avoid
+    # blocking the main event loop (which causes the SPA to hang/white-screen).
+    def _clear_queue_sync(only_chat_local):
+        cleared_local = 0
+        try:
+            # clear in-memory queue when worker present
+            from . import worker as worker_mod
+
+            w = getattr(worker_mod, "active_worker", None)
+            if w:
+                try:
+                    q = getattr(w._queue, "_queue", None)
+                    if q is not None:
+                        if only_chat_local is None:
+                            cleared_local += len(q)
+                            q.clear()
+                        else:
+                            remaining = []
+                            for it in list(q):
+                                try:
+                                    if it.get("chat_id") == only_chat_local:
+                                        cleared_local += 1
+                                    else:
+                                        remaining.append(it)
+                                except Exception:
+                                    remaining.append(it)
+                            q.clear()
+                            for it in remaining:
+                                q.append(it)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # update DB: mark queued requests as 'cancelled' for visibility
+        try:
+            conn = db._connect()
+            cur = conn.cursor()
+            if only_chat_local is None:
+                cur.execute("SELECT id FROM requests WHERE status = 'queued'")
+            else:
+                cur.execute(
+                    "SELECT id FROM requests WHERE status = 'queued' AND chat_id = ?",
+                    (only_chat_local,),
+                )
+            rows = cur.fetchall()
+            ids = [r[0] for r in rows]
+            for rid in ids:
+                try:
+                    cur.execute(
+                        "UPDATE requests SET status = ? WHERE id = ?",
+                        ("cancelled", rid),
+                    )
+                    try:
+                        db.add_request_event(
+                            rid, "cancelled", details="cancelled by admin clear_queue"
+                        )
+                    except Exception:
+                        pass
+                    cleared_local += 1
+                except Exception:
+                    pass
+            conn.commit()
+            try:
+                conn.close()
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        # broadcast event so GUIs refresh
+        try:
+            from . import ws_broadcast
+
+            if getattr(ws_broadcast, "loop", None):
+                ws_broadcast.publish_sync({"type": "queue_cleared"})
+        except Exception:
+            pass
+
+        return cleared_local
+
+    # schedule the blocking work on a thread and return immediately
+    try:
+        asyncio.create_task(asyncio.to_thread(_clear_queue_sync, only_chat))
+    except Exception:
+        # fallback: run synchronously if scheduling fails (best-effort)
+        try:
+            cleared_now = _clear_queue_sync(only_chat)
+            return JSONResponse({"ok": True, "cleared": cleared_now})
+        except Exception:
+            return JSONResponse({"ok": False, "cleared": 0})
+
+    return JSONResponse({"ok": True, "cleared": "scheduled"})
+
+
+@app.post("/api/queue/start")
+async def api_queue_start(request: Request):
+    """Manually trigger the worker to ingest/process persisted queued items.
+
+    Optional JSON body: { "rehydrate": true } (default true).
+    """
+    if not _check_admin(request):
+        raise HTTPException(status_code=403, detail="forbidden")
+    try:
+        body = await request.json()
+    except Exception:
+        body = {}
+    rehydrate = bool(body.get("rehydrate", True))
+
+    try:
+        from . import worker as worker_mod
+
+        w = getattr(worker_mod, "active_worker", None)
+        if w and rehydrate:
+            try:
+                getattr(w, "trigger_rehydrate", lambda: None)()
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    return JSONResponse({"ok": True})
 
     # also expose richer aggregates via a single endpoint
 
@@ -903,7 +1548,70 @@ async def api_queue(request: Request, limit: int = 50):
 
         w = getattr(worker_mod, "active_worker", None)
         if not w:
-            return JSONResponse({"queue_length": 0, "queued": [], "running": []})
+            # No in-process worker: fall back to persisted requests in DB
+            try:
+                conn = db._connect()
+                cur = conn.cursor()
+                # queued items
+                cur.execute(
+                    "SELECT id, chat_id, url, status, created_at FROM requests WHERE status = 'queued' ORDER BY created_at ASC LIMIT ?",
+                    (limit,),
+                )
+                queued_rows = cur.fetchall()
+                # running items: only treat as running if processing_started_at is recent
+                window = int(os.environ.get("GUI_PROCESSING_WINDOW_SECONDS", "1800"))
+                cutoff = (
+                    datetime.datetime.utcnow() - datetime.timedelta(seconds=window)
+                ).isoformat()
+                cur.execute(
+                    "SELECT id, chat_id, url, status, processing_started_at FROM requests WHERE status IN ('processing','sending') AND processing_started_at >= ? ORDER BY processing_started_at DESC LIMIT ?",
+                    (cutoff, limit),
+                )
+                running_rows = cur.fetchall()
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            except Exception:
+                queued_rows = []
+                running_rows = []
+
+            queued = []
+            running = []
+            for r in queued_rows:
+                try:
+                    rid, chat_id, url, status, created_at = r
+                    queued.append(
+                        {
+                            "request_id": rid,
+                            "chat_id": chat_id,
+                            "url": url,
+                            "enqueued_at": created_at,
+                        }
+                    )
+                except Exception:
+                    pass
+            for r in running_rows:
+                try:
+                    rid, chat_id, url, status, started_at = r
+                    running.append(
+                        {
+                            "request_id": rid,
+                            "chat_id": chat_id,
+                            "url": url,
+                            "enqueued_at": started_at,
+                        }
+                    )
+                except Exception:
+                    pass
+
+            return JSONResponse(
+                {
+                    "queue_length": len(queued_rows) + len(running_rows),
+                    "queued": queued,
+                    "running": running,
+                }
+            )
 
         # queued items (internal asyncio.Queue deque)
         try:
@@ -1077,8 +1785,50 @@ async def api_rate_limits(request: Request, per_chat_limit: int = 200):
         except Exception:
             recent = []
 
+        # persisted limited chats: distinct chat ids that have persisted
+        # rate_limited rows. This allows the GUI to show a concise list of
+        # blocked chats that can be unblocked individually.
+        persisted_limited = []
+        try:
+            conn = db._connect()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT chat_id, COUNT(*) as cnt FROM requests WHERE status = 'rate_limited' GROUP BY chat_id ORDER BY cnt DESC LIMIT ?",
+                (per_chat_limit,),
+            )
+            for cid, cnt in cur.fetchall():
+                persisted_limited.append({"chat_id": cid, "count": int(cnt or 0)})
+            conn.close()
+        except Exception:
+            persisted_limited = []
+
+        # compute currently limited chats from worker memory when available
+        currently_limited = []
+        try:
+            now = time.time()
+            for cid in list(getattr(w, "_last_rate_limited_next", {}).keys()):
+                try:
+                    next_ts = getattr(w, "_last_rate_limited_next", {}).get(cid)
+                    if next_ts and float(next_ts) > now:
+                        currently_limited.append(
+                            {
+                                "chat_id": cid,
+                                "next_in_seconds": int(max(0, float(next_ts) - now)),
+                            }
+                        )
+                except Exception:
+                    pass
+        except Exception:
+            currently_limited = []
+
         return JSONResponse(
-            {"limits": limits, "per_chat": per_chat, "recent_rate_limited": recent}
+            {
+                "limits": limits,
+                "per_chat": per_chat,
+                "recent_rate_limited": recent,
+                "persisted_limited_chats": persisted_limited,
+                "currently_limited": currently_limited,
+            }
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

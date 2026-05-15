@@ -1,4 +1,5 @@
 import asyncio
+import json
 import logging
 import os
 import re
@@ -72,9 +73,71 @@ class WorkerPool:
         try:
             loop = asyncio.get_running_loop()
             self._dispatch_task = loop.create_task(self._dispatch_loop())
+            try:
+                # Rehydrate persisted queued requests from DB into the in-memory
+                # queue so that a worker restart continues processing where it
+                # left off. Make this behavior configurable via
+                # `config.WORKER_REHYDRATE_ON_START`.
+                if getattr(config, "WORKER_REHYDRATE_ON_START", True):
+                    loop.create_task(self._rehydrate_persisted_queue())
+                else:
+                    # Mark any persisted queued rows as 'aborted' so operators
+                    # can inspect what was interrupted without requeuing.
+                    try:
+                        conn = db._connect()
+                        cur = conn.cursor()
+                        cur.execute("SELECT id FROM requests WHERE status = 'queued'")
+                        rows = [r[0] for r in cur.fetchall()]
+                        try:
+                            conn.close()
+                        except Exception:
+                            pass
+                    except Exception:
+                        rows = []
+                    aborted = 0
+                    for rid in rows:
+                        try:
+                            db.update_request_status(rid, "aborted")
+                            try:
+                                db.add_request_event(
+                                    rid,
+                                    "aborted_on_startup",
+                                    details=("aborted at startup because WORKER_REHYDRATE_ON_START=false"),
+                                )
+                            except Exception:
+                                pass
+                            aborted += 1
+                        except Exception:
+                            pass
+                    try:
+                        logger.info("Marked %s persisted queued requests as aborted on startup", aborted)
+                    except Exception:
+                        pass
+            except Exception:
+                pass
         except RuntimeError:
             # not in a running loop; dispatcher will be started later
             self._dispatch_task = None
+
+        # optional periodic rehydration: if configured, start a background
+        # task that periodically pulls persisted 'queued' rows from the DB
+        # into the in-memory queue. This helps when the GUI or another
+        # process requeues items and the worker runs in a separate process.
+        try:
+            interval = float(getattr(config, "WORKER_PERIODIC_REHYDRATE_SECONDS", 0) or 0)
+            if interval and interval > 0:
+                try:
+                    loop.create_task(self._periodic_rehydrate_loop(interval))
+                except Exception:
+                    pass
+                try:
+                    # also start an updates poller so GUI/other processes can
+                    # notify this worker about unlimit events across processes.
+                    loop.create_task(self._db_updates_poller(interval))
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
         # register active pool for external monitoring (GUI/debug)
         try:
@@ -149,6 +212,62 @@ class WorkerPool:
                 pass
             return False
 
+        # If this chat is currently rate-limited by an earlier attempt, block
+        # new enqueues immediately (prevents sending a different link to
+        # 'self-unblock'). Notify the user (throttled) and persist a
+        # rate_limited marker for operator visibility.
+        try:
+            next_allowed = self._last_rate_limited_next.get(chat_id)
+            if next_allowed and now < float(next_allowed):
+                # persist a rate_limited request row for traceability
+                try:
+                    rid = db.add_request(
+                        chat_id,
+                        url,
+                        status="rate_limited",
+                        description=description,
+                        original_message_id=original_message_id,
+                    )
+                    try:
+                        db.add_request_event(
+                            rid,
+                            "rate_limited",
+                            details=(f"enqueue blocked by active rate-limit; next_in={int(max(0, float(next_allowed) - now))}s"),
+                        )
+                    except Exception:
+                        pass
+                except Exception:
+                    rid = None
+
+                # Throttled notification to chat about active rate limit
+                try:
+                    last_warn = self._last_rate_warning.get(chat_id)
+                    if not last_warn or (now - last_warn) > int(self._notify_rate_throttle or 60):
+                        try:
+                            asyncio.create_task(
+                                self._notify_rate_limit(
+                                    chat_id,
+                                    original_message_id,
+                                    int(max(0, float(next_allowed) - now)),
+                                )
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            self._last_rate_warning[chat_id] = now
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                try:
+                    self._inflight_urls.discard(key)
+                except Exception:
+                    pass
+                return False
+        except Exception:
+            pass
+
         try:
             # 1) Duplicate suppression: do not download the same URL from the
             # same chat within the configured dedupe window (default 90m).
@@ -157,80 +276,177 @@ class WorkerPool:
                     chat_id, url, since_seconds=self._dedupe_window_seconds
                 )
                 if recent:
-                    # Persist a small marker so operators can see duplicate attempts
+                    # If the most-recent matching request exists, examine its
+                    # status. Treat prior 'rate_limited' as an active block and
+                    # notify the user; treat prior 'duplicate' as a duplicate
+                    # and notify accordingly. Only previously successful/queued
+                    # requests count as true dedupe for the same URL.
                     try:
-                        rid = db.add_request(
-                            chat_id,
-                            url,
-                            status="duplicate",
-                            description=description,
-                            original_message_id=original_message_id,
-                        )
+                        recent_status = recent[1] if len(recent) > 1 else None
+                    except Exception:
+                        recent_status = None
+
+                    # If previously rate_limited, re-assert the block and notify.
+                    if recent_status == "rate_limited":
                         try:
-                            db.add_request_event(
-                                rid,
-                                "duplicate",
-                                details=(
-                                    f"duplicate of request {recent[0]} within {int(self._dedupe_window_seconds)}s"
-                                ),
+                            # compute remaining using in-memory next_allowed if present
+                            next_allowed = self._last_rate_limited_next.get(chat_id)
+                            if next_allowed and float(next_allowed) > now:
+                                remaining = int(max(0, int(float(next_allowed) - now)))
+                            else:
+                                # fallback: infer from recent.created_at if available
+                                try:
+                                    from datetime import datetime
+
+                                    created_at = None
+                                    try:
+                                        created_iso = recent[2]
+                                        if created_iso:
+                                            created_at = datetime.fromisoformat(created_iso)
+                                    except Exception:
+                                        created_at = None
+                                    remaining = int(self._dedupe_window_seconds)
+                                    if created_at is not None:
+                                        try:
+                                            now_dt = datetime.utcnow()
+                                            elapsed = (now_dt - created_at).total_seconds()
+                                            remaining = int(
+                                                max(
+                                                    0,
+                                                    int(self._dedupe_window_seconds) - int(elapsed),
+                                                )
+                                            )
+                                        except Exception:
+                                            remaining = int(self._dedupe_window_seconds)
+                                except Exception:
+                                    remaining = int(self._dedupe_window_seconds)
+                        except Exception:
+                            remaining = int(self._dedupe_window_seconds)
+
+                        # persist a small marker for operator visibility
+                        try:
+                            rid = db.add_request(
+                                chat_id,
+                                url,
+                                status="rate_limited",
+                                description=description,
+                                original_message_id=original_message_id,
                             )
+                            try:
+                                db.add_request_event(
+                                    rid,
+                                    "rate_limited",
+                                    details=(f"re-attempt blocked; prior rate_limited; next_in={remaining}s"),
+                                )
+                            except Exception:
+                                pass
+                        except Exception:
+                            rid = None
+
+                        try:
+                            last_warn = self._last_rate_warning.get(chat_id)
+                            if not last_warn or (now - last_warn) > int(self._notify_rate_throttle or 60):
+                                try:
+                                    asyncio.create_task(
+                                        self._notify_rate_limit(chat_id, original_message_id, remaining)
+                                    )
+                                except Exception:
+                                    pass
+                                try:
+                                    self._last_rate_warning[chat_id] = now
+                                except Exception:
+                                    pass
                         except Exception:
                             pass
-                    except Exception:
-                        pass
-                    # compute remaining seconds until dedupe window expires
-                    try:
-                        from datetime import datetime
 
-                        created_at = None
                         try:
-                            created_iso = recent[2]
-                            if created_iso:
-                                created_at = datetime.fromisoformat(created_iso)
+                            self._inflight_urls.discard(key)
                         except Exception:
-                            created_at = None
-                        remaining = int(self._dedupe_window_seconds)
-                        if created_at is not None:
-                            try:
-                                now_dt = datetime.utcnow()
-                                elapsed = (now_dt - created_at).total_seconds()
-                                remaining = int(
-                                    max(
-                                        0,
-                                        int(self._dedupe_window_seconds) - int(elapsed),
-                                    )
-                                )
-                            except Exception:
-                                remaining = int(self._dedupe_window_seconds)
-                    except Exception:
-                        remaining = int(self._dedupe_window_seconds)
+                            pass
+                        return False
 
-                    # notify user about duplicate only if not recently warned (long throttle)
-                    try:
-                        last_dup = self._last_duplicate_warning.get(chat_id)
-                        if not last_dup or (now - last_dup) > int(
-                            self._notify_duplicate_throttle or 600
-                        ):
+                    # Treat prior duplicate as duplicate: notify with remaining dedupe window
+                    if recent_status == "duplicate":
+                        try:
+                            # Persist a marker so operators can see the attempt
+                            rid = db.add_request(
+                                chat_id,
+                                url,
+                                status="duplicate",
+                                description=description,
+                                original_message_id=original_message_id,
+                            )
                             try:
-                                asyncio.create_task(
-                                    self._notify_duplicate(
-                                        chat_id, original_message_id, remaining
-                                    )
+                                db.add_request_event(
+                                    rid,
+                                    "duplicate",
+                                    details=(
+                                        f"duplicate of request {recent[0]} within {int(self._dedupe_window_seconds)}s"
+                                    ),
                                 )
                             except Exception:
                                 pass
+                        except Exception:
+                            pass
+
+                        # compute remaining seconds until dedupe window expires
+                        try:
+                            from datetime import datetime
+
+                            created_at = None
                             try:
-                                self._last_duplicate_warning[chat_id] = now
+                                created_iso = recent[2]
+                                if created_iso:
+                                    created_at = datetime.fromisoformat(created_iso)
                             except Exception:
-                                pass
-                    except Exception:
-                        pass
-                    # ensure inflight marker removed before returning
-                    try:
-                        self._inflight_urls.discard(key)
-                    except Exception:
-                        pass
-                    return False
+                                created_at = None
+                            remaining = int(self._dedupe_window_seconds)
+                            if created_at is not None:
+                                try:
+                                    now_dt = datetime.utcnow()
+                                    elapsed = (now_dt - created_at).total_seconds()
+                                    remaining = int(
+                                        max(
+                                            0,
+                                            int(self._dedupe_window_seconds) - int(elapsed),
+                                        )
+                                    )
+                                except Exception:
+                                    remaining = int(self._dedupe_window_seconds)
+                        except Exception:
+                            remaining = int(self._dedupe_window_seconds)
+
+                        # notify user about duplicate only if not recently warned (long throttle)
+                        try:
+                            last_dup = self._last_duplicate_warning.get(chat_id)
+                            if not last_dup or (now - last_dup) > int(
+                                self._notify_duplicate_throttle or 600
+                            ):
+                                try:
+                                    asyncio.create_task(
+                                        self._notify_duplicate(
+                                            chat_id, original_message_id, remaining
+                                        )
+                                    )
+                                except Exception:
+                                    pass
+                                try:
+                                    self._last_duplicate_warning[chat_id] = now
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                        # ensure inflight marker removed before returning
+                        try:
+                            self._inflight_urls.discard(key)
+                        except Exception:
+                            pass
+                        return False
+
+                    # else: prior successful/queued/processing requests are treated as duplicates
+                    # fall through to duplicate handler below
+                    # (we will handle below as before)
             except Exception:
                 # if DB check fails, continue to next checks
                 pass
@@ -297,58 +513,75 @@ class WorkerPool:
                     self._last_rate_limited_next[chat_id] = now + 120
                 except Exception:
                     pass
+                # notify GUIs about this in-memory rate-limit change
                 try:
-                    last_warn = self._last_rate_warning.get(chat_id)
-                    if not last_warn or (now - last_warn) > int(
-                        self._notify_rate_throttle or 60
-                    ):
-                        try:
-                            asyncio.create_task(
-                                self._notify_rate_limit(
-                                    chat_id, original_message_id, 120
-                                )
-                            )
-                        except Exception:
-                            pass
-                        try:
-                            self._last_rate_warning[chat_id] = now
-                        except Exception:
-                            pass
+                    from . import ws_broadcast
+
+                    try:
+                        ws_broadcast.publish_sync({
+                            "type": "rate_limit_changed",
+                            "chat_id": chat_id,
+                            "next": self._last_rate_limited_next.get(chat_id),
+                        })
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                try:
+                    logger.info(
+                        "Enqueue blocked (pending cap) for chat=%s url=%s queued=%s running=%s limit=%s",
+                        chat_id,
+                        url,
+                        queued_count,
+                        running_count,
+                        self._max_pending_per_chat,
+                    )
+                except Exception:
+                    pass
+                try:
+                    # do not send immediate rate-limit messages at enqueue time
+                    # to avoid false-positives; operators can inspect persisted
+                    # 'rate_limited' rows in the GUI.
+                    logger.info(
+                        "Enqueue blocked (pending cap) for chat=%s url=%s queued=%s running=%s limit=%s",
+                        chat_id,
+                        url,
+                        queued_count,
+                        running_count,
+                        self._max_pending_per_chat,
+                    )
+                    try:
+                        self._last_rate_warning[chat_id] = now
+                    except Exception:
+                        pass
                 except Exception:
                     pass
                 try:
                     self._inflight_urls.discard(key)
                 except Exception:
                     pass
-                # schedule a delayed requeue so this request is retried after the
-                # short backoff window. Persisted DB row exists (status='rate_limited'),
-                # so ensure we include the request_id in the queued item so the
-                # delayed requeue routine can update the DB status to 'queued'.
-                try:
-                    item = {
-                        "chat_id": chat_id,
-                        "url": url,
-                        "description": description,
-                        "original_message_id": original_message_id,
-                        "chat_type": chat_type,
-                        "enqueued_at": now,
-                    }
-                    if rid:
-                        try:
-                            item["request_id"] = rid
-                        except Exception:
-                            pass
-                    try:
-                        asyncio.create_task(self._delayed_requeue(item, 120))
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
+                # Do NOT schedule an automatic requeue for rate-limited items.
+                # Persisted DB row remains with status='rate_limited' so operators
+                # can inspect and decide whether to requeue via the Admin GUI.
                 return False
 
             # Check rate limits at enqueue time and BLOCK if exceeded.
             exceeded = False
             delay_needed = 0
+            try:
+                # diagnostic logging: show recent timestamps and computed counts
+                try:
+                    recent_ts = list(ts)[-10:]
+                    logger.debug(
+                        "enqueue: chat=%s recent_ts=%s rate_limits=%s",
+                        chat_id,
+                        recent_ts,
+                        getattr(self, "_rate_limits", []),
+                    )
+                except Exception:
+                    pass
+            except Exception:
+                pass
             try:
                 for limit, window in self._rate_limits:
                     cnt = sum(1 for t in ts if t >= now - window)
@@ -396,25 +629,35 @@ class WorkerPool:
                 except Exception:
                     pass
 
+                # broadcast rate-limit change so GUI updates promptly
+                try:
+                    from . import ws_broadcast
+
+                    try:
+                        ws_broadcast.publish_sync({
+                            "type": "rate_limit_changed",
+                            "chat_id": chat_id,
+                            "next": self._last_rate_limited_next.get(chat_id),
+                        })
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+
                 # throttle frequent warnings according to configured throttle
                 try:
-                    last_warn = self._last_rate_warning.get(chat_id)
-                    if not last_warn or (now - last_warn) > int(
-                        self._notify_rate_throttle or 60
-                    ):
-                        # schedule async notification
-                        try:
-                            asyncio.create_task(
-                                self._notify_rate_limit(
-                                    chat_id, original_message_id, delay_needed
-                                )
-                            )
-                        except Exception:
-                            pass
-                        try:
-                            self._last_rate_warning[chat_id] = now
-                        except Exception:
-                            pass
+                    # avoid notifying users at enqueue time to reduce false
+                    # positives; dispatch-time notifications remain.
+                    try:
+                        self._last_rate_warning[chat_id] = now
+                    except Exception:
+                        pass
+                    logger.info(
+                        "Enqueue blocked (rate limit) for chat=%s url=%s next_in=%s",
+                        chat_id,
+                        url,
+                        int(delay_needed) if delay_needed else None,
+                    )
                 except Exception:
                     pass
 
@@ -422,36 +665,8 @@ class WorkerPool:
                     self._inflight_urls.discard(key)
                 except Exception:
                     pass
-                # schedule a delayed requeue to retry the request after
-                # the computed delay_needed so the item is not lost.
-                try:
-                    item = {
-                        "chat_id": chat_id,
-                        "url": url,
-                        "description": description,
-                        "original_message_id": original_message_id,
-                        "chat_type": chat_type,
-                        "enqueued_at": now,
-                    }
-                    if rid:
-                        try:
-                            item["request_id"] = rid
-                        except Exception:
-                            pass
-                    try:
-                        d = (
-                            int(delay_needed)
-                            if delay_needed and delay_needed > 0
-                            else 120
-                        )
-                    except Exception:
-                        d = 120
-                    try:
-                        asyncio.create_task(self._delayed_requeue(item, d))
-                    except Exception:
-                        pass
-                except Exception:
-                    pass
+                # Do NOT schedule automatic requeue for rate-limited items.
+                # Operators can requeue via the Admin GUI when appropriate.
                 return False
 
             # not exceeded: record this enqueue timestamp and persist queued request
@@ -545,6 +760,136 @@ class WorkerPool:
         except Exception:
             pass
 
+    async def _periodic_rehydrate_loop(self, interval: float):
+        """Background loop that periodically invokes the persisted-queue
+        rehydration routine. Runs until the worker is closed.
+        """
+        try:
+            while not self._closing:
+                try:
+                    await asyncio.sleep(float(interval))
+                except asyncio.CancelledError:
+                    break
+                except Exception:
+                    pass
+                try:
+                    await self._rehydrate_persisted_queue()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    def trigger_rehydrate(self):
+        """Schedule an immediate rehydrate task on the running loop.
+
+        This is useful for the GUI to call when items were requeued via
+        the Admin UI and an immediate pickup is desired.
+        """
+        try:
+            loop = asyncio.get_running_loop()
+            try:
+                loop.create_task(self._rehydrate_persisted_queue())
+            except Exception:
+                pass
+        except Exception:
+            # not running in an event loop (rare) — ignore
+            pass
+
+    async def _db_updates_poller(self, poll_interval: float = 5.0):
+        """Poll the DB `updates` table and react to cross-process events.
+
+        Currently supports: `unlimited` (with `chat_id`) and `unlimited_all`.
+        When an `unlimited` event is observed, clear the in-memory rate-limit
+        markers for the specified chat so persisted queued items can be
+        processed immediately.
+        """
+        last_id = 0
+        try:
+            conn = db._connect()
+            cur = conn.cursor()
+            cur.execute("SELECT MAX(id) FROM updates")
+            r = cur.fetchone()
+            try:
+                last_id = int(r[0]) if r and r[0] is not None else 0
+            except Exception:
+                last_id = 0
+            try:
+                conn.close()
+            except Exception:
+                pass
+        except Exception:
+            last_id = 0
+
+        while not self._closing:
+            try:
+                await asyncio.sleep(float(poll_interval))
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                pass
+
+            try:
+                conn = db._connect()
+                cur = conn.cursor()
+                cur.execute(
+                    "SELECT id, raw FROM updates WHERE id > ? ORDER BY id ASC",
+                    (last_id,),
+                )
+                rows = cur.fetchall()
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+            except Exception:
+                rows = []
+
+            for r in rows:
+                try:
+                    uid, raw = r
+                except Exception:
+                    continue
+                try:
+                    last_id = int(uid)
+                except Exception:
+                    pass
+                parsed = None
+                try:
+                    parsed = json.loads(raw)
+                except Exception:
+                    parsed = None
+                try:
+                    if isinstance(parsed, dict) and parsed.get("type"):
+                        t = parsed.get("type")
+                        if t == "unlimited":
+                            cid = parsed.get("chat_id")
+                            try:
+                                if cid is not None:
+                                    self._last_rate_limited.pop(cid, None)
+                                    self._last_rate_limited_next.pop(cid, None)
+                                    self._last_rate_warning.pop(cid, None)
+                                    logger.info("Cleared in-memory rate-limit for chat=%s via DB update", cid)
+                                    # rehydrate queued items for this chat immediately
+                                    try:
+                                        asyncio.create_task(self._rehydrate_persisted_queue())
+                                    except Exception:
+                                        pass
+                            except Exception:
+                                pass
+                        elif t == "unlimited_all":
+                            try:
+                                self._last_rate_limited.clear()
+                                self._last_rate_limited_next.clear()
+                                self._last_rate_warning.clear()
+                                logger.info("Cleared all in-memory rate-limits via DB update")
+                                try:
+                                    asyncio.create_task(self._rehydrate_persisted_queue())
+                                except Exception:
+                                    pass
+                            except Exception:
+                                pass
+                except Exception:
+                    pass
+
     async def _delayed_requeue(self, item: dict, delay: float):
         try:
             if delay and delay > 0:
@@ -573,6 +918,103 @@ class WorkerPool:
                     except Exception:
                         pass
                 await self._queue.put(item)
+        except Exception:
+            pass
+
+    async def _rehydrate_persisted_queue(self):
+        """Load persisted requests with status='queued' from the DB into
+        the in-memory queue at startup so restarts continue processing.
+        """
+        try:
+            # small delay to allow other startup tasks to complete
+            await asyncio.sleep(0.1)
+        except Exception:
+            pass
+        try:
+            conn = db._connect()
+            cur = conn.cursor()
+            cur.execute(
+                "SELECT id, chat_id, url, description, original_message_id, created_at FROM requests WHERE status = 'queued' ORDER BY created_at ASC"
+            )
+            rows = cur.fetchall()
+            try:
+                conn.close()
+            except Exception:
+                pass
+        except Exception:
+            rows = []
+
+        # compute existing request_ids already present in memory (queue/tasks)
+        existing_rids = set()
+        try:
+            queued_raw = list(getattr(self._queue, "_queue", []))
+            for it in queued_raw:
+                try:
+                    if isinstance(it, dict) and it.get("request_id"):
+                        existing_rids.add(int(it.get("request_id")))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+        try:
+            for t in list(getattr(self, "_tasks", set()) or set()):
+                try:
+                    itm = getattr(t, "_item", None)
+                    if itm and itm.get("request_id"):
+                        existing_rids.add(int(itm.get("request_id")))
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        requeued = 0
+        now = time.time()
+        cutoff = now - (30 * 24 * 3600)
+        for r in rows or []:
+            try:
+                rid, chat_id, url, description, original_message_id, created_at = r
+                try:
+                    if int(rid) in existing_rids:
+                        # already present in memory; skip to avoid duplicate enqueue
+                        continue
+                except Exception:
+                    pass
+                # build item dict similar to enqueue
+                item = {
+                    "chat_id": chat_id,
+                    "url": url,
+                    "description": description,
+                    "original_message_id": original_message_id,
+                    "chat_type": None,
+                    "enqueued_at": now,
+                    "request_id": rid,
+                }
+                # update in-memory timestamps for rate limiting conservatively
+                try:
+                    ts = self._chat_timestamps.setdefault(chat_id, [])
+                    # only include recent timestamps
+                    if now >= cutoff:
+                        ts.append(now)
+                except Exception:
+                    pass
+                try:
+                    await self._queue.put(item)
+                    requeued += 1
+                except Exception:
+                    pass
+            except Exception:
+                pass
+        try:
+            logger.info("Rehydrated %s persisted queued requests into memory", requeued)
+        except Exception:
+            pass
+        try:
+            from . import ws_broadcast
+
+            try:
+                ws_broadcast.publish_sync({"type": "queue_rehydrated", "count": requeued})
+            except Exception:
+                pass
         except Exception:
             pass
 
@@ -705,7 +1147,10 @@ class WorkerPool:
             try:
                 for limit, window in limits:
                     cnt = sum(1 for t in ts if t >= now - window)
-                    if cnt >= limit:
+                    # ts already includes timestamps recorded at enqueue time,
+                    # so allow up to `limit` entries in the window. Block only
+                    # when the count exceeds the configured limit.
+                    if cnt > limit:
                         # compute earliest time when next slot frees
                         oldest = min(t for t in ts if t >= now - window)
                         d = (oldest + window) - now
@@ -714,25 +1159,64 @@ class WorkerPool:
                         exceeded = True
                 # if exceeded, warn (once per minute) and requeue after delay
                 if exceeded and delay_needed > 0:
+                    # Prefer any previously recorded next-allowed timestamp
+                    # when computing the user-facing remaining seconds so that
+                    # messages are consistent with what the dispatcher will honor.
+                    try:
+                        import math
+
+                        next_allowed_ts = self._last_rate_limited_next.get(chat_id)
+                        if next_allowed_ts and float(next_allowed_ts) > now:
+                            remaining = int(max(0, math.ceil(float(next_allowed_ts) - now)))
+                        else:
+                            remaining = int(max(0, math.ceil(delay_needed)))
+                    except Exception:
+                        try:
+                            remaining = int(max(0, int(delay_needed)))
+                        except Exception:
+                            remaining = int(delay_needed) if delay_needed else 0
+
+                    # record a canonical next-allowed time so subsequent checks
+                    # and client notifications observe the same window.
+                    try:
+                        self._last_rate_limited_next[chat_id] = now + (remaining if remaining and remaining > 0 else int(delay_needed))
+                    except Exception:
+                        pass
+
+                    # broadcast rate-limit change so connected GUIs refresh
+                    try:
+                        from . import ws_broadcast
+
+                        try:
+                            ws_broadcast.publish_sync({
+                                "type": "rate_limit_changed",
+                                "chat_id": chat_id,
+                                "next": self._last_rate_limited_next.get(chat_id),
+                            })
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+
                     last_warn = self._last_rate_warning.get(chat_id)
-                    if not last_warn or (now - last_warn) > int(
-                        self._notify_rate_throttle or 60
-                    ):
+                    if not last_warn or (now - last_warn) > int(self._notify_rate_throttle or 60):
                         try:
                             # best-effort notify chat about throttling
-                            msg = (
-                                f"Rate limit: troppi link inviati. "
-                                f"Il tuo link sarà processato tra {int(delay_needed)} secondi."
-                            )
+                            if remaining and remaining > 0:
+                                msg = (
+                                    f"Rate limit: troppi link inviati. "
+                                    f"Il tuo link sarà processato tra {remaining} secondi."
+                                )
+                            else:
+                                msg = "Sei temporaneamente limitato: riprova tra qualche secondo."
                             await telegram_api.send_message(self.token, chat_id, msg)
                         except Exception:
-                            logger.debug(
-                                "Could not send rate limit warning to chat %s", chat_id
-                            )
+                            logger.debug("Could not send rate limit warning to chat %s", chat_id)
                         try:
                             self._last_rate_warning[chat_id] = now
                         except Exception:
                             pass
+
                     # requeue with delay
                     try:
                         asyncio.create_task(self._delayed_requeue(item, delay_needed))
@@ -1450,24 +1934,6 @@ class WorkerPool:
                         ):
                             if original_message_id:
                                 try:
-                                    if reaction_current == "eyes":
-                                        try:
-                                            rrem = (
-                                                await telegram_api.set_message_reaction(
-                                                    self.token,
-                                                    chat_id,
-                                                    original_message_id,
-                                                    "👀",
-                                                    remove=True,
-                                                )
-                                            )
-                                            # if removal succeeded, clear state
-                                            if isinstance(rrem, dict) and rrem.get(
-                                                "ok"
-                                            ):
-                                                reaction_current = None
-                                        except Exception:
-                                            pass
                                     try:
                                         radd = await telegram_api.set_message_reaction(
                                             self.token,
@@ -1523,40 +1989,28 @@ class WorkerPool:
                             # supported fall back to sending a banana emoji message.
                             if original_message_id:
                                 try:
-                                    if reaction_current == "eyes":
-                                        try:
-                                            rrem = (
-                                                await telegram_api.set_message_reaction(
+                                    try:
+                                        radd = await telegram_api.set_message_reaction(
+                                            self.token, chat_id, original_message_id, "🍌"
+                                        )
+                                        ok_radd = (
+                                            (isinstance(radd, dict) and radd.get("ok"))
+                                            if isinstance(radd, dict)
+                                            else bool(radd)
+                                        )
+                                        if ok_radd:
+                                            reaction_current = "banana"
+                                        else:
+                                            try:
+                                                await telegram_api.send_message(
                                                     self.token,
                                                     chat_id,
-                                                    original_message_id,
-                                                    "👀",
-                                                    remove=True,
+                                                    "🍌",
+                                                    reply_to_message_id=original_message_id,
                                                 )
-                                            )
-                                            if isinstance(rrem, dict) and not rrem.get(
-                                                "ok"
-                                            ):
-                                                logger.debug(
-                                                    "set_message_reaction(remove) returned: %s",
-                                                    rrem,
-                                                )
-                                        except Exception:
-                                            pass
-                                except Exception:
-                                    pass
-                                try:
-                                    radd = await telegram_api.set_message_reaction(
-                                        self.token, chat_id, original_message_id, "🍌"
-                                    )
-                                    ok_radd = (
-                                        (isinstance(radd, dict) and radd.get("ok"))
-                                        if isinstance(radd, dict)
-                                        else bool(radd)
-                                    )
-                                    if ok_radd:
-                                        reaction_current = "banana"
-                                    else:
+                                            except Exception:
+                                                pass
+                                    except Exception:
                                         try:
                                             await telegram_api.send_message(
                                                 self.token,
@@ -1567,15 +2021,7 @@ class WorkerPool:
                                         except Exception:
                                             pass
                                 except Exception:
-                                    try:
-                                        await telegram_api.send_message(
-                                            self.token,
-                                            chat_id,
-                                            "🍌",
-                                            reply_to_message_id=original_message_id,
-                                        )
-                                    except Exception:
-                                        pass
+                                    pass
                             try:
                                 await telegram_api.send_message(
                                     self.token,
@@ -1610,6 +2056,12 @@ class WorkerPool:
             final_size = (
                 meta.get("final_size") if isinstance(meta, dict) else None
             ) or size
+            # Ensure meta reflects the best-known final size at this stage
+            try:
+                if isinstance(meta, dict):
+                    meta["final_size"] = final_size
+            except Exception:
+                pass
 
             # persist original size in the DB for telemetry/debugging
             try:
@@ -1672,7 +2124,7 @@ class WorkerPool:
             if not claimed:
                 try:
                     status_msg_id = await self._edit_status(
-                        self.token, chat_id, status_msg_id, "✅ already processed"
+                        self.token, chat_id, status_msg_id, "🏆 already processed"
                     )
                 except Exception:
                     pass
@@ -1706,6 +2158,7 @@ class WorkerPool:
                 fmt = (
                     (meta.get("format") or "").lower() if isinstance(meta, dict) else ""
                 )
+                container_ok = ("mp4" in fmt) or (ext == "mp4")
                 size_ok = (
                     True
                     if final_size is None
@@ -1713,12 +2166,16 @@ class WorkerPool:
                     <= getattr(config, "TELEGRAM_MAX_FILE_SIZE", 50 * 1024 * 1024)
                 )
 
+                # Require a preferred video codec (H.264/MPEG4) when a video
+                # stream is present. Even if the container is MP4, non-H.264
+                # codecs (e.g. VP9) can fail to play inline in Telegram clients,
+                # so prefer to transcode to H.264 when needed. Audio codec is
+                # also validated when a video stream is present.
                 codec_ok = True
                 if has_video:
                     codec_ok = (video_codec in preferred_video) and (
                         (not has_audio) or (audio_codec in preferred_audio)
                     )
-                container_ok = ("mp4" in fmt) or (ext == "mp4")
 
                 logger.debug(
                     "telegram rules: has_video=%s has_audio=%s video_codec=%s audio_codec=%s format=%s size_ok=%s",
@@ -1771,8 +2228,29 @@ class WorkerPool:
                     try:
                         base = os.path.splitext(os.path.basename(file_path))[0]
                         trans_path = os.path.join(tmpdir, f"{base}_tg_transcoded.mp4")
-                        max_sz = getattr(
+                        max_allowed = getattr(
                             config, "TELEGRAM_MAX_FILE_SIZE", 50 * 1024 * 1024
+                        )
+                        # Prefer not to upsize: use the smaller of the original
+                        # file size and the allowed Telegram max as the target.
+                        try:
+                            orig_sz = size or (
+                                meta.get("original_size") if isinstance(meta, dict) else None
+                            )
+                        except Exception:
+                            orig_sz = None
+                        try:
+                            if orig_sz and orig_sz < max_allowed:
+                                target_sz = int(orig_sz)
+                            else:
+                                target_sz = int(max_allowed)
+                        except Exception:
+                            target_sz = int(max_allowed)
+                        logger.debug(
+                            "Transcode target: orig=%s max_allowed=%s target=%s",
+                            orig_sz,
+                            max_allowed,
+                            target_sz,
                         )
                         # ensure only one transcode runs at a time
                         try:
@@ -1782,7 +2260,7 @@ class WorkerPool:
                                     trans_path,
                                     tmpdir,
                                     meta=meta,
-                                    target_size=max_sz,
+                                    target_size=target_sz,
                                 )
                         except Exception:
                             ok = False
@@ -1795,6 +2273,11 @@ class WorkerPool:
                                 try:
                                     if isinstance(meta, dict):
                                         meta["compressed"] = True
+                                        # Update meta to reflect the new final size
+                                        try:
+                                            meta["final_size"] = final_size
+                                        except Exception:
+                                            pass
                                 except Exception:
                                     pass
                                 # We intentionally do not regenerate thumbnails here
@@ -2011,13 +2494,14 @@ class WorkerPool:
                         try:
                             if reaction_current == "eyes" and original_message_id:
                                 try:
+                                    # replace processing eyes reaction with a success trophy
                                     await telegram_api.set_message_reaction(
                                         self.token,
                                         chat_id,
                                         original_message_id,
-                                        "👀",
-                                        remove=True,
+                                        "🏆",
                                     )
+                                    reaction_current = "trophy"
                                 except Exception:
                                     pass
                         except Exception:
@@ -2098,17 +2582,6 @@ class WorkerPool:
                         ):
                             if original_message_id:
                                 try:
-                                    if reaction_current == "eyes":
-                                        try:
-                                            await telegram_api.set_message_reaction(
-                                                self.token,
-                                                chat_id,
-                                                original_message_id,
-                                                "👀",
-                                                remove=True,
-                                            )
-                                        except Exception:
-                                            pass
                                     try:
                                         await telegram_api.set_message_reaction(
                                             self.token,
@@ -2116,6 +2589,7 @@ class WorkerPool:
                                             original_message_id,
                                             "🍌",
                                         )
+                                        reaction_current = "banana"
                                     except Exception:
                                         try:
                                             await telegram_api.send_message(
@@ -2150,13 +2624,14 @@ class WorkerPool:
                         else:
                             if reaction_current == "eyes" and original_message_id:
                                 try:
+                                    # on generic error replace eyes with banana to indicate failure
                                     await telegram_api.set_message_reaction(
                                         self.token,
                                         chat_id,
                                         original_message_id,
-                                        "👀",
-                                        remove=True,
+                                        "🍌",
                                     )
+                                    reaction_current = "banana"
                                 except Exception:
                                     pass
                             try:
@@ -2193,13 +2668,14 @@ class WorkerPool:
                                     pass
                             if reaction_current == "eyes" and original_message_id:
                                 try:
+                                    # on generic error replace eyes with banana to indicate failure
                                     await telegram_api.set_message_reaction(
                                         self.token,
                                         chat_id,
                                         original_message_id,
-                                        "👀",
-                                        remove=True,
+                                        "🍌",
                                     )
+                                    reaction_current = "banana"
                                 except Exception:
                                     pass
                     except Exception:
@@ -2236,13 +2712,14 @@ class WorkerPool:
                 try:
                     if reaction_current == "eyes" and original_message_id:
                         try:
+                            # final cleanup: if still showing eyes, mark as failure
                             await telegram_api.set_message_reaction(
                                 self.token,
                                 chat_id,
                                 original_message_id,
-                                "👀",
-                                remove=True,
+                                "🍌",
                             )
+                            reaction_current = "banana"
                         except Exception:
                             pass
                 except Exception:

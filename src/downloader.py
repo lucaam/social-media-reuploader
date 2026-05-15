@@ -184,10 +184,13 @@ async def download(
         logger.debug("Could not stat downloaded file: %s", latest)
 
     # default meta
+    # Note: do not pre-populate final_size here — the definitive final
+    # size may change after optional transcoding. Keep original_size
+    # set to the downloaded file size and leave final_size unset.
     meta = {
         "compressed": False,
         "original_size": orig_size,
-        "final_size": orig_size,
+        "final_size": None,
         "has_video": None,
         "has_audio": None,
         "duration": None,
@@ -310,5 +313,5 @@ async def download(
     except Exception:
         pass
 
-    logger.debug("download(): returning latest=%s final_size=%s", latest, orig_size)
+    logger.debug("download(): returning latest=%s original_size=%s", latest, orig_size)
     return latest, meta
