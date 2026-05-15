@@ -4,9 +4,13 @@ from typing import Optional, Sequence
 
 import aiohttp
 
-from . import http_client, telegram_client
+from . import config, http_client, telegram_client
 
 logger = logging.getLogger(__name__)
+
+# per-chat reaction suppression when API reports reactions are invalid/unavailable
+_reaction_disabled_until: dict = {}
+_reaction_disable_seconds = getattr(config, "REACTION_DISABLE_SECONDS", 300)
 
 
 async def send_message(
@@ -283,6 +287,21 @@ async def set_message_reaction(
     constructs the correct payload for the Telegram Bot API.
     """
     try:
+        import time
+
+        # per-chat suppression: if we recently detected reactions are invalid
+        try:
+            now = time.time()
+            disabled_until = _reaction_disabled_until.get(chat_id)
+            if disabled_until and now < disabled_until:
+                logger.debug(
+                    "set_message_reaction suppressed for chat %s until %s",
+                    chat_id,
+                    disabled_until,
+                )
+                return {"ok": False, "error": "reactions_suppressed"}
+        except Exception:
+            pass
         # Normalize reaction payload into Telegram's ReactionType objects.
         # ReactionType for emoji should be: {"type": "emoji", "emoji": "🍌"}
         payload_reaction = []
@@ -310,147 +329,140 @@ async def set_message_reaction(
         else:
             payload_reaction = [{"type": "emoji", "emoji": str(reaction)}]
 
-        # prefer HTTP API when `remove` is requested (some aiogram versions don't accept remove)
-        if remove:
-            try:
-                session = await http_client.get_session()
-                url = f"https://api.telegram.org/bot{token}/setMessageReaction"
-                # API expects an Array of ReactionType objects; always send a list
-                payload = {
-                    "chat_id": chat_id,
-                    "message_id": int(message_id),
-                    "reaction": payload_reaction,
-                    "remove": True,
-                }
-                logger.debug("set_message_reaction HTTP payload: %s", payload)
-                async with session.post(url, json=payload) as resp:
-                    try:
-                        result = await resp.json()
-                    except Exception:
-                        result = {"ok": False, "status": resp.status}
-                logger.debug(
-                    "set_message_reaction HTTP response: %s for payload: %s",
-                    result,
-                    payload,
-                )
-                if not (isinstance(result, dict) and result.get("ok")):
-                    logger.warning(
-                        "set_message_reaction HTTP API returned non-ok: %s", result
-                    )
-                return result
-            except Exception:
-                # fallback to aiogram
-                try:
-                    bot = telegram_client.get_bot(token)
-                    # aiogram may expect a single ReactionType for simple emoji.
-                    reaction_for_aiogram = (
-                        payload_reaction[0]
-                        if len(payload_reaction) == 1
-                        else payload_reaction
-                    )
-                    try:
-                        # aiogram expects a list of ReactionType objects; always pass a list
-                        reaction_for_aiogram = payload_reaction
-                        res = await bot.set_message_reaction(
-                            chat_id=chat_id,
-                            message_id=int(message_id),
-                            reaction=reaction_for_aiogram,
-                            remove=True,
-                        )
-                    except TypeError as te:
-                        # aiogram version does not support remove kwarg
-                        logger.exception(
-                            "set_message_reaction(aiogram) does not support remove kwarg: %s",
-                            te,
-                        )
-                        return {"ok": False, "error": str(te)}
-                    logger.debug(
-                        "set_message_reaction(aiogram remove) returned: %s, payload: %s",
-                        res,
-                        reaction_for_aiogram,
-                    )
-                    if isinstance(res, dict) and not res.get("ok"):
-                        logger.warning(
-                            "set_message_reaction(aiogram) returned non-ok: %s", res
-                        )
-                    return res
-                except Exception as e:
-                    logger.exception("set_message_reaction fallback failed: %s", e)
-                    return {"ok": False, "error": str(e)}
-
-        # no remove: use aiogram Bot (cached)
+        # Use aiogram only; do not perform raw HTTP fallbacks. If aiogram raises
+        # or returns an error, record and suppress further attempts for this chat.
         bot = telegram_client.get_bot(token)
 
-        # aiogram expectations vary between versions. For a single emoji
-        # some versions expect a plain emoji string, while others accept
-        # structured ReactionType objects. Convert conservatively:
+        # aiogram expectations vary; convert payload conservatively for simple emoji
         def _to_aiogram_reaction(payload):
-            if not payload:
-                return payload
-            if isinstance(payload, list) and len(payload) == 1:
-                single = payload[0]
-                if isinstance(single, dict):
-                    if single.get("type") == "emoji" and isinstance(
-                        single.get("emoji"), str
-                    ):
-                        return single["emoji"]
-                    return single
-                return single
-            if isinstance(payload, list):
-                # If all entries are simple emoji dicts, convert to list of emoji strings
-                emoji_list = []
+            """Normalize reaction payload to a list acceptable by aiogram.
+
+            Always return a list. Elements can be emoji strings or ReactionType
+            dicts (with a 'type' field). This avoids passing a bare string which
+            some aiogram versions reject with a pydantic validation error.
+            """
+            out = []
+            if payload is None:
+                return out
+            # If single string, wrap into list
+            if isinstance(payload, str):
+                return [payload]
+            # If a dict, ensure it has a type and wrap
+            if isinstance(payload, dict):
+                if "type" not in payload and "emoji" in payload:
+                    payload = {"type": "emoji", "emoji": payload.get("emoji")}
+                return [payload]
+            # If iterable/list-like, normalize each element
+            if isinstance(payload, (list, tuple)):
                 for p in payload:
-                    if (
-                        isinstance(p, dict)
-                        and p.get("type") == "emoji"
-                        and isinstance(p.get("emoji"), str)
-                    ):
-                        emoji_list.append(p.get("emoji"))
+                    if isinstance(p, str):
+                        out.append(p)
+                    elif isinstance(p, dict):
+                        if "type" not in p and "emoji" in p:
+                            out.append({"type": "emoji", "emoji": p.get("emoji")})
+                        else:
+                            out.append(p)
                     else:
-                        return payload
-                return emoji_list
-            return payload
+                        out.append(str(p))
+                return out
+            # Fallback: stringify and wrap
+            return [str(payload)]
 
         reaction_for_aiogram = _to_aiogram_reaction(payload_reaction)
         logger.debug("set_message_reaction payload (aiogram): %s", reaction_for_aiogram)
         try:
-            res = await bot.set_message_reaction(
-                chat_id=chat_id,
-                message_id=int(message_id),
-                reaction=reaction_for_aiogram,
-            )
-        except Exception as e:
-            # If aiogram/Telegram rejects the supplied form, try the raw HTTP API
-            logger.debug(
-                "aiogram set_message_reaction failed (%s), trying HTTP fallback", e
-            )
-            session = await http_client.get_session()
-            url = f"https://api.telegram.org/bot{token}/setMessageReaction"
-            payload = {
-                "chat_id": chat_id,
-                "message_id": int(message_id),
-                "reaction": payload_reaction,
-                "remove": False,
-            }
-            logger.debug("set_message_reaction HTTP payload (fallback): %s", payload)
-            async with session.post(url, json=payload) as resp:
-                try:
-                    result = await resp.json()
-                except Exception:
-                    result = {"ok": False, "status": resp.status}
-            logger.debug(
-                "set_message_reaction HTTP fallback response: %s for payload: %s",
-                result,
-                payload,
-            )
-            if isinstance(result, dict) and not result.get("ok"):
-                logger.warning(
-                    "set_message_reaction HTTP fallback returned non-ok: %s", result
+            # Some aiogram versions accept a `remove` kwarg, others do not.
+            # Inspect the bound method signature at runtime and call accordingly
+            import inspect
+
+            method = getattr(bot, "set_message_reaction")
+            supports_remove = False
+            try:
+                sig = inspect.signature(method)
+                supports_remove = "remove" in sig.parameters
+            except Exception:
+                supports_remove = False
+
+            if supports_remove:
+                # Preferred: call with explicit remove kwarg
+                res = await method(
+                    chat_id=chat_id,
+                    message_id=int(message_id),
+                    reaction=reaction_for_aiogram,
+                    remove=remove,
                 )
-            return result
-        logger.debug("set_message_reaction(aiogram) response: %s", res)
-        if isinstance(res, dict) and not res.get("ok"):
-            logger.warning("set_message_reaction(aiogram) returned non-ok: %s", res)
+            else:
+                # Method does not accept `remove`. Use alternative aiogram-only
+                # approaches: for removal attempt to set an empty reaction list,
+                # otherwise call the method with the reaction list.
+                if remove:
+                    try:
+                        res = await method(
+                            chat_id=chat_id,
+                            message_id=int(message_id),
+                            reaction=[],
+                        )
+                    except TypeError:
+                        # As a last resort, try delete_message_reaction()
+                        try:
+                            res = await bot.delete_message_reaction(
+                                chat_id=chat_id, message_id=int(message_id)
+                            )
+                        except Exception:
+                            raise
+                else:
+                    res = await method(
+                        chat_id=chat_id,
+                        message_id=int(message_id),
+                        reaction=reaction_for_aiogram,
+                    )
+        except Exception as e:
+            # Log and disable reactions for this chat for a while to avoid spam
+            logger.exception("aiogram set_message_reaction failed: %s", e)
+            try:
+                errtxt = str(e)
+                if errtxt:
+                    if (
+                        "REACTION_INVALID" in errtxt.upper()
+                        or "invalid reaction" in errtxt.lower()
+                        or "bad request" in errtxt.lower()
+                    ):
+                        import time
+
+                        _reaction_disabled_until[chat_id] = time.time() + int(
+                            _reaction_disable_seconds or 300
+                        )
+                        logger.info(
+                            "Disabling reactions for chat %s for %s seconds due to aiogram error: %s",
+                            chat_id,
+                            _reaction_disable_seconds,
+                            errtxt,
+                        )
+            except Exception:
+                pass
+            return {"ok": False, "error": str(e)}
+
+        # If aiogram returned a dict-like error payload, inspect for invalid reaction
+        try:
+            if isinstance(res, dict) and not res.get("ok"):
+                try:
+                    desc = res.get("description") or ""
+                    if isinstance(desc, str) and "REACTION_INVALID" in desc.upper():
+                        import time
+
+                        _reaction_disabled_until[chat_id] = time.time() + int(
+                            _reaction_disable_seconds or 300
+                        )
+                        logger.info(
+                            "Disabling reactions for chat %s for %s seconds due to REACTION_INVALID (aiogram response)",
+                            chat_id,
+                            _reaction_disable_seconds,
+                        )
+                except Exception:
+                    pass
+                logger.warning("set_message_reaction(aiogram) returned non-ok: %s", res)
+        except Exception:
+            pass
         return res
     except Exception as e:
         logger.exception("set_message_reaction failed: %s", e)

@@ -39,8 +39,35 @@ class WorkerPool:
         self._transcode_lock: asyncio.Lock = asyncio.Lock()
         # per-chat timestamps for rate limiting (chat_id -> [ts, ...])
         self._chat_timestamps: dict = {}
+        # in-memory inflight enqueues to avoid race duplicates before DB write
+        self._inflight_urls: set = set()
         # last time we warned a chat about rate limiting (chat_id -> ts)
         self._last_rate_warning: dict = {}
+        # last time we warned a chat about duplicate submissions
+        self._last_duplicate_warning: dict = {}
+        # last time a chat was actively rate-limited (chat_id -> ts)
+        self._last_rate_limited: dict = {}
+        # next allowed timestamp per chat when rate-limited (chat_id -> unix_ts)
+        self._last_rate_limited_next: dict = {}
+        # default rate limits: (count, window_seconds)
+        # stricter defaults: avoid bursts and long-running saturation
+        self._rate_limits = [
+            (1, 10),
+            (3, 60),
+            (5, 3600),
+            (20, 30 * 24 * 3600),
+        ]
+        # notification throttles (seconds) read from config so operators can tune
+        self._notify_rate_throttle = getattr(config, "NOTIFY_RATE_THROTTLE_SECONDS", 60)
+        self._notify_duplicate_throttle = getattr(
+            config, "NOTIFY_DUPLICATE_THROTTLE_SECONDS", 600
+        )
+        # per-chat pending cap: queued + running tasks limit (protects worker saturation)
+        self._max_pending_per_chat = getattr(config, "MAX_PENDING_PER_CHAT", 1)
+        # dedupe window in seconds for same chat+url (default 90 minutes)
+        self._dedupe_window_seconds = getattr(
+            config, "DUPLICATE_WINDOW_SECONDS", 90 * 60
+        )
         # start dispatcher task if event loop is running
         try:
             loop = asyncio.get_running_loop()
@@ -67,21 +94,380 @@ class WorkerPool:
         """Schedule processing of a link. Returns True if scheduled."""
         if self._closing:
             return False
+        now = time.time()
+        # quick in-process dedupe to avoid racing DB writes from concurrent handlers
+        key = (chat_id, url)
+        already_inflight = False
         try:
+            if key in self._inflight_urls:
+                already_inflight = True
+            else:
+                self._inflight_urls.add(key)
+        except Exception:
+            already_inflight = False
+
+        if already_inflight:
+            # Persist a small marker so operators can see duplicate attempts
+            try:
+                rid = db.add_request(
+                    chat_id,
+                    url,
+                    status="duplicate",
+                    description=description,
+                    original_message_id=original_message_id,
+                )
+                try:
+                    db.add_request_event(
+                        rid,
+                        "duplicate",
+                        details=("duplicate (inflight) of recent enqueue for same url"),
+                    )
+                except Exception:
+                    pass
+            except Exception:
+                pass
+            try:
+                last_dup = self._last_duplicate_warning.get(chat_id)
+                if not last_dup or (now - last_dup) > int(
+                    self._notify_duplicate_throttle or 600
+                ):
+                    try:
+                        asyncio.create_task(
+                            self._notify_duplicate(
+                                chat_id,
+                                original_message_id,
+                                int(self._dedupe_window_seconds),
+                            )
+                        )
+                    except Exception:
+                        pass
+                    try:
+                        self._last_duplicate_warning[chat_id] = now
+                    except Exception:
+                        pass
+            except Exception:
+                pass
+            return False
+
+        try:
+            # 1) Duplicate suppression: do not download the same URL from the
+            # same chat within the configured dedupe window (default 90m).
+            try:
+                recent = db.find_recent_request_by_chat_url(
+                    chat_id, url, since_seconds=self._dedupe_window_seconds
+                )
+                if recent:
+                    # Persist a small marker so operators can see duplicate attempts
+                    try:
+                        rid = db.add_request(
+                            chat_id,
+                            url,
+                            status="duplicate",
+                            description=description,
+                            original_message_id=original_message_id,
+                        )
+                        try:
+                            db.add_request_event(
+                                rid,
+                                "duplicate",
+                                details=(
+                                    f"duplicate of request {recent[0]} within {int(self._dedupe_window_seconds)}s"
+                                ),
+                            )
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
+                    # compute remaining seconds until dedupe window expires
+                    try:
+                        from datetime import datetime
+
+                        created_at = None
+                        try:
+                            created_iso = recent[2]
+                            if created_iso:
+                                created_at = datetime.fromisoformat(created_iso)
+                        except Exception:
+                            created_at = None
+                        remaining = int(self._dedupe_window_seconds)
+                        if created_at is not None:
+                            try:
+                                now_dt = datetime.utcnow()
+                                elapsed = (now_dt - created_at).total_seconds()
+                                remaining = int(
+                                    max(
+                                        0,
+                                        int(self._dedupe_window_seconds) - int(elapsed),
+                                    )
+                                )
+                            except Exception:
+                                remaining = int(self._dedupe_window_seconds)
+                    except Exception:
+                        remaining = int(self._dedupe_window_seconds)
+
+                    # notify user about duplicate only if not recently warned (long throttle)
+                    try:
+                        last_dup = self._last_duplicate_warning.get(chat_id)
+                        if not last_dup or (now - last_dup) > int(
+                            self._notify_duplicate_throttle or 600
+                        ):
+                            try:
+                                asyncio.create_task(
+                                    self._notify_duplicate(
+                                        chat_id, original_message_id, remaining
+                                    )
+                                )
+                            except Exception:
+                                pass
+                            try:
+                                self._last_duplicate_warning[chat_id] = now
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    # ensure inflight marker removed before returning
+                    try:
+                        self._inflight_urls.discard(key)
+                    except Exception:
+                        pass
+                    return False
+            except Exception:
+                # if DB check fails, continue to next checks
+                pass
+
+            # ensure timestamp list exists and prune long-ago entries
+            ts = self._chat_timestamps.setdefault(chat_id, [])
+            try:
+                cutoff = now - (30 * 24 * 3600)
+                self._chat_timestamps[chat_id] = [t for t in ts if t >= cutoff]
+                ts = self._chat_timestamps[chat_id]
+            except Exception:
+                ts = ts
+
+            # 2) per-chat pending cap: count queued + running tasks for this chat
+            try:
+                queued_raw = list(getattr(self._queue, "_queue", []))
+                queued_count = sum(
+                    1 for it in queued_raw if (it or {}).get("chat_id") == chat_id
+                )
+            except Exception:
+                queued_count = 0
+            try:
+                running_count = 0
+                for t in list(getattr(self, "_tasks", set()) or set()):
+                    try:
+                        if getattr(t, "done", lambda: True)():
+                            continue
+                    except Exception:
+                        pass
+                    try:
+                        itm = getattr(t, "_item", None)
+                        if itm and itm.get("chat_id") == chat_id:
+                            running_count += 1
+                    except Exception:
+                        pass
+            except Exception:
+                running_count = 0
+
+            if (queued_count + running_count) >= int(self._max_pending_per_chat or 2):
+                # block and persist a rate_limited marker
+                try:
+                    rid = db.add_request(
+                        chat_id,
+                        url,
+                        status="rate_limited",
+                        description=description,
+                        original_message_id=original_message_id,
+                    )
+                    try:
+                        db.add_request_event(
+                            rid,
+                            "rate_limited",
+                            details=(
+                                f"pending cap reached: queued={queued_count} running={running_count} limit={self._max_pending_per_chat}"
+                            ),
+                        )
+                    except Exception:
+                        pass
+                except Exception:
+                    rid = None
+                try:
+                    self._last_rate_limited[chat_id] = now
+                    # temporary block for pending-cap cases (short backoff of 2 minutes)
+                    self._last_rate_limited_next[chat_id] = now + 120
+                except Exception:
+                    pass
+                try:
+                    last_warn = self._last_rate_warning.get(chat_id)
+                    if not last_warn or (now - last_warn) > int(
+                        self._notify_rate_throttle or 60
+                    ):
+                        try:
+                            asyncio.create_task(
+                                self._notify_rate_limit(
+                                    chat_id, original_message_id, 120
+                                )
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            self._last_rate_warning[chat_id] = now
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+                try:
+                    self._inflight_urls.discard(key)
+                except Exception:
+                    pass
+                # schedule a delayed requeue so this request is retried after the
+                # short backoff window. Persisted DB row exists (status='rate_limited'),
+                # so ensure we include the request_id in the queued item so the
+                # delayed requeue routine can update the DB status to 'queued'.
+                try:
+                    item = {
+                        "chat_id": chat_id,
+                        "url": url,
+                        "description": description,
+                        "original_message_id": original_message_id,
+                        "chat_type": chat_type,
+                        "enqueued_at": now,
+                    }
+                    if rid:
+                        try:
+                            item["request_id"] = rid
+                        except Exception:
+                            pass
+                    try:
+                        asyncio.create_task(self._delayed_requeue(item, 120))
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                return False
+
+            # Check rate limits at enqueue time and BLOCK if exceeded.
+            exceeded = False
+            delay_needed = 0
+            try:
+                for limit, window in self._rate_limits:
+                    cnt = sum(1 for t in ts if t >= now - window)
+                    # if current count already meets/exceeds limit, block this new one
+                    if cnt >= limit:
+                        oldest = min(t for t in ts if t >= now - window)
+                        d = (oldest + window) - now
+                        if d > delay_needed:
+                            delay_needed = d
+                        exceeded = True
+            except Exception:
+                exceeded = False
+
+            if exceeded:
+                # Persist a "rate_limited" request record and log an event
+                try:
+                    rid = db.add_request(
+                        chat_id,
+                        url,
+                        status="rate_limited",
+                        description=description,
+                        original_message_id=original_message_id,
+                    )
+                    try:
+                        db.add_request_event(
+                            rid,
+                            "rate_limited",
+                            details=f"limit exceeded; next_in={int(delay_needed)}s",
+                        )
+                    except Exception:
+                        pass
+                except Exception:
+                    rid = None
+
+                # record last-limited timestamp and optionally notify chat (best-effort)
+                try:
+                    self._last_rate_limited[chat_id] = now
+                    # record the next allowed time based on computed delay_needed
+                    try:
+                        self._last_rate_limited_next[chat_id] = now + (
+                            delay_needed if delay_needed and delay_needed > 0 else 120
+                        )
+                    except Exception:
+                        self._last_rate_limited_next[chat_id] = now + 120
+                except Exception:
+                    pass
+
+                # throttle frequent warnings according to configured throttle
+                try:
+                    last_warn = self._last_rate_warning.get(chat_id)
+                    if not last_warn or (now - last_warn) > int(
+                        self._notify_rate_throttle or 60
+                    ):
+                        # schedule async notification
+                        try:
+                            asyncio.create_task(
+                                self._notify_rate_limit(
+                                    chat_id, original_message_id, delay_needed
+                                )
+                            )
+                        except Exception:
+                            pass
+                        try:
+                            self._last_rate_warning[chat_id] = now
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+
+                try:
+                    self._inflight_urls.discard(key)
+                except Exception:
+                    pass
+                # schedule a delayed requeue to retry the request after
+                # the computed delay_needed so the item is not lost.
+                try:
+                    item = {
+                        "chat_id": chat_id,
+                        "url": url,
+                        "description": description,
+                        "original_message_id": original_message_id,
+                        "chat_type": chat_type,
+                        "enqueued_at": now,
+                    }
+                    if rid:
+                        try:
+                            item["request_id"] = rid
+                        except Exception:
+                            pass
+                    try:
+                        d = (
+                            int(delay_needed)
+                            if delay_needed and delay_needed > 0
+                            else 120
+                        )
+                    except Exception:
+                        d = 120
+                    try:
+                        asyncio.create_task(self._delayed_requeue(item, d))
+                    except Exception:
+                        pass
+                except Exception:
+                    pass
+                return False
+
+            # not exceeded: record this enqueue timestamp and persist queued request
             item = {
                 "chat_id": chat_id,
                 "url": url,
                 "description": description,
                 "original_message_id": original_message_id,
                 "chat_type": chat_type,
-                "enqueued_at": time.time(),
+                "enqueued_at": now,
             }
-            # record enqueue timestamp for rate-limiting at submission time
             try:
-                ts = self._chat_timestamps.setdefault(chat_id, [])
-                ts.append(item["enqueued_at"])
+                ts.append(now)
             except Exception:
                 pass
+
             # persist a queued request in DB so external GUIs/processes can
             # observe pending items even when worker and GUI run in different
             # processes. db.add_request will deduplicate by original_message_id
@@ -101,9 +487,25 @@ class WorkerPool:
             except Exception:
                 # non-fatal: continue even if DB write fails
                 pass
-            self._queue.put_nowait(item)
+            try:
+                self._queue.put_nowait(item)
+            except Exception:
+                try:
+                    self._inflight_urls.discard(key)
+                except Exception:
+                    pass
+                return False
+            # queued successfully: remove inflight marker so DB-backed dedupe works
+            try:
+                self._inflight_urls.discard(key)
+            except Exception:
+                pass
             return True
         except Exception:
+            try:
+                self._inflight_urls.discard(key)
+            except Exception:
+                pass
             return False
 
     async def shutdown(self, timeout: int | None = None):
@@ -151,7 +553,82 @@ class WorkerPool:
             return
         try:
             if not self._closing:
+                # If this item references a persisted request row, update its
+                # status to 'queued' so the dispatcher does not skip it.
+                try:
+                    rid = item.get("request_id") if isinstance(item, dict) else None
+                except Exception:
+                    rid = None
+                if rid:
+                    try:
+                        db.update_request_status(rid, "queued")
+                        try:
+                            db.add_request_event(
+                                rid,
+                                "requeued",
+                                details=f"requeued after {int(delay) if delay else 0}s",
+                            )
+                        except Exception:
+                            pass
+                    except Exception:
+                        pass
                 await self._queue.put(item)
+        except Exception:
+            pass
+
+    async def _notify_rate_limit(
+        self, chat_id: int, original_message_id: int | None, delay: float
+    ):
+        try:
+            # Format a human-friendly message. Avoid showing 0 seconds.
+            try:
+                d = int(delay) if delay is not None else None
+            except Exception:
+                d = None
+            try:
+                if d is None or d <= 0:
+                    msg = "Sei temporaneamente limitato: troppi link inviati. Riprova tra qualche minuto."
+                elif d < 60:
+                    msg = f"Sei temporaneamente limitato: riprova tra {d} secondi."
+                else:
+                    mins = int((d + 59) // 60)
+                    msg = f"Sei temporaneamente limitato: riprova tra circa {mins} minuto{'' if mins==1 else 'i'}."
+            except Exception:
+                msg = "Sei temporaneamente limitato: riprova più tardi."
+            try:
+                await telegram_api.send_message(
+                    self.token, chat_id, msg, reply_to_message_id=original_message_id
+                )
+            except Exception:
+                logger.debug("Could not send rate limit warning to chat %s", chat_id)
+        except Exception:
+            pass
+
+    async def _notify_duplicate(
+        self,
+        chat_id: int,
+        original_message_id: int | None,
+        delay_seconds: int | None = None,
+    ):
+        try:
+            # Friendly Italian message describing remaining wait time
+            try:
+                if delay_seconds and delay_seconds > 0:
+                    if delay_seconds >= 60:
+                        mins = int((delay_seconds + 59) // 60)
+                        msg = f"Hai già inviato questo link di recente. Riprova tra circa {mins} minuto{'' if mins==1 else 'i'}."
+                    else:
+                        msg = f"Hai già inviato questo link di recente; riprova tra {int(delay_seconds)} secondi."
+                else:
+                    msg = "Hai già inviato questo link di recente; riprova più tardi."
+            except Exception:
+                msg = "Hai già inviato questo link di recente; riprova più tardi."
+            try:
+                await telegram_api.send_message(
+                    self.token, chat_id, msg, reply_to_message_id=original_message_id
+                )
+            except Exception:
+                logger.debug("Could not send duplicate notice to chat %s", chat_id)
         except Exception:
             pass
 
@@ -159,13 +636,8 @@ class WorkerPool:
         """Background dispatcher that pulls items from the queue, enforces per-chat rate limits
         and starts worker tasks honoring the semaphore (max concurrent workers).
         """
-        # rate limits (counts) -> (limit, window_seconds)
-        limits = [
-            (5, 10),
-            (15, 60),
-            (50, 24 * 3600),
-            (100, 30 * 24 * 3600),
-        ]
+        # use configured rate limits from the instance (set in __init__)
+        limits = list(getattr(self, "_rate_limits", []))
         while not self._closing:
             try:
                 item = await self._queue.get()
@@ -173,8 +645,49 @@ class WorkerPool:
                 break
             if item is None:
                 continue
+            # If this item was previously persisted as rate_limited/duplicate,
+            # skip processing to avoid resurrecting blocked attempts.
+            try:
+                rid = item.get("request_id") if isinstance(item, dict) else None
+                if rid:
+                    try:
+                        conn = db._connect()
+                        cur = conn.cursor()
+                        cur.execute("SELECT status FROM requests WHERE id = ?", (rid,))
+                        row = cur.fetchone()
+                        conn.close()
+                        if row and row[0] in ("rate_limited", "duplicate"):
+                            # skip and do not requeue
+                            continue
+                    except Exception:
+                        pass
+            except Exception:
+                pass
             chat_id = item.get("chat_id")
             now = time.time()
+
+            # If this chat has an active rate-limit window, skip processing
+            try:
+                next_allowed = self._last_rate_limited_next.get(chat_id)
+                if next_allowed and now < float(next_allowed):
+                    # mark persisted request (if present) as rate_limited and skip
+                    try:
+                        rid = item.get("request_id") if isinstance(item, dict) else None
+                        if rid:
+                            try:
+                                db.update_request_status(rid, "rate_limited")
+                                db.add_request_event(
+                                    rid,
+                                    "rate_limited",
+                                    details="skipped due to active rate-limit window",
+                                )
+                            except Exception:
+                                pass
+                    except Exception:
+                        pass
+                    continue
+            except Exception:
+                pass
 
             # prune old timestamps for chat
             try:
@@ -202,7 +715,9 @@ class WorkerPool:
                 # if exceeded, warn (once per minute) and requeue after delay
                 if exceeded and delay_needed > 0:
                     last_warn = self._last_rate_warning.get(chat_id)
-                    if not last_warn or (now - last_warn) > 60:
+                    if not last_warn or (now - last_warn) > int(
+                        self._notify_rate_throttle or 60
+                    ):
                         try:
                             # best-effort notify chat about throttling
                             msg = (
