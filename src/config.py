@@ -70,12 +70,16 @@ MAX_PENDING_PER_CHAT = int(os.getenv("MAX_PENDING_PER_CHAT", "1"))
 
 # Duplicate detection window (seconds) for same chat+url. Default: 90 minutes.
 DUUPLICATE_DEFAULT = 90 * 60
-DUPLICATE_WINDOW_SECONDS = int(os.getenv("DUPLICATE_WINDOW_SECONDS", str(DUUPLICATE_DEFAULT)))
+DUPLICATE_WINDOW_SECONDS = int(
+    os.getenv("DUPLICATE_WINDOW_SECONDS", str(DUUPLICATE_DEFAULT))
+)
 
 # Throttle durations for notifications sent to users (seconds).
 # Default: rate-limit warnings every 60s, duplicate warnings less frequent (10min).
 NOTIFY_RATE_THROTTLE_SECONDS = int(os.getenv("NOTIFY_RATE_THROTTLE_SECONDS", "60"))
-NOTIFY_DUPLICATE_THROTTLE_SECONDS = int(os.getenv("NOTIFY_DUPLICATE_THROTTLE_SECONDS", str(10 * 60)))
+NOTIFY_DUPLICATE_THROTTLE_SECONDS = int(
+    os.getenv("NOTIFY_DUPLICATE_THROTTLE_SECONDS", str(10 * 60))
+)
 
 # Whether the worker should rehydrate persisted queued requests on startup.
 # If false, queued requests are marked as 'aborted' at startup instead of
@@ -101,7 +105,9 @@ WORKER_PERIODIC_REHYDRATE_SECONDS = float(
 # When true, attempts to trigger an immediate rehydrate after an admin
 # 'unlimit' operation will be made (only effective when GUI and worker
 # run in the same process). Default: true.
-WORKER_REHYDRATE_ON_UNLIMIT = os.getenv("WORKER_REHYDRATE_ON_UNLIMIT", "true").lower() in (
+WORKER_REHYDRATE_ON_UNLIMIT = os.getenv(
+    "WORKER_REHYDRATE_ON_UNLIMIT", "true"
+).lower() in (
     "1",
     "true",
     "yes",
