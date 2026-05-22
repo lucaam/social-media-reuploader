@@ -4,6 +4,7 @@ import json
 import logging
 import os
 import shutil
+import subprocess
 import sys
 from asyncio.subprocess import PIPE
 from typing import Optional, Tuple
@@ -38,7 +39,48 @@ def _select_latest_media_file(dest_dir: str):
     )
     if not candidates:
         return None
-    # Prefer the largest file among candidates (usually the combined video),
+    # If ffprobe is available, prefer files that contain a video stream.
+    ffprobe_bin = shutil.which("ffprobe")
+    if ffprobe_bin:
+        video_candidates = []
+        for f in candidates:
+            try:
+                p = subprocess.run(
+                    [
+                        ffprobe_bin,
+                        "-v",
+                        "error",
+                        "-select_streams",
+                        "v",
+                        "-show_entries",
+                        "stream=codec_type",
+                        "-print_format",
+                        "json",
+                        f,
+                    ],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if p.returncode == 0 and p.stdout:
+                    try:
+                        info = json.loads(p.stdout)
+                        if info.get("streams"):
+                            video_candidates.append(f)
+                    except Exception:
+                        # parse failure: ignore this file for video detection
+                        pass
+            except Exception:
+                # ffprobe failed on this file: ignore and continue
+                pass
+
+        if video_candidates:
+            try:
+                return max(video_candidates, key=os.path.getsize)
+            except Exception:
+                return max(video_candidates, key=os.path.getmtime)
+
+    # Fallback: prefer the largest file among candidates (usually the combined video),
     # which avoids accidentally picking an audio-only artifact (e.g. .m4a)
     # when yt-dlp left multiple outputs. Fall back to mtime if size fails.
     try:
