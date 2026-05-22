@@ -169,6 +169,9 @@ gui:
     oauthServerMetadataUrl: ""
     # Comma-separated group names that should be treated as admin
     oauthAdminGroups: ""
+  # Additional environment variables for the GUI container.
+  # Use `gui.env.OAUTH_ADMIN_GROUPS` to set admin groups without creating a Secret.
+  env: {}
 
 # Database / persistence for GUI
 db:
