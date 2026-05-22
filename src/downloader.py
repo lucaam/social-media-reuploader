@@ -38,7 +38,13 @@ def _select_latest_media_file(dest_dir: str):
     )
     if not candidates:
         return None
-    return max(candidates, key=os.path.getmtime)
+    # Prefer the largest file among candidates (usually the combined video),
+    # which avoids accidentally picking an audio-only artifact (e.g. .m4a)
+    # when yt-dlp left multiple outputs. Fall back to mtime if size fails.
+    try:
+        return max(candidates, key=os.path.getsize)
+    except Exception:
+        return max(candidates, key=os.path.getmtime)
 
 
 async def download(
