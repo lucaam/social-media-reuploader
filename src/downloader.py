@@ -18,25 +18,46 @@ def _select_latest_media_file(dest_dir: str):
     files = glob.glob(os.path.join(dest_dir, "*"))
     if not files:
         return None
-    media_exts = {
+    # Classify by common video vs audio extensions. If any video-extension
+    # files are present, only consider those — this ensures we don't pick
+    # audio-only artifacts (e.g. .m4a/.opus) when a video file exists.
+    video_exts = {
         ".mp4",
-        ".m4a",
         ".webm",
         ".mkv",
-        ".mp3",
-        ".aac",
-        ".ogg",
-        ".opus",
         ".mov",
         ".flv",
         ".ts",
+        ".avi",
+        ".m4v",
+        ".3gp",
+        ".3g2",
+        ".m2ts",
+        ".mts",
+        ".f4v",
+        ".mpeg",
+        ".mpg",
+        ".wmv",
     }
-    media_files = [f for f in files if os.path.splitext(f)[1].lower() in media_exts]
-    candidates = (
-        media_files
-        if media_files
-        else [f for f in files if not f.endswith(".json") and not f.endswith(".part")]
-    )
+    audio_exts = {".m4a", ".mp3", ".aac", ".ogg", ".opus"}
+
+    def _ext(p):
+        return os.path.splitext(p)[1].lower()
+
+    video_files = [f for f in files if _ext(f) in video_exts]
+    audio_files = [f for f in files if _ext(f) in audio_exts]
+    media_files = video_files + audio_files
+
+    if video_files:
+        candidates = video_files
+    elif media_files:
+        # no video-extension files: consider audio/video union
+        candidates = media_files
+    else:
+        # no recognized media extensions at all: fall back to any non-json/part
+        candidates = [
+            f for f in files if not f.endswith(".json") and not f.endswith(".part")
+        ]
     if not candidates:
         return None
     # If ffprobe is available, prefer files that contain a video stream.
