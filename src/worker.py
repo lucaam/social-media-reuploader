@@ -10,6 +10,7 @@ from asyncio.subprocess import PIPE
 from typing import Optional
 
 from . import config, db, downloader, metrics, telegram_api
+from .link_utils import is_supported
 
 # module-level pointer to the active WorkerPool instance (if any).
 # WorkerPool.__init__ will assign itself to this so other modules (GUI)
@@ -163,6 +164,28 @@ class WorkerPool:
     ) -> bool:
         """Schedule processing of a link. Returns True if scheduled."""
         if self._closing:
+            return False
+        # Only allow supported social media URLs to be enqueued. Reject
+        # generic links early to avoid unnecessary processing and error
+        # reactions (banana) from the worker.
+        try:
+            if not url or not is_supported(url):
+                try:
+                    # persist an unsupported marker for operator visibility
+                    db.add_request(
+                        chat_id,
+                        url,
+                        status="unsupported",
+                        description=description,
+                        original_message_id=original_message_id,
+                    )
+                except Exception:
+                    pass
+                logger.info("Rejecting unsupported url enqueue: %s", url)
+                return False
+        except Exception:
+            # if link check fails for any reason, be conservative and reject
+            logger.debug("Link support check failed; rejecting enqueue for %s", url)
             return False
         now = time.time()
         # quick in-process dedupe to avoid racing DB writes from concurrent handlers
