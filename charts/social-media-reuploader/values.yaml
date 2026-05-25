@@ -169,6 +169,13 @@ gui:
     oauthServerMetadataUrl: ""
     # Comma-separated group names that should be treated as admin
     oauthAdminGroups: ""
+  # Additional environment variables for the GUI container.
+  # Use `gui.env.OAUTH_ADMIN_GROUPS` to set admin groups without creating a Secret.
+  # WARNING: `gui.env` is rendered verbatim into the Pod spec. Do NOT place
+  # sensitive values (secrets, OAuth client secrets, BOT_TOKEN, SECRET_KEY)
+  # here — use `gui.secrets` or a Kubernetes Secret instead to avoid leaking
+  # credentials in plaintext.
+  env: {}
 
 # Database / persistence for GUI
 db:

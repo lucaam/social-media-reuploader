@@ -10,6 +10,7 @@ from asyncio.subprocess import PIPE
 from typing import Optional
 
 from . import config, db, downloader, metrics, telegram_api
+from .link_utils import is_supported
 
 # module-level pointer to the active WorkerPool instance (if any).
 # WorkerPool.__init__ will assign itself to this so other modules (GUI)
@@ -163,6 +164,19 @@ class WorkerPool:
     ) -> bool:
         """Schedule processing of a link. Returns True if scheduled."""
         if self._closing:
+            return False
+        # Only allow supported social media URLs to be enqueued. Reject
+        # generic links early to avoid unnecessary processing and error
+        # reactions (banana) from the worker.
+        try:
+            if not url or not is_supported(url):
+                # Do not persist unsupported links to avoid DB spam; simply
+                # reject early and log for operator visibility.
+                logger.info("Rejecting unsupported url enqueue: %s", url)
+                return False
+        except Exception:
+            # if link check fails for any reason, be conservative and reject
+            logger.debug("Link support check failed; rejecting enqueue for %s", url)
             return False
         now = time.time()
         # quick in-process dedupe to avoid racing DB writes from concurrent handlers
@@ -1403,6 +1417,8 @@ class WorkerPool:
 
             full_err = bytearray()
             buffer = bytearray()
+            # track last reported progress bucket (0..6 for 0-100% in 15% steps)
+            last_reported_bucket = -1
 
             # try to obtain duration from meta for progress percentage
             duration_seconds = None
@@ -1420,7 +1436,7 @@ class WorkerPool:
                 duration_seconds = None
 
             async def _reader():
-                nonlocal buffer, full_err
+                nonlocal buffer, full_err, last_reported_bucket
                 try:
                     while True:
                         chunk = await p.stderr.read(1024)
@@ -1474,11 +1490,23 @@ class WorkerPool:
                                                     * 100.0,
                                                 ),
                                             )
-                                            logger.info(
-                                                "ffmpeg progress: time=%s (%.1f%%)",
-                                                token,
-                                                pct,
-                                            )
+                                            # only log progress when we cross a new 15% bucket
+                                            try:
+                                                bucket = int(pct // 15)
+                                            except Exception:
+                                                bucket = -1
+                                            # skip the 0% bucket to avoid spamming on start;
+                                            # log when bucket increases (15%,30%,...100%)
+                                            if (
+                                                bucket >= 1
+                                                and bucket != last_reported_bucket
+                                            ):
+                                                logger.info(
+                                                    "ffmpeg progress: time=%s (%.1f%%)",
+                                                    token,
+                                                    pct,
+                                                )
+                                                last_reported_bucket = bucket
                                 except Exception:
                                     pass
                             # keep remainder after last_sep
@@ -1870,7 +1898,16 @@ class WorkerPool:
                     if not getattr(config, "SIMPLE_YTDLP_ONLY", False):
                         if not has_video:
                             lowurl = (url or "").lower()
-                            if "instagram.com" in lowurl or "reel" in lowurl:
+                            # If yt-dlp selected audio-only due to filesize or
+                            # site-specific defaults, try a redownload without
+                            # the filesize limit for known sites that commonly
+                            # return separate audio artifacts (Instagram, Facebook).
+                            if (
+                                "instagram.com" in lowurl
+                                or "reel" in lowurl
+                                or "facebook.com" in lowurl
+                                or "fb.watch" in lowurl
+                            ):
                                 logger.info(
                                     "No video stream detected; attempting redownload without size limit for %s",
                                     url,

@@ -13,32 +13,123 @@ from . import config
 logger = logging.getLogger(__name__)
 
 
-def _select_latest_media_file(dest_dir: str):
+async def _select_latest_media_file(dest_dir: str):
     files = glob.glob(os.path.join(dest_dir, "*"))
     if not files:
         return None
-    media_exts = {
+    # Classify by common video vs audio extensions. If any video-extension
+    # files are present, only consider those — this ensures we don't pick
+    # audio-only artifacts (e.g. .m4a/.opus) when a video file exists.
+    video_exts = {
         ".mp4",
-        ".m4a",
         ".webm",
         ".mkv",
-        ".mp3",
-        ".aac",
-        ".ogg",
-        ".opus",
         ".mov",
         ".flv",
         ".ts",
+        ".avi",
+        ".m4v",
+        ".3gp",
+        ".3g2",
+        ".m2ts",
+        ".mts",
+        ".f4v",
+        ".mpeg",
+        ".mpg",
+        ".wmv",
     }
-    media_files = [f for f in files if os.path.splitext(f)[1].lower() in media_exts]
-    candidates = (
-        media_files
-        if media_files
-        else [f for f in files if not f.endswith(".json") and not f.endswith(".part")]
-    )
+    audio_exts = {".m4a", ".mp3", ".aac", ".ogg", ".opus"}
+
+    def _ext(p):
+        return os.path.splitext(p)[1].lower()
+
+    video_files = [f for f in files if _ext(f) in video_exts]
+    audio_files = [f for f in files if _ext(f) in audio_exts]
+    media_files = video_files + audio_files
+
+    if video_files:
+        candidates = video_files
+    elif media_files:
+        # no video-extension files: consider audio/video union
+        candidates = media_files
+    else:
+        # no recognized media extensions at all: fall back to any non-json/part
+        candidates = [
+            f for f in files if not f.endswith(".json") and not f.endswith(".part")
+        ]
     if not candidates:
         return None
-    return max(candidates, key=os.path.getmtime)
+    # If ffprobe is available, prefer files that contain a video stream.
+    ffprobe_bin = shutil.which("ffprobe")
+    if ffprobe_bin:
+        video_candidates = []
+        for f in candidates:
+            try:
+                # run ffprobe asynchronously so we don't block the event loop
+                p = await asyncio.create_subprocess_exec(
+                    ffprobe_bin,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v",
+                    "-show_entries",
+                    "stream=codec_type,disposition",
+                    "-print_format",
+                    "json",
+                    f,
+                    stdout=PIPE,
+                    stderr=PIPE,
+                )
+                try:
+                    outb, errb = await asyncio.wait_for(p.communicate(), timeout=5)
+                except asyncio.TimeoutError:
+                    try:
+                        p.kill()
+                    except Exception:
+                        pass
+                    try:
+                        await p.communicate()
+                    except Exception:
+                        pass
+                    continue
+                if p.returncode == 0 and outb:
+                    try:
+                        info = json.loads(outb.decode(errors="ignore"))
+                        streams = info.get("streams") or []
+                        # consider a file a video candidate if it has a video
+                        # stream which is not just an attached picture (attached_pic)
+                        for s in streams:
+                            if s.get("codec_type") == "video":
+                                disp = s.get("disposition") or {}
+                                try:
+                                    attached = int(disp.get("attached_pic") or 0)
+                                except Exception:
+                                    attached = 0
+                                if attached == 1:
+                                    # skip attached cover art streams
+                                    continue
+                                video_candidates.append(f)
+                                break
+                    except Exception:
+                        # parse failure: ignore this file for video detection
+                        pass
+            except Exception:
+                # ffprobe failed on this file: ignore and continue
+                pass
+
+        if video_candidates:
+            try:
+                return max(video_candidates, key=os.path.getsize)
+            except Exception:
+                return max(video_candidates, key=os.path.getmtime)
+
+    # Fallback: prefer the largest file among candidates (usually the combined video),
+    # which avoids accidentally picking an audio-only artifact (e.g. .m4a)
+    # when yt-dlp left multiple outputs. Fall back to mtime if size fails.
+    try:
+        return max(candidates, key=os.path.getsize)
+    except Exception:
+        return max(candidates, key=os.path.getmtime)
 
 
 async def download(
@@ -170,7 +261,7 @@ async def download(
         await _cleanup_procs()
         raise RuntimeError(f"yt-dlp failed: {err.strip()[:200]}")
 
-    latest = _select_latest_media_file(dest_dir)
+    latest = await _select_latest_media_file(dest_dir)
     if not latest:
         await _cleanup_procs()
         raise RuntimeError("no file downloaded")
@@ -183,14 +274,12 @@ async def download(
         orig_size = None
         logger.debug("Could not stat downloaded file: %s", latest)
 
-    # default meta
-    # Note: do not pre-populate final_size here — the definitive final
-    # size may change after optional transcoding. Keep original_size
-    # set to the downloaded file size and leave final_size unset.
+    # default meta — populate final_size with the best-known size (orig_size).
+    # This may be updated later if transcoding/compression changes the file size.
     meta = {
         "compressed": False,
         "original_size": orig_size,
-        "final_size": None,
+        "final_size": orig_size,
         "has_video": None,
         "has_audio": None,
         "duration": None,
@@ -257,7 +346,6 @@ async def download(
                     streams = info.get("streams", [])
                     for s in streams:
                         if s.get("codec_type") == "video":
-                            meta["has_video"] = True
                             meta["video_codec"] = s.get("codec_name")
                             meta["video_profile"] = s.get("profile")
                             meta["video_sample_aspect_ratio"] = (
@@ -289,8 +377,31 @@ async def download(
                             except Exception:
                                 meta["video_rotation"] = None
                         elif s.get("codec_type") == "audio":
-                            meta["has_audio"] = True
                             meta["audio_codec"] = s.get("codec_name")
+                    # Explicitly set has_video/has_audio based on ffprobe results
+                    try:
+                        # ignore attached cover art (attached_pic) when deciding
+                        # whether a file has a real video stream
+                        has_video = False
+                        has_audio = False
+                        for s in streams:
+                            ctype = s.get("codec_type")
+                            if ctype == "video":
+                                disp = s.get("disposition") or {}
+                                try:
+                                    attached = int(disp.get("attached_pic") or 0)
+                                except Exception:
+                                    attached = 0
+                                if attached == 1:
+                                    # skip attached picture streams
+                                    continue
+                                has_video = True
+                            elif ctype == "audio":
+                                has_audio = True
+                        meta["has_video"] = has_video
+                        meta["has_audio"] = has_audio
+                    except Exception:
+                        pass
                     # set format string if available
                     fmt_info = info.get("format", {}) or {}
                     ffmt = fmt_info.get("format_name") or ""

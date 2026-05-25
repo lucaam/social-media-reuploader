@@ -386,7 +386,10 @@ async def set_message_reaction(
                 except Exception as e:
                     # If setting empty list fails, try using DeleteMessageReaction method directly
                     try:
-                        from aiogram.methods.delete_message_reaction import DeleteMessageReaction
+                        from aiogram.methods.delete_message_reaction import (
+                            DeleteMessageReaction,
+                        )
+
                         delete_method = DeleteMessageReaction(
                             chat_id=chat_id,
                             message_id=int(message_id),
