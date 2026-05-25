@@ -4,7 +4,6 @@ import json
 import logging
 import os
 import shutil
-import subprocess
 import sys
 from asyncio.subprocess import PIPE
 from typing import Optional, Tuple
@@ -14,7 +13,7 @@ from . import config
 logger = logging.getLogger(__name__)
 
 
-def _select_latest_media_file(dest_dir: str):
+async def _select_latest_media_file(dest_dir: str):
     files = glob.glob(os.path.join(dest_dir, "*"))
     if not files:
         return None
@@ -66,28 +65,51 @@ def _select_latest_media_file(dest_dir: str):
         video_candidates = []
         for f in candidates:
             try:
-                p = subprocess.run(
-                    [
-                        ffprobe_bin,
-                        "-v",
-                        "error",
-                        "-select_streams",
-                        "v",
-                        "-show_entries",
-                        "stream=codec_type",
-                        "-print_format",
-                        "json",
-                        f,
-                    ],
-                    capture_output=True,
-                    text=True,
-                    timeout=5,
+                # run ffprobe asynchronously so we don't block the event loop
+                p = await asyncio.create_subprocess_exec(
+                    ffprobe_bin,
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v",
+                    "-show_entries",
+                    "stream=codec_type,disposition",
+                    "-print_format",
+                    "json",
+                    f,
+                    stdout=PIPE,
+                    stderr=PIPE,
                 )
-                if p.returncode == 0 and p.stdout:
+                try:
+                    outb, errb = await asyncio.wait_for(p.communicate(), timeout=5)
+                except asyncio.TimeoutError:
                     try:
-                        info = json.loads(p.stdout)
-                        if info.get("streams"):
-                            video_candidates.append(f)
+                        p.kill()
+                    except Exception:
+                        pass
+                    try:
+                        await p.communicate()
+                    except Exception:
+                        pass
+                    continue
+                if p.returncode == 0 and outb:
+                    try:
+                        info = json.loads(outb.decode(errors="ignore"))
+                        streams = info.get("streams") or []
+                        # consider a file a video candidate if it has a video
+                        # stream which is not just an attached picture (attached_pic)
+                        for s in streams:
+                            if s.get("codec_type") == "video":
+                                disp = s.get("disposition") or {}
+                                try:
+                                    attached = int(disp.get("attached_pic") or 0)
+                                except Exception:
+                                    attached = 0
+                                if attached == 1:
+                                    # skip attached cover art streams
+                                    continue
+                                video_candidates.append(f)
+                                break
                     except Exception:
                         # parse failure: ignore this file for video detection
                         pass
@@ -239,7 +261,7 @@ async def download(
         await _cleanup_procs()
         raise RuntimeError(f"yt-dlp failed: {err.strip()[:200]}")
 
-    latest = _select_latest_media_file(dest_dir)
+    latest = await _select_latest_media_file(dest_dir)
     if not latest:
         await _cleanup_procs()
         raise RuntimeError("no file downloaded")
@@ -358,12 +380,26 @@ async def download(
                             meta["audio_codec"] = s.get("codec_name")
                     # Explicitly set has_video/has_audio based on ffprobe results
                     try:
-                        meta["has_video"] = any(
-                            (s.get("codec_type") == "video") for s in streams
-                        )
-                        meta["has_audio"] = any(
-                            (s.get("codec_type") == "audio") for s in streams
-                        )
+                        # ignore attached cover art (attached_pic) when deciding
+                        # whether a file has a real video stream
+                        has_video = False
+                        has_audio = False
+                        for s in streams:
+                            ctype = s.get("codec_type")
+                            if ctype == "video":
+                                disp = s.get("disposition") or {}
+                                try:
+                                    attached = int(disp.get("attached_pic") or 0)
+                                except Exception:
+                                    attached = 0
+                                if attached == 1:
+                                    # skip attached picture streams
+                                    continue
+                                has_video = True
+                            elif ctype == "audio":
+                                has_audio = True
+                        meta["has_video"] = has_video
+                        meta["has_audio"] = has_audio
                     except Exception:
                         pass
                     # set format string if available

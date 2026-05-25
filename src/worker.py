@@ -170,17 +170,8 @@ class WorkerPool:
         # reactions (banana) from the worker.
         try:
             if not url or not is_supported(url):
-                try:
-                    # persist an unsupported marker for operator visibility
-                    db.add_request(
-                        chat_id,
-                        url,
-                        status="unsupported",
-                        description=description,
-                        original_message_id=original_message_id,
-                    )
-                except Exception:
-                    pass
+                # Do not persist unsupported links to avoid DB spam; simply
+                # reject early and log for operator visibility.
                 logger.info("Rejecting unsupported url enqueue: %s", url)
                 return False
         except Exception:

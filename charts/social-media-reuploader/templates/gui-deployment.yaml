@@ -1,4 +1,10 @@
 {{- if .Values.gui.enabled -}}
+{{- /*
+  Reserved GUI env names that must not be shadowed by .Values.gui.env.
+  These variables are managed by the chart (secrets / runtime defaults)
+  and should not be overridden via plaintext values in `gui.env`.
+*/ -}}
+{{- $reservedEnv := dict "ADMIN_TOKEN" true "SECRET_KEY" true "REQUESTS_DB" true "MODE" true "TMP_DIR" true "TELEGRAM_MAX_FILE_SIZE" true "WORKERS" true "HEALTH_DEBUG" true "YTDLP_USER_AGENT" true "YTDLP_COOKIES_PATH" true "YTDLP_COOKIES_FROM_BROWSER" true "YTDLP_HEADERS" true "OAUTH_CLIENT_ID" true "OAUTH_CLIENT_SECRET" true "OAUTH_AUTHORIZE_URL" true "OAUTH_TOKEN_URL" true "OAUTH_USERINFO_URL" true "OAUTH_JWKS_URI" true "OAUTH_SERVER_METADATA_URL" true "OAUTH_ADMIN_GROUPS" true -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -95,8 +101,12 @@ spec:
               value: '{{ .Values.env.YTDLP_HEADERS | default "" }}'
             {{- if .Values.gui.env }}
             {{- range $k, $v := .Values.gui.env }}
+            {{- if not (hasKey $reservedEnv $k) }}
             - name: {{ $k }}
               value: {{ $v | quote }}
+            {{- else }}
+            {{- /* reserved key skipped to avoid shadowing chart-managed env */ -}}
+            {{- end }}
             {{- end }}
             {{- end }}
 {{- else if $hasSecrets }}
@@ -172,8 +182,12 @@ spec:
               value: '{{ .Values.env.YTDLP_HEADERS | default "" }}'
             {{- if .Values.gui.env }}
             {{- range $k, $v := .Values.gui.env }}
+            {{- if not (hasKey $reservedEnv $k) }}
             - name: {{ $k }}
               value: {{ $v | quote }}
+            {{- else }}
+            {{- /* reserved key skipped to avoid shadowing chart-managed env */ -}}
+            {{- end }}
             {{- end }}
             {{- end }}
 {{- else }}
@@ -208,8 +222,12 @@ spec:
               value: '{{ .Values.env.YTDLP_HEADERS | default "" }}'
             {{- if .Values.gui.env }}
             {{- range $k, $v := .Values.gui.env }}
+            {{- if not (hasKey $reservedEnv $k) }}
             - name: {{ $k }}
               value: {{ $v | quote }}
+            {{- else }}
+            {{- /* reserved key skipped to avoid shadowing chart-managed env */ -}}
+            {{- end }}
             {{- end }}
             {{- end }}
 {{- end }}
