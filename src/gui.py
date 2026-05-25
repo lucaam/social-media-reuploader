@@ -92,12 +92,9 @@ def _check_admin(request: Request) -> bool:
             return True
     except Exception:
         pass
-    # Option A: treat any authenticated user as admin (session contains user info)
-    try:
-        if session and session.get("user"):
-            return True
-    except Exception:
-        pass
+    # Do NOT treat a generic authenticated session as admin. Admin access
+    # must be explicitly granted via `session['is_admin']`, OAuth admin
+    # groups or a DB role mapping.
     # Optional: map OAuth groups to admin role when configured
     if OAUTH_ADMIN_GROUPS_SET and session and session.get("user"):
         try:
@@ -216,12 +213,8 @@ def _check_admin_ws(websocket: WebSocket) -> bool:
             return True
     except Exception:
         pass
-    # Option A: treat any authenticated websocket session as admin
-    try:
-        if session and session.get("user"):
-            return True
-    except Exception:
-        pass
+    # Do NOT treat a generic authenticated websocket session as admin.
+    # Admin via WebSocket must be explicitly granted.
     # Optional: map OAuth groups to admin role when configured (WebSocket)
     if OAUTH_ADMIN_GROUPS_SET and session and session.get("user"):
         try:
@@ -518,13 +511,17 @@ async def health(request: Request):
 
 @app.get("/login")
 async def login(request: Request):
-    # If OAuth is configured (by env vars), use the provider-based flow.
-    if _oauth_enabled():
-        provider = _get_oauth_provider()
-        if not provider:
-            raise HTTPException(status_code=400, detail="OAuth provider not available")
+    # Prefer a live provider client if available (tests may monkeypatch
+    # `oauth.provider`). This allows provider-based flows even when the
+    # environment variables are not set. If OAuth was intended via env
+    # but no provider instance is present, return an error.
+    provider = _get_oauth_provider()
+    if provider:
         redirect_uri = request.url_for("auth")
         return await provider.authorize_redirect(request, redirect_uri)
+    if _oauth_enabled():
+        # OAuth configured via env but provider instance unavailable
+        raise HTTPException(status_code=400, detail="OAuth provider not available")
 
     # Otherwise, if ADMIN_TOKEN is configured, show a simple token form.
     admin_token = os.environ.get("ADMIN_TOKEN")
@@ -1023,6 +1020,7 @@ async def api_db_clear(request: Request):
     try:
         if getattr(ws_broadcast, "loop", None):
             import asyncio as _asyncio
+
             _asyncio.run_coroutine_threadsafe(
                 ws_broadcast.broadcast({"type": "db_cleared"}),
                 ws_broadcast.loop,
@@ -1441,7 +1439,9 @@ async def api_clear_queue(request: Request):
             try:
                 exc = t.exception()
                 if exc:
-                    logging.exception("Background clear_queue task raised exception: %s", exc)
+                    logging.exception(
+                        "Background clear_queue task raised exception: %s", exc
+                    )
             except Exception:
                 pass
 
