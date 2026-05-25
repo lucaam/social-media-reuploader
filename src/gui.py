@@ -95,11 +95,15 @@ def _check_admin(request: Request) -> bool:
     # Do NOT treat a generic authenticated session as admin. Admin access
     # must be explicitly granted via `session['is_admin']`, OAuth admin
     # groups or a DB role mapping.
-    # Optional: map OAuth groups to admin role when configured
-    if OAUTH_ADMIN_GROUPS_SET and session and session.get("user"):
+    # If a user is present in the session, check both configured OAuth
+    # admin groups (when set) and the persistent DB role. The DB role
+    # lookup must be performed regardless of whether admin groups are
+    # configured so operators can assign local admin mappings.
+    if session and session.get("user"):
         try:
             user = session.get("user")
-            if isinstance(user, dict):
+            # check groups if configured
+            if OAUTH_ADMIN_GROUPS_SET and isinstance(user, dict):
                 groups = (
                     user.get("groups") or user.get("memberOf") or user.get("member_of")
                 )
@@ -118,23 +122,24 @@ def _check_admin(request: Request) -> bool:
                             or g.lower() in OAUTH_ADMIN_GROUPS_LOWER
                         ):
                             return True
+            # check DB role by email (always check DB mapping when user present)
+            email = None
+            if isinstance(user, dict):
+                email = (
+                    user.get("email")
+                    or user.get("preferred_username")
+                    or user.get("sub")
+                )
+            if email:
+                try:
+                    u = db.get_user_by_email(email)
+                    if u and u[3] == "admin":
+                        return True
+                except Exception:
+                    # If DB is not available (tests/CI), do not raise here.
+                    pass
         except Exception:
             pass
-        user = session.get("user")
-        # try to extract email
-        email = None
-        if isinstance(user, dict):
-            email = (
-                user.get("email") or user.get("preferred_username") or user.get("sub")
-            )
-        if email:
-            try:
-                u = db.get_user_by_email(email)
-                if u and u[3] == "admin":
-                    return True
-            except Exception:
-                # If DB is not available (tests/CI), do not raise here.
-                pass
 
     return False
 
