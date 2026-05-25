@@ -324,7 +324,6 @@ async def download(
                     streams = info.get("streams", [])
                     for s in streams:
                         if s.get("codec_type") == "video":
-                            meta["has_video"] = True
                             meta["video_codec"] = s.get("codec_name")
                             meta["video_profile"] = s.get("profile")
                             meta["video_sample_aspect_ratio"] = (
@@ -356,8 +355,17 @@ async def download(
                             except Exception:
                                 meta["video_rotation"] = None
                         elif s.get("codec_type") == "audio":
-                            meta["has_audio"] = True
                             meta["audio_codec"] = s.get("codec_name")
+                    # Explicitly set has_video/has_audio based on ffprobe results
+                    try:
+                        meta["has_video"] = any(
+                            (s.get("codec_type") == "video") for s in streams
+                        )
+                        meta["has_audio"] = any(
+                            (s.get("codec_type") == "audio") for s in streams
+                        )
+                    except Exception:
+                        pass
                     # set format string if available
                     fmt_info = info.get("format", {}) or {}
                     ffmt = fmt_info.get("format_name") or ""

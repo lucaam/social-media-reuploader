@@ -1870,7 +1870,16 @@ class WorkerPool:
                     if not getattr(config, "SIMPLE_YTDLP_ONLY", False):
                         if not has_video:
                             lowurl = (url or "").lower()
-                            if "instagram.com" in lowurl or "reel" in lowurl:
+                            # If yt-dlp selected audio-only due to filesize or
+                            # site-specific defaults, try a redownload without
+                            # the filesize limit for known sites that commonly
+                            # return separate audio artifacts (Instagram, Facebook).
+                            if (
+                                "instagram.com" in lowurl
+                                or "reel" in lowurl
+                                or "facebook.com" in lowurl
+                                or "fb.watch" in lowurl
+                            ):
                                 logger.info(
                                     "No video stream detected; attempting redownload without size limit for %s",
                                     url,
