@@ -1403,6 +1403,8 @@ class WorkerPool:
 
             full_err = bytearray()
             buffer = bytearray()
+            # track last reported progress bucket (0..6 for 0-100% in 15% steps)
+            last_reported_bucket = -1
 
             # try to obtain duration from meta for progress percentage
             duration_seconds = None
@@ -1420,7 +1422,7 @@ class WorkerPool:
                 duration_seconds = None
 
             async def _reader():
-                nonlocal buffer, full_err
+                nonlocal buffer, full_err, last_reported_bucket
                 try:
                     while True:
                         chunk = await p.stderr.read(1024)
@@ -1474,11 +1476,23 @@ class WorkerPool:
                                                     * 100.0,
                                                 ),
                                             )
-                                            logger.info(
-                                                "ffmpeg progress: time=%s (%.1f%%)",
-                                                token,
-                                                pct,
-                                            )
+                                            # only log progress when we cross a new 15% bucket
+                                            try:
+                                                bucket = int(pct // 15)
+                                            except Exception:
+                                                bucket = -1
+                                            # skip the 0% bucket to avoid spamming on start;
+                                            # log when bucket increases (15%,30%,...100%)
+                                            if (
+                                                bucket >= 1
+                                                and bucket != last_reported_bucket
+                                            ):
+                                                logger.info(
+                                                    "ffmpeg progress: time=%s (%.1f%%)",
+                                                    token,
+                                                    pct,
+                                                )
+                                                last_reported_bucket = bucket
                                 except Exception:
                                     pass
                             # keep remainder after last_sep
