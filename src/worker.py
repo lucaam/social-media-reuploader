@@ -599,6 +599,24 @@ class WorkerPool:
                     self._inflight_urls.discard(key)
                 except Exception:
                     pass
+                try:
+                    # Notify private chats immediately so the user knows their
+                    # request was blocked (don't spam groups; keep prior behavior).
+                    if chat_type is None or (isinstance(chat_type, str) and chat_type.lower() == "private"):
+                        try:
+                            delay = None
+                            try:
+                                next_allowed = self._last_rate_limited_next.get(chat_id)
+                                if next_allowed:
+                                    delay = max(0, float(next_allowed - now))
+                            except Exception:
+                                delay = None
+                            try:
+                                asyncio.create_task(self._notify_rate_limit(chat_id, original_message_id, delay))
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
                 # Do NOT schedule an automatic requeue for rate-limited items.
                 # Persisted DB row remains with status='rate_limited' so operators
                 # can inspect and decide whether to requeue via the Admin GUI.
