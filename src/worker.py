@@ -9,7 +9,7 @@ import time
 from asyncio.subprocess import PIPE
 from typing import Optional
 
-from . import config, db, downloader, metrics, telegram_api
+from . import config, db, downloader, http_client, metrics, telegram_api, ytdlp
 from .link_utils import is_supported
 
 # module-level pointer to the active WorkerPool instance (if any).
@@ -1869,6 +1869,111 @@ class WorkerPool:
                             )
                     except Exception:
                         logger.debug("Could not create status message")
+
+            # Attempt to obtain a direct HTTP(S) media URL so Telegram
+            # can fetch it server-side (avoids local download/transcode).
+            direct_url = None
+            direct_meta = None
+            try:
+                direct_url, direct_meta = await ytdlp.extract_direct_url_and_meta(
+                    url, timeout=15
+                )
+            except Exception:
+                direct_url = None
+
+            if direct_url:
+                session = await http_client.get_session()
+                ok_fetch = False
+                size_hint = None
+                try:
+                    resp = await session.head(direct_url, allow_redirects=True)
+                    status = getattr(resp, "status", None)
+                    if status and 200 <= status < 400:
+                        ctype = resp.headers.get("Content-Type", "")
+                        cl = resp.headers.get("Content-Length") or resp.headers.get(
+                            "content-length"
+                        )
+                        if cl:
+                            try:
+                                size_hint = int(cl)
+                            except Exception:
+                                size_hint = None
+                        if ctype.lower().startswith(
+                            "video/"
+                        ) or direct_url.lower().endswith(".mp4"):
+                            ok_fetch = True
+                except Exception:
+                    # Try a ranged GET if HEAD is blocked by the server
+                    try:
+                        headers = {"Range": "bytes=0-0"}
+                        resp = await session.get(
+                            direct_url, headers=headers, allow_redirects=True
+                        )
+                        status = getattr(resp, "status", None)
+                        if status and (200 <= status < 400 or status == 206):
+                            ctype = resp.headers.get("Content-Type", "")
+                            cl = resp.headers.get("Content-Length") or resp.headers.get(
+                                "content-length"
+                            )
+                            if cl:
+                                try:
+                                    size_hint = int(cl)
+                                except Exception:
+                                    size_hint = None
+                            if ctype.lower().startswith(
+                                "video/"
+                            ) or direct_url.lower().endswith(".mp4"):
+                                ok_fetch = True
+                    except Exception:
+                        ok_fetch = False
+
+                if ok_fetch and (
+                    size_hint is None
+                    or size_hint
+                    <= getattr(config, "TELEGRAM_MAX_FILE_SIZE", 50 * 1024 * 1024)
+                ):
+                    try:
+                        send_res = await telegram_api.send_video(
+                            self.token,
+                            chat_id,
+                            direct_url,
+                            reply_to_message_id=original_message_id,
+                            meta=direct_meta,
+                        )
+                    except Exception:
+                        send_res = {"ok": False}
+
+                    if isinstance(send_res, dict) and send_res.get("ok"):
+                        # Mark request finished in DB and clean up status
+                        try:
+                            if request_id:
+                                final_size = size_hint
+                                if final_size is None and isinstance(direct_meta, dict):
+                                    final_size = direct_meta.get("final_size")
+                                try:
+                                    db.mark_request_finished(
+                                        request_id,
+                                        final_size=final_size,
+                                        compressed=False,
+                                    )
+                                except Exception:
+                                    pass
+                                try:
+                                    db.update_request_status(request_id, "done")
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                        try:
+                            if status_msg_id:
+                                await telegram_api.delete_message(
+                                    self.token, chat_id, status_msg_id
+                                )
+                        except Exception:
+                            pass
+
+                        return
 
             # download
             try:
