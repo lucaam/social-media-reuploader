@@ -9,7 +9,7 @@ import time
 from asyncio.subprocess import PIPE
 from typing import Optional
 
-from . import config, db, downloader, metrics, telegram_api
+from . import config, db, downloader, http_client, metrics, telegram_api, ytdlp
 from .link_utils import is_supported
 
 # module-level pointer to the active WorkerPool instance (if any).
@@ -597,6 +597,32 @@ class WorkerPool:
                     pass
                 try:
                     self._inflight_urls.discard(key)
+                except Exception:
+                    pass
+                try:
+                    # Notify private chats immediately so the user knows their
+                    # request was blocked (don't spam groups; keep prior behavior).
+                    if chat_type is None or (
+                        isinstance(chat_type, str) and chat_type.lower() == "private"
+                    ):
+                        try:
+                            delay = None
+                            try:
+                                next_allowed = self._last_rate_limited_next.get(chat_id)
+                                if next_allowed:
+                                    delay = max(0, float(next_allowed - now))
+                            except Exception:
+                                delay = None
+                            try:
+                                asyncio.create_task(
+                                    self._notify_rate_limit(
+                                        chat_id, original_message_id, delay
+                                    )
+                                )
+                            except Exception:
+                                pass
+                        except Exception:
+                            pass
                 except Exception:
                     pass
                 # Do NOT schedule an automatic requeue for rate-limited items.
@@ -1870,6 +1896,158 @@ class WorkerPool:
                     except Exception:
                         logger.debug("Could not create status message")
 
+            # Attempt to obtain a direct HTTP(S) media URL so Telegram
+            # can fetch it server-side (avoids local download/transcode).
+            direct_url = None
+            direct_meta = None
+            # initialize values used later (avoid NameError when direct_url is falsy)
+            ok_fetch = False
+            size_hint = None
+            ctype = None
+            try:
+                direct_url, direct_meta = await ytdlp.extract_direct_url_and_meta(
+                    url, timeout=15
+                )
+            except Exception:
+                direct_url = None
+
+            if direct_url:
+                logger.info(
+                    "Attempting Telegram server-side fetch for enqueue=%s direct=%s meta=%s",
+                    url,
+                    direct_url,
+                    (
+                        json.dumps(direct_meta)
+                        if isinstance(direct_meta, dict)
+                        else direct_meta
+                    ),
+                )
+                session = await http_client.get_session()
+                ok_fetch = False
+                size_hint = None
+                ctype = None
+                try:
+                    resp = await session.head(direct_url, allow_redirects=True)
+                    status = getattr(resp, "status", None)
+                    if status and 200 <= status < 400:
+                        ctype = resp.headers.get("Content-Type", "")
+                        cl = resp.headers.get("Content-Length") or resp.headers.get(
+                            "content-length"
+                        )
+                        if cl:
+                            try:
+                                size_hint = int(cl)
+                            except Exception:
+                                size_hint = None
+                        # require ctype to be present and then accept either a
+                        # video/* content-type or an explicit .mp4 URL suffix
+                        if ctype and (
+                            ctype.lower().startswith("video/")
+                            or direct_url.lower().endswith(".mp4")
+                        ):
+                            ok_fetch = True
+                except Exception as e:
+                    logger.debug(
+                        "HEAD request for direct URL failed (%s); trying ranged GET: %s",
+                        direct_url,
+                        e,
+                    )
+                    # Try a ranged GET if HEAD is blocked by the server
+                    try:
+                        headers = {"Range": "bytes=0-0"}
+                        resp = await session.get(
+                            direct_url, headers=headers, allow_redirects=True
+                        )
+                        status = getattr(resp, "status", None)
+                        if status and (200 <= status < 400 or status == 206):
+                            ctype = resp.headers.get("Content-Type", "")
+                            cl = resp.headers.get("Content-Length") or resp.headers.get(
+                                "content-length"
+                            )
+                            if cl:
+                                try:
+                                    size_hint = int(cl)
+                                except Exception:
+                                    size_hint = None
+                            # require ctype to be present and then accept either a
+                            # video/* content-type or an explicit .mp4 URL suffix
+                            if ctype and (
+                                ctype.lower().startswith("video/")
+                                or direct_url.lower().endswith(".mp4")
+                            ):
+                                ok_fetch = True
+                    except Exception as e:
+                        logger.debug(
+                            "Ranged GET also failed for direct URL %s: %s",
+                            direct_url,
+                            e,
+                        )
+                        ok_fetch = False
+
+                if ok_fetch and (
+                    size_hint is None
+                    or size_hint
+                    <= getattr(config, "TELEGRAM_MAX_FILE_SIZE", 50 * 1024 * 1024)
+                ):
+                    try:
+                        send_res = await telegram_api.send_video(
+                            self.token,
+                            chat_id,
+                            direct_url,
+                            reply_to_message_id=original_message_id,
+                            meta=direct_meta,
+                        )
+                    except Exception:
+                        send_res = {"ok": False}
+
+                    if isinstance(send_res, dict) and send_res.get("ok"):
+                        # Mark request finished in DB and clean up status
+                        try:
+                            if request_id:
+                                final_size = size_hint
+                                if final_size is None and isinstance(direct_meta, dict):
+                                    final_size = direct_meta.get("final_size")
+                                try:
+                                    db.mark_request_finished(
+                                        request_id,
+                                        final_size=final_size,
+                                        compressed=False,
+                                    )
+                                except Exception:
+                                    pass
+                                try:
+                                    db.update_request_status(request_id, "done")
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                        try:
+                            # replace processing eyes reaction with a success trophy
+                            if reaction_current == "eyes" and original_message_id:
+                                try:
+                                    await telegram_api.set_message_reaction(
+                                        self.token,
+                                        chat_id,
+                                        original_message_id,
+                                        "🏆",
+                                    )
+                                    reaction_current = "trophy"
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                        try:
+                            if status_msg_id:
+                                await telegram_api.delete_message(
+                                    self.token, chat_id, status_msg_id
+                                )
+                        except Exception:
+                            pass
+
+                        return
+
             # download
             try:
                 file_path, meta = await downloader.download(
@@ -2021,34 +2199,74 @@ class WorkerPool:
                         ):
                             if original_message_id:
                                 try:
+                                    radd = await telegram_api.set_message_reaction(
+                                        self.token,
+                                        chat_id,
+                                        original_message_id,
+                                        "🍌",
+                                    )
+                                    if isinstance(radd, dict):
+                                        ok_radd = radd.get("ok")
+                                    else:
+                                        ok_radd = bool(radd)
+                                except Exception:
+                                    ok_radd = False
+
+                                if ok_fetch and (
+                                    size_hint is None
+                                    or size_hint
+                                    <= getattr(
+                                        config,
+                                        "TELEGRAM_MAX_FILE_SIZE",
+                                        50 * 1024 * 1024,
+                                    )
+                                ):
                                     try:
-                                        radd = await telegram_api.set_message_reaction(
+                                        send_res = await telegram_api.send_video(
                                             self.token,
                                             chat_id,
-                                            original_message_id,
-                                            "🍌",
+                                            direct_url,
+                                            reply_to_message_id=original_message_id,
+                                            meta=direct_meta,
                                         )
-                                        ok_radd = (
-                                            (isinstance(radd, dict) and radd.get("ok"))
-                                            if isinstance(radd, dict)
-                                            else bool(radd)
+                                    except Exception as e:
+                                        logger.warning(
+                                            "telegram_api.send_video raised exception for direct URL %s; falling back to download: %s",
+                                            direct_url,
+                                            e,
                                         )
-                                        if ok_radd:
-                                            reaction_current = "banana"
-                                        else:
-                                            radd = None
-                                    except Exception:
-                                        radd = None
-                                    if not radd:
+                                        send_res = {"ok": False}
+
+                                    if not (
+                                        isinstance(send_res, dict)
+                                        and send_res.get("ok")
+                                    ):
+                                        logger.info(
+                                            "Telegram server-side fetch failed for %s (send_result=%s); falling back to download",
+                                            direct_url,
+                                            send_res,
+                                        )
+                                    else:
                                         try:
                                             await telegram_api.send_message(
                                                 self.token,
                                                 chat_id,
-                                                "🍌",
+                                                hint,
                                                 reply_to_message_id=original_message_id,
                                             )
                                         except Exception:
                                             pass
+                                        # If server-side fetch and hint were sent, stop further processing
+                                        return
+
+                                try:
+                                    if not ok_radd:
+                                        await telegram_api.send_message(
+                                            self.token,
+                                            chat_id,
+                                            "🍌",
+                                            reply_to_message_id=original_message_id,
+                                        )
                                 except Exception:
                                     pass
                             else:
@@ -2061,6 +2279,7 @@ class WorkerPool:
                                     )
                                 except Exception:
                                     pass
+
                             try:
                                 await telegram_api.send_message(
                                     self.token,
@@ -2071,45 +2290,16 @@ class WorkerPool:
                             except Exception:
                                 pass
                         else:
-                            # In private chats try to remove the eyes reaction (if we added it)
-                            # then attempt to add a banana reaction; if reactions are not
-                            # supported fall back to sending a banana emoji message.
-                            if original_message_id:
+                            # private chats: replace eyes with banana if present
+                            if reaction_current == "eyes" and original_message_id:
                                 try:
-                                    try:
-                                        radd = await telegram_api.set_message_reaction(
-                                            self.token,
-                                            chat_id,
-                                            original_message_id,
-                                            "🍌",
-                                        )
-                                        ok_radd = (
-                                            (isinstance(radd, dict) and radd.get("ok"))
-                                            if isinstance(radd, dict)
-                                            else bool(radd)
-                                        )
-                                        if ok_radd:
-                                            reaction_current = "banana"
-                                        else:
-                                            try:
-                                                await telegram_api.send_message(
-                                                    self.token,
-                                                    chat_id,
-                                                    "🍌",
-                                                    reply_to_message_id=original_message_id,
-                                                )
-                                            except Exception:
-                                                pass
-                                    except Exception:
-                                        try:
-                                            await telegram_api.send_message(
-                                                self.token,
-                                                chat_id,
-                                                "🍌",
-                                                reply_to_message_id=original_message_id,
-                                            )
-                                        except Exception:
-                                            pass
+                                    await telegram_api.set_message_reaction(
+                                        self.token,
+                                        chat_id,
+                                        original_message_id,
+                                        "🍌",
+                                    )
+                                    reaction_current = "banana"
                                 except Exception:
                                     pass
                             try:
@@ -2316,6 +2506,26 @@ class WorkerPool:
 
                     # Use _transcode_to_baseline which first tries fast remux, then audio transcode, then full transcode.
                     try:
+                        # If remote direct URL info exists, log fetchability only when available
+                        max_sz = getattr(
+                            config, "TELEGRAM_MAX_FILE_SIZE", 50 * 1024 * 1024
+                        )
+                        if direct_url is not None:
+                            if not ok_fetch:
+                                logger.info(
+                                    "Remote media %s is not fetchable by Telegram (ctype=%s size=%s); will download and convert locally",
+                                    direct_url,
+                                    ctype,
+                                    _mb(size_hint),
+                                )
+                            else:
+                                logger.info(
+                                    "Remote media %s exceeds TELEGRAM_MAX_FILE_SIZE (%s > %s); will download and convert locally",
+                                    direct_url,
+                                    _mb(size_hint),
+                                    _mb(max_sz),
+                                )
+
                         base = os.path.splitext(os.path.basename(file_path))[0]
                         trans_path = os.path.join(tmpdir, f"{base}_tg_transcoded.mp4")
                         max_allowed = getattr(

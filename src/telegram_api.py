@@ -102,6 +102,95 @@ async def send_video(
     meta: Optional[dict] = None,
 ):
     url = f"https://api.telegram.org/bot{token}/sendVideo"
+    # If `file_path` is actually an HTTP(S) URL, ask Telegram to fetch it
+    # remotely by sending a JSON payload with the `video` field set to the URL.
+    # This avoids uploading bytes from this process and lets Telegram do the
+    # download/processing. Note: thumbnails are ignored by Telegram unless the
+    # file is uploaded via multipart/form-data, so we skip thumbnails here.
+    try:
+        if isinstance(file_path, str) and file_path.lower().startswith(
+            ("http://", "https://")
+        ):
+            payload: dict = {"chat_id": chat_id, "video": file_path}
+            if caption:
+                payload["caption"] = caption
+            if reply_to_message_id is not None:
+                payload["reply_to_message_id"] = int(reply_to_message_id)
+            # include helpful meta hints when available
+            try:
+                if isinstance(meta, dict):
+                    dur = None
+                    try:
+                        if "duration" in meta and meta.get("duration") is not None:
+                            dur = float(meta.get("duration"))
+                        else:
+                            fmt = (
+                                meta.get("format")
+                                if isinstance(meta.get("format"), dict)
+                                else None
+                            )
+                            if fmt and fmt.get("duration") is not None:
+                                dur = float(fmt.get("duration"))
+                    except Exception:
+                        dur = None
+                    if dur is not None:
+                        try:
+                            payload["duration"] = int(float(dur))
+                        except Exception:
+                            pass
+
+                    w = None
+                    h = None
+                    try:
+                        if (
+                            "video_width" in meta
+                            and meta.get("video_width") is not None
+                        ):
+                            w = meta.get("video_width")
+                        elif "width" in meta and meta.get("width") is not None:
+                            w = meta.get("width")
+                        if (
+                            "video_height" in meta
+                            and meta.get("video_height") is not None
+                        ):
+                            h = meta.get("video_height")
+                        elif "height" in meta and meta.get("height") is not None:
+                            h = meta.get("height")
+                    except Exception:
+                        w = None
+                        h = None
+                    try:
+                        if w is not None:
+                            payload["width"] = int(w)
+                    except Exception:
+                        pass
+                    try:
+                        if h is not None:
+                            payload["height"] = int(h)
+                    except Exception:
+                        pass
+                    # hint to Telegram that this supports streaming
+                    payload["supports_streaming"] = True
+            except Exception:
+                pass
+
+            session = await http_client.get_session()
+            async with session.post(url, json=payload) as resp:
+                try:
+                    return await resp.json()
+                except Exception:
+                    return {"ok": False, "status": resp.status}
+    except Exception as e:
+        # If the remote JSON-based request failed and the input is a URL,
+        # return the error instead of attempting to open the URL as a file.
+        logger.warning("send_video remote JSON request failed: %s", e)
+        if isinstance(file_path, str) and file_path.lower().startswith(
+            ("http://", "https://")
+        ):
+            return {"ok": False, "error": str(e)}
+        # otherwise fall through to multipart upload for local paths
+
+    # Fallback: upload the file via multipart/form-data as before
     data = aiohttp.FormData()
     data.add_field("chat_id", str(chat_id))
     if caption:
