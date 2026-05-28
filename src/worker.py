@@ -1900,6 +1900,10 @@ class WorkerPool:
             # can fetch it server-side (avoids local download/transcode).
             direct_url = None
             direct_meta = None
+            # initialize values used later (avoid NameError when direct_url is falsy)
+            ok_fetch = False
+            size_hint = None
+            ctype = None
             try:
                 direct_url, direct_meta = await ytdlp.extract_direct_url_and_meta(
                     url, timeout=15
@@ -1935,9 +1939,10 @@ class WorkerPool:
                                 size_hint = int(cl)
                             except Exception:
                                 size_hint = None
-                        if (
-                            ctype
-                            and ctype.lower().startswith("video/")
+                        # require ctype to be present and then accept either a
+                        # video/* content-type or an explicit .mp4 URL suffix
+                        if ctype and (
+                            ctype.lower().startswith("video/")
                             or direct_url.lower().endswith(".mp4")
                         ):
                             ok_fetch = True
@@ -1964,9 +1969,10 @@ class WorkerPool:
                                     size_hint = int(cl)
                                 except Exception:
                                     size_hint = None
-                            if (
-                                ctype
-                                and ctype.lower().startswith("video/")
+                            # require ctype to be present and then accept either a
+                            # video/* content-type or an explicit .mp4 URL suffix
+                            if ctype and (
+                                ctype.lower().startswith("video/")
                                 or direct_url.lower().endswith(".mp4")
                             ):
                                 ok_fetch = True
@@ -2011,6 +2017,22 @@ class WorkerPool:
                                     pass
                                 try:
                                     db.update_request_status(request_id, "done")
+                                except Exception:
+                                    pass
+                        except Exception:
+                            pass
+
+                        try:
+                            # replace processing eyes reaction with a success trophy
+                            if reaction_current == "eyes" and original_message_id:
+                                try:
+                                    await telegram_api.set_message_reaction(
+                                        self.token,
+                                        chat_id,
+                                        original_message_id,
+                                        "🏆",
+                                    )
+                                    reaction_current = "trophy"
                                 except Exception:
                                     pass
                         except Exception:
@@ -2234,6 +2256,8 @@ class WorkerPool:
                                             )
                                         except Exception:
                                             pass
+                                        # If server-side fetch and hint were sent, stop further processing
+                                        return
 
                                 try:
                                     if not ok_radd:
@@ -2479,26 +2503,29 @@ class WorkerPool:
                         except Exception:
                             pass
                         return
-                else:
-                    # Not suitable for server-side fetch, log reason and continue to download
-                    max_sz = getattr(config, "TELEGRAM_MAX_FILE_SIZE", 50 * 1024 * 1024)
-                    if not ok_fetch:
-                        logger.info(
-                            "Remote media %s is not fetchable by Telegram (ctype=%s size=%s); will download and convert locally",
-                            direct_url,
-                            ctype,
-                            _mb(size_hint),
-                        )
-                    else:
-                        logger.info(
-                            "Remote media %s exceeds TELEGRAM_MAX_FILE_SIZE (%s > %s); will download and convert locally",
-                            direct_url,
-                            _mb(size_hint),
-                            _mb(max_sz),
-                        )
 
                     # Use _transcode_to_baseline which first tries fast remux, then audio transcode, then full transcode.
                     try:
+                        # If remote direct URL info exists, log fetchability only when available
+                        max_sz = getattr(
+                            config, "TELEGRAM_MAX_FILE_SIZE", 50 * 1024 * 1024
+                        )
+                        if direct_url is not None:
+                            if not ok_fetch:
+                                logger.info(
+                                    "Remote media %s is not fetchable by Telegram (ctype=%s size=%s); will download and convert locally",
+                                    direct_url,
+                                    ctype,
+                                    _mb(size_hint),
+                                )
+                            else:
+                                logger.info(
+                                    "Remote media %s exceeds TELEGRAM_MAX_FILE_SIZE (%s > %s); will download and convert locally",
+                                    direct_url,
+                                    _mb(size_hint),
+                                    _mb(max_sz),
+                                )
+
                         base = os.path.splitext(os.path.basename(file_path))[0]
                         trans_path = os.path.join(tmpdir, f"{base}_tg_transcoded.mp4")
                         max_allowed = getattr(

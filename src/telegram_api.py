@@ -170,10 +170,7 @@ async def send_video(
                     except Exception:
                         pass
                     # hint to Telegram that this supports streaming
-                    try:
-                        payload["supports_streaming"] = True
-                    except Exception:
-                        pass
+                    payload["supports_streaming"] = True
             except Exception:
                 pass
 
@@ -183,9 +180,15 @@ async def send_video(
                     return await resp.json()
                 except Exception:
                     return {"ok": False, "status": resp.status}
-    except Exception:
-        # fallback to file upload path below
-        pass
+    except Exception as e:
+        # If the remote JSON-based request failed and the input is a URL,
+        # return the error instead of attempting to open the URL as a file.
+        logger.warning("send_video remote JSON request failed: %s", e)
+        if isinstance(file_path, str) and file_path.lower().startswith(
+            ("http://", "https://")
+        ):
+            return {"ok": False, "error": str(e)}
+        # otherwise fall through to multipart upload for local paths
 
     # Fallback: upload the file via multipart/form-data as before
     data = aiohttp.FormData()

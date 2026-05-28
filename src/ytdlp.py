@@ -127,7 +127,8 @@ async def extract_direct_url_and_meta(
                 chosen = None
                 for f in reversed(fmts):
                     try:
-                        if f.get("url") and f.get("url") in direct:
+                        # Compare exact URLs to avoid false substring matches
+                        if f.get("url") and f.get("url") == direct:
                             chosen = f
                             break
                     except Exception:
