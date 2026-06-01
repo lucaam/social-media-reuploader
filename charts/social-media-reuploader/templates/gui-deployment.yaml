@@ -99,6 +99,8 @@ spec:
               value: '{{ .Values.env.YTDLP_COOKIES_FROM_BROWSER | default "" }}'
             - name: YTDLP_HEADERS
               value: '{{ .Values.env.YTDLP_HEADERS | default "" }}'
+            - name: OAUTH_ADMIN_GROUPS
+              value: '{{ .Values.env.OAUTH_ADMIN_GROUPS | default "" }}'
             {{- if .Values.gui.env }}
             {{- range $k, $v := .Values.gui.env }}
             {{- if not (hasKey $reservedEnv $k) }}
@@ -220,6 +222,8 @@ spec:
               value: '{{ .Values.env.YTDLP_COOKIES_FROM_BROWSER | default "" }}'
             - name: YTDLP_HEADERS
               value: '{{ .Values.env.YTDLP_HEADERS | default "" }}'
+            - name: OAUTH_ADMIN_GROUPS
+              value: '{{ .Values.env.OAUTH_ADMIN_GROUPS | default "" }}'
             {{- if .Values.gui.env }}
             {{- range $k, $v := .Values.gui.env }}
             {{- if not (hasKey $reservedEnv $k) }}
