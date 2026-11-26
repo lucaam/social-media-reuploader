@@ -1,52 +1,61 @@
-# Release Guide
+# Guida alle release
 
-This document lists the steps and checks required to prepare and publish a release for `social-media-reuploader`.
+Le release sono semantiche e derivano dai Conventional Commits. Il flusso è
+automatico a partire da un'azione manuale.
 
-Prerequisites
-- Have CI checks passing on branch to be merged into `main` (tests, linters, commitlint).
-- Repository secrets configured (recommended):
-  - `GHCR_PAT` — personal access token with `write:packages` to manage GHCR visibility and package publishing. Required for making GHCR packages public automatically.
-  - `RELEASE_PLEASE_TOKEN` — optional PAT to use instead of `GITHUB_TOKEN` if your org restricts the default token.
+## Prerequisiti
 
-Automated release flow
-1. Merge the release branch into `main`. The `release-please` workflow is triggered on pushes to `main` and will create and publish a GitHub Release based on Conventional Commits.
-2. Once the release is published, the `docker-release` workflow will build and publish the container image to GHCR (if configured).
+- CI verde su `main` (test, linters, commitlint).
+- Facoltativo: secret `GHCR_PAT` (token con permessi di amministrazione del
+  package GHCR) per rendere pubblico il package dopo il push. Il push delle
+  immagini usa `GITHUB_TOKEN`: non servono altri segreti.
 
-Local preparation
-1. Install dev tools:
+## Flusso
+
+1. **Bump**: avvia il workflow *Manual Version Bump* (tab Actions, oppure
+   `gh workflow run manual-version-bump.yml --ref main`). Lo script
+   `scripts/release/bump_versions.py`:
+   - calcola la versione dai commit dall'ultimo tag (`feat` → minor, `fix` e
+     altri → patch, breaking → major);
+   - aggiorna `src/__init__.py`, `charts/social-media-reuploader/Chart.yaml`
+     (`appVersion`, e `version` +1 patch) e i tag immagine in `values.yaml`;
+   - crea il branch `release/bump-X.Y.Z` e apre la PR
+     `chore(release): bump versions to vX.Y.Z`;
+   - avvia la CI sul branch (le PR aperte da `GITHUB_TOKEN` non la avviano da
+     sole).
+2. **Revisione e merge** della PR di bump.
+3. **Pubblicazione**: *Publish Release on Bump PR Merge* crea tag e release
+   GitHub (note generate automaticamente) sul commit di merge, poi chiama
+   *Docker publish* che builda l'immagine linux/amd64 + linux/arm64 e la
+   pubblica come `ghcr.io/<owner>/social-media-reuploader:X.Y.Z` e `:latest`.
+
+Le release create a mano (interfaccia GitHub o `gh release create`) pubblicano
+l'immagine con *Build and publish Docker image to GHCR on release*.
+
+## Controlli in locale
 
 ```bash
-npm ci      # installs commitlint
-python -m venv .venv && source .venv/bin/activate
+npm ci
 pip install -r requirements-dev.txt
-pip install pre-commit
+./scripts/prepare_release.sh      # test, pre-commit, commitlint, helm lint, versioni
 ```
 
-2. Install pre-commit hooks:
+## Ricostruire un'immagine
+
+*Manual Docker build and publish to GHCR* con l'input `tag` (es. `v0.9.0`,
+obbligatorio). `push-latest` sposta `:latest` solo se quel tag è la release più
+alta, quindi non si torna mai indietro per errore.
 
 ```bash
-pre-commit install
-pre-commit install --hook-type commit-msg
-pre-commit install --hook-type pre-push
+gh workflow run docker-release-manual.yml -f tag=v0.9.0
 ```
 
-3. Run the helper script to validate everything locally:
+## Problemi frequenti
 
-```bash
-./scripts/prepare_release.sh
-```
-
-Manual trigger
-- If you need to run the `release-please` action manually, use the Actions UI or the `workflow_dispatch` trigger.
-- Example with GitHub CLI (optional):
-
-```bash
-# list workflows
-gh workflow list
-# then run the 'Release Please' workflow
-gh workflow run 'Release Please' --repo <owner>/<repo> --ref main
-```
-
-Troubleshooting
-- If release is not published after merge, check the Actions run logs for `release-please` and ensure the token used has proper permissions.
-- If container publish fails, ensure `GHCR_PAT` is configured and has `write:packages` and `delete:packages` (if needed) permissions.
+- *La PR di bump non compare*: nessun commit dall'ultimo tag, oppure lo script
+  è fallito (log del job "Run bump script").
+- *La release c'è ma l'immagine no*: controlla il job "Publish the Docker image"
+  di *Publish Release on Bump PR Merge*, poi rilancia la build manuale con quel
+  tag.
+- *Package GHCR privato*: aggiungi `GHCR_PAT` o cambia la visibilità dalle
+  impostazioni del package.

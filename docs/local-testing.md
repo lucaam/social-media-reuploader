@@ -1,53 +1,88 @@
-# Local testing & development
+# Sviluppo e test in locale
 
-This page lists practical steps to run the bot and the admin GUI locally for development.
+## Requisiti
 
-Prerequisites
-
-- Python 3.11
-- Docker & docker-compose (optional, for container testing)
-- `yt-dlp` (used by downloader) — it will be executed by the app, ensure it's available in PATH when running locally.
-
-1) Quickstart using Python (run processes separately)
+- Python 3.14
+- ffmpeg e ffprobe nel `PATH` (`apt install ffmpeg`, `brew install ffmpeg`):
+  servono per convertire i media e per i test dei media (senza, quei test
+  vengono saltati)
+- deno, `curl_cffi` e `yt-dlp-ejs` arrivano con `requirements.txt`
+  (`yt-dlp[default,curl-cffi,deno]`): il binario `deno` viene installato
+  accanto a `python` nel virtualenv, dove yt-dlp lo cerca
+- facoltativi: Docker con Compose, Helm (con il plugin helm-unittest), Node.js
+  (commitlint)
 
 ```bash
-# create venv and install
 python -m venv .venv
 source .venv/bin/activate
-pip install -r requirements.txt
+pip install -r requirements.txt -r requirements-dev.txt
+deno --version && python -c "import curl_cffi, yt_dlp_ejs"   # controllo rapido
+```
 
-# Run the bot in long-polling mode
-export BOT_TOKEN="<your-bot-token>"
+## Test
+
+```bash
+REQUESTS_DB=/tmp/smr-tests/requests.db python -m pytest -q
+```
+
+- I test non usano la rete né Telegram.
+- `REQUESTS_DB` punta a un database usa-e-getta (ogni test che usa il DB ne
+  crea uno proprio; la variabile evita di toccare `data/requests.db`).
+- I test dei media usano ffmpeg/ffprobe del `PATH`.
+
+Lint (gli stessi controlli della CI):
+
+```bash
+pre-commit run --all-files                 # ruff, black, isort, whitespace, YAML
+SKIP=helm-lint,actionlint pre-commit run --all-files   # senza helm / actionlint installati
+python scripts/check_docs.py               # ogni impostazione è documentata
+```
+
+## Avviare bot e GUI
+
+In due terminali, con lo stesso database:
+
+```bash
+# bot (polling): /health e /metrics su http://127.0.0.1:8080
+export BOT_TOKEN="<token-di-un-bot-di-prova>"
+export REQUESTS_DB="$PWD/data/requests.db"
 python -m src.bot
 
-# In another terminal, run the admin GUI
-export ADMIN_TOKEN="myadmintoken"
-export SECRET_KEY="$(openssl rand -hex 32)"
-uvicorn src.gui:app --host 0.0.0.0 --port 8081
+# GUI: http://127.0.0.1:8081
+export REQUESTS_DB="$PWD/data/requests.db"
+export SECRET_KEY="$(openssl rand -hex 32)" ADMIN_TOKEN="$(openssl rand -hex 24)"
+./scripts/run-dev.sh            # uvicorn con --reload, SESSION_COOKIE_SECURE=false
 ```
 
-Visit `http://localhost:8081/requests?token=myadmintoken` to see recent requests.
+Usa un bot di prova: due processi con lo stesso token si rubano gli update a
+vicenda (il bot in produzione smetterebbe di ricevere messaggi).
 
-2) Run both with `docker-compose` (recommended for parity with containers)
+`python -m src` avvia lo stesso bot; `MODE=webhook` richiede `WEBHOOK_URL`
+pubblico (ad esempio un tunnel HTTPS verso la porta 8080).
+
+Diagnosi rapida del token (getMe, getWebhookInfo):
 
 ```bash
-export BOT_TOKEN="<your-bot-token>"
-export ADMIN_TOKEN="myadmintoken"
-docker-compose up --build
+BOT_TOKEN="<token>" ./scripts/diagnose_bot.sh
 ```
 
-This uses the same image for bot and GUI but runs different commands: the bot container runs the `src.bot` entrypoint, while the GUI container runs `uvicorn src.gui:app` (see `docker-compose.yml`). Using the same image is convenient for development; in production you may build separate images or use different tags.
-
-3) Run both services as containers from the built image
+## Docker Compose
 
 ```bash
-docker build -t local/social-media-reuploader:dev .
-# Bot
-docker run -d --name td-bot -e BOT_TOKEN="$BOT_TOKEN" local/social-media-reuploader:dev
-# GUI (override cmd)
-docker run -d --name td-gui -e ADMIN_TOKEN="$ADMIN_TOKEN" local/social-media-reuploader:dev uvicorn src.gui:app --host 0.0.0.0 --port 8081
+cp examples/docker-compose.env.example .env
+docker compose up --build
 ```
 
-Notes
-- Using a single image for both processes is normal — the image contains the code and dependencies; you simply start different commands in separate containers.
-- For production, you can either run two different Deployments (bot + GUI) using the same image and different `command`/`args`, or build separate images with specialised entrypoints.
+Bot e GUI condividono il volume `data`; la GUI è su <http://127.0.0.1:8081>.
+
+## Chart Helm
+
+```bash
+helm lint charts/social-media-reuploader --strict
+helm template smr charts/social-media-reuploader -f charts/social-media-reuploader/ci/webhook-ingress-values.yaml
+helm plugin install https://github.com/helm-unittest/helm-unittest.git   # Helm 4: aggiungi --verify=false
+helm unittest charts/social-media-reuploader
+```
+
+I file in `charts/social-media-reuploader/ci/` sono le combinazioni di valori
+usate dalla CI (lint, render e validazione con kubeconform).

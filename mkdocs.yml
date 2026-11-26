@@ -1,11 +1,40 @@
-site_name: Social media reuploader
-site_description: A Telegram bot that downloads media links and reposts them
+site_name: Social Media Reuploader
+site_description: Bot Telegram che ripubblica nella chat i media dei link social (tutti i siti supportati da yt-dlp), con GUI di amministrazione
 site_author: social-media-reuploader
+site_url: https://lucaam.github.io/social-media-reuploader/
+repo_url: https://github.com/lucaam/social-media-reuploader
+repo_name: lucaam/social-media-reuploader
+edit_uri: edit/main/docs/
+
 nav:
   - Home: index.md
-  - Usage: usage.md
+  - Utilizzo: usage.md
+  - Configurazione: configuration.md
   - Deploy: deploy.md
+  - OAuth: oauth.md
+  - Sviluppo e test in locale: local-testing.md
+  - Immagini e release: ghcr.md
+
 theme:
   name: material
+  language: it
+  features:
+    - content.code.copy
+    - navigation.sections
+    - navigation.top
+
+# docs/configuration.md includes the configuration table of README.md.
+hooks:
+  - scripts/mkdocs_hooks.py
+
+markdown_extensions:
+  - admonition
+  - attr_list
+  - tables
+  - toc:
+      permalink: true
+  - pymdownx.superfences
+  - pymdownx.details
+
 extra_css:
   - css/custom.css

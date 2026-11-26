@@ -1,13 +1,21 @@
 # Flux deployment agent
 
-Use this agent prompt to help generate or adapt Flux manifests for this repo.
+Usa questo prompt per generare o adattare i manifest Flux di questo repository.
 
-Suggested prompts:
+Prompt suggeriti:
 
-- "Generate a Flux `HelmRelease` for the chart in `charts/social-media-reuploader`, with values pulled from a Kubernetes Secret named `td-secrets`."
-- "Create a `Kustomization` that applies `examples/flux/helmrelease.yaml` in namespace `default`."
-- "Explain how to create sealed-secrets for BOT_TOKEN and ADMIN_TOKEN and reference them from HelmRelease values."
+- "Genera una `HelmRelease` (`helm.toolkit.fluxcd.io/v2`) per il chart in `charts/social-media-reuploader` con il
+  token del bot nel Secret `smr-bot` (`secret.name`) e le credenziali della GUI nel Secret `smr-gui`
+  (`gui.existingSecret`)."
+- "Crea una `Kustomization` che applica `examples/flux/` nel namespace `smr`."
+- "Spiega come creare con sealed-secrets o SOPS i Secret `smr-bot` (BOT_TOKEN) e `smr-gui` (SECRET_KEY, ADMIN_TOKEN o
+  OAUTH_*) e come referenziarli dalla HelmRelease."
 
-Notes:
-- Do not include raw secrets in generated manifests. Always reference secret names.
-- Use `GitRepository` as source and `HelmRelease` pointing to `./charts/social-media-reuploader`.
+Note:
+
+- Non includere mai segreti nei manifest: solo nomi di Secret (`secret.name`, `gui.existingSecret`,
+  `ytdlpCookies.existingSecret`).
+- Sorgente `GitRepository` (`source.toolkit.fluxcd.io/v1`) e `HelmRelease` che punta a
+  `./charts/social-media-reuploader`; fissa `image.tag` a una versione invece di `latest`.
+- Il chart ammette una sola replica del bot (`replicaCount: 1`) e mette la GUI sullo stesso nodo del bot perché
+  condividono un PVC `ReadWriteOnce`.

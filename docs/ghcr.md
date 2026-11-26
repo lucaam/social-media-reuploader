@@ -1,41 +1,63 @@
-# GHCR (GitHub Container Registry) and publishing
+# Immagini GHCR e release
 
-This repository includes a GitHub Actions workflow that builds and publishes the Docker image to GHCR when a release is published. It also includes a workflow to set the package visibility to `public` after publishing.
+Le immagini sono pubblicate su GitHub Container Registry:
 
-How it works
-
-- On release publish, `.github/workflows/docker-release.yml` builds the image and pushes tags to `ghcr.io/${{ github.repository }}`.
-- After a release, `.github/workflows/ghcr-visibility.yml` attempts to set the package visibility to `public` using the GitHub API.
-
-Badges
-
-You can show the published image's latest tag using Shields.io in the README:
-
+```text
+ghcr.io/lucaam/social-media-reuploader:<versione>   # es. 0.9.0
+ghcr.io/lucaam/social-media-reuploader:latest       # ultima release
 ```
+
+Ogni immagine è multi-arch (linux/amd64, linux/arm64) e porta le label OCI
+(versione, commit, data di build). `:latest` si sposta solo sulla release con il
+numero di versione più alto.
+
+## Flusso di release
+
+1. **Manual Version Bump** (`manual-version-bump.yml`, avvio manuale): calcola
+   la versione successiva dai Conventional Commits dall'ultimo tag (`feat` →
+   minor, `fix` e altri → patch, `!`/`BREAKING CHANGE` → major), aggiorna
+   `src/__init__.py`, `Chart.yaml` (`version`, `appVersion`) e i tag immagine in
+   `values.yaml`, apre la PR `chore(release): bump versions to vX.Y.Z` e avvia
+   la CI su quel branch.
+2. Si rivede e si fa il merge della PR.
+3. **Publish Release on Bump PR Merge** (`publish-bump-release.yml`) crea il tag
+   e la release GitHub sul commit di merge e chiama **Docker publish**
+   (`docker-publish.yml`), che builda e pubblica l'immagine.
+
+Le release create da un workflow con `GITHUB_TOKEN` non avviano altri workflow:
+per questo `publish-bump-release.yml` chiama direttamente il workflow
+riutilizzabile `docker-publish.yml` invece di contare sull'evento `release`.
+
+Altri workflow:
+
+- `docker-release.yml`: pubblica l'immagine per le release create a mano
+  (interfaccia GitHub o `gh release create`).
+- `docker-release-manual.yml`: ricostruisce l'immagine di un tag esistente
+  (input `tag` obbligatorio; `push-latest` sposta `:latest` solo se il tag è la
+  release più alta).
+- `docker-pr-build.yml`: su ogni PR che tocca l'immagine la builda e controlla
+  che ci siano deno, curl_cffi, yt-dlp-ejs, ffmpeg e che i moduli si importino
+  con filesystem in sola lettura.
+
+## Permessi e segreti
+
+- Il push su GHCR usa `GITHUB_TOKEN` con `packages: write` (già nei workflow).
+- `GHCR_PAT` (facoltativo): token personale con permessi di amministrazione del
+  package, usato solo per rendere pubblico il package dopo il push. Senza, il
+  passaggio viene saltato.
+
+## Badge
+
+```markdown
 [![GHCR Image Version](https://img.shields.io/docker/v/ghcr.io/lucaam/social-media-reuploader?label=ghcr.io&sort=semver)](https://github.com/lucaam/social-media-reuploader/pkgs/container/social-media-reuploader)
 ```
 
-Publishing notes
-
-- The GitHub runner uses the `GITHUB_TOKEN` to push the image. For private repositories, ensure the token has `packages: write` permissions in the workflow `permissions` block (already set).
-- Making the package public requires additional repository/org permissions; the `ghcr-visibility` workflow attempts both org and user package endpoints.
-
-Repository secrets and PAT (optional)
-
-If the `ghcr-visibility` workflow fails due to insufficient permissions, create a Personal Access Token (PAT) with the `write:packages` (and `repo` if needed) scopes and add it to the repository Secrets as `GHCR_PAT`:
-
-1. Create a PAT in GitHub (Settings → Developer settings → Personal access tokens) with scopes `write:packages` and `repo` (if you need to access private repo resources).
-2. In the repository, go to Settings → Secrets and variables → Actions → New repository secret and add `GHCR_PAT` with the token value.
-
-You can then modify `.github/workflows/ghcr-visibility.yml` or other workflows to use `${{ secrets.GHCR_PAT }}` where a higher-privileged token is required.
-
-Note: keep PATs secret and rotate them regularly. For organization-wide automation, consider creating a GitHub App with limited permissions instead.
-
-Local testing of images
-
-After building locally, tag and run the image:
+## Build locale
 
 ```bash
-docker build -t ghcr.io/lucaam/social-media-reuploader:dev .
-docker run -e BOT_TOKEN="$BOT_TOKEN" -p 8080:8080 ghcr.io/lucaam/social-media-reuploader:dev
+docker build -t ghcr.io/lucaam/social-media-reuploader:dev \
+  --build-arg VERSION=dev --build-arg VCS_REF="$(git rev-parse HEAD)" .
+docker run --rm ghcr.io/lucaam/social-media-reuploader:dev deno --version
+docker run --rm -e BOT_TOKEN="$BOT_TOKEN" -p 127.0.0.1:8080:8080 \
+  ghcr.io/lucaam/social-media-reuploader:dev
 ```
