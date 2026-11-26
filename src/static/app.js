@@ -1,851 +1,1619 @@
-// Externalized app script (moved from inline in index.html)
-// This file is loaded with `defer` so DOM is available.
-const authControls = document.getElementById('authControls')
-const requestsTable = document.getElementById('requestsTable')
-const updatesEl = document.getElementById('updates')
-const searchInput = document.getElementById('searchInput')
-const pageSizeSelect = document.getElementById('pageSize')
-const paginationEl = document.getElementById('pagination')
-const statusCtx = document.getElementById('statusChart')
-const topChatsCtx = document.getElementById('topChatsChart')
-const durationCtx = document.getElementById('durationChart')
-const statusFilterSelect = document.getElementById('statusFilter')
-const queueQueuedEl = document.getElementById('queueQueued')
-const queueRunningEl = document.getElementById('queueRunning')
-const refreshQueueBtn = document.getElementById('refreshQueueBtn')
-const clearQueueBtn = document.getElementById('clearQueueBtn')
-const startQueueBtn = document.getElementById('startQueueBtn')
-const showConfigBtn = document.getElementById('showConfigBtn')
+/*
+ * Admin console of social-media-reuploader.
+ *
+ * - No inline handlers and no innerHTML with data: every node is built with
+ *   DOM APIs and text goes through textContent. Links are rendered only for
+ *   http(s) URLs, with rel="noopener noreferrer".
+ * - Data comes from the JSON API (relative URLs, cookie session). 401 shows
+ *   the login overlay, 403 the "not an administrator" overlay; other errors
+ *   are shown as toasts.
+ * - Live updates: one WebSocket (event-log batches from the server), with
+ *   exponential backoff + jitter on reconnect and a full resync after it.
+ *   Bursts of events are coalesced: each resource is refreshed at most once
+ *   per short window, one request in flight per resource, and sequence guards
+ *   drop stale responses.
+ * - Timestamps from the server are ISO 8601 with an offset; they are shown in
+ *   the browser's local time.
+ */
+(function () {
+  'use strict'
 
-let timeSeriesChart = null
-let statusChart = null
-let loginInlineInit = false
-
-// helper: use cookie-based session (include credentials for widest compatibility)
-function fetchWithCreds(url, opts) {
-  opts = opts || {}
-  opts.credentials = opts.credentials || 'include'
-  return fetch(url, opts)
-}
-
-async function loadRequests(page = 1) {
-  try {
-    const limit = parseInt(pageSizeSelect.value, 10)
-    const offset = (page - 1) * limit
-    let q = `/requests?limit=${limit}&offset=${offset}`
-    try {
-      const sVal = (searchInput && searchInput.value) ? searchInput.value.trim() : ''
-      if (sVal) q += '&q=' + encodeURIComponent(sVal)
-    } catch (e) {}
-    try {
-      const sf = (statusFilterSelect && statusFilterSelect.value) ? statusFilterSelect.value : 'all'
-      if (sf && sf !== 'all') q += '&status=' + encodeURIComponent(sf)
-    } catch (e) {}
-    const resp = await fetchWithCreds(q)
-    if (!resp.ok) throw new Error('unauthorized')
-    const data = await resp.json()
-    return data
-  } catch (err) {
-    requestsTable.innerHTML = '<tr><td colspan="9">Could not fetch requests (invalid token?)</td></tr>'
-    return { items: [], total: 0, offset: 0, limit: parseInt(pageSizeSelect.value, 10) }
+  // ---------------------------------------------------------------------
+  // Labels (Italian UI)
+  // ---------------------------------------------------------------------
+  const STATUS_META = {
+    queued: { label: 'In coda', badge: 'text-bg-warning', color: '#f0ad4e' },
+    deferred: { label: 'Differita', badge: 'text-bg-info', color: '#5bc0de' },
+    processing: { label: 'In elaborazione', badge: 'text-bg-primary', color: '#0d6efd' },
+    sending: { label: 'In invio', badge: 'text-bg-primary', color: '#6610f2' },
+    done: { label: 'Completata', badge: 'text-bg-success', color: '#198754' },
+    failed: { label: 'Fallita', badge: 'text-bg-danger', color: '#dc3545' },
+    rate_limited: { label: 'Rifiutata (limite)', badge: 'text-bg-warning', color: '#fd7e14' },
+    duplicate: { label: 'Duplicato', badge: 'text-bg-secondary', color: '#6c757d' },
+    cancelled: { label: 'Annullata', badge: 'text-bg-dark', color: '#343a40' },
+    aborted: { label: 'Interrotta', badge: 'text-bg-dark', color: '#868e96' },
+    pending: { label: 'In attesa (versione precedente)', badge: 'text-bg-light', color: '#adb5bd' },
+    unlimited: { label: 'Sbloccata (versione precedente)', badge: 'text-bg-light', color: '#ced4da' },
+    unknown: { label: 'Sconosciuto', badge: 'text-bg-light', color: '#dee2e6' }
   }
-}
-
-async function loadUpdates(page = 1) {
-  try {
-    const limit = 50
-    const offset = (page - 1) * limit
-    const resp = await fetchWithCreds(`/api/updates?limit=${limit}&offset=${offset}`)
-    if (!resp.ok) throw new Error('unauthorized')
-    const data = await resp.json()
-    updatesEl.textContent = data.items.slice(0,50).map(u => `${u.created_at}\n${u.raw}\n---`).join('\n')
-    return data
-  } catch (err) {
-    updatesEl.textContent = 'Could not fetch updates (invalid token?)'
-    return { items: [] }
+  const REQUEUEABLE = ['failed', 'rate_limited', 'cancelled', 'aborted', 'duplicate', 'pending', 'unlimited']
+  const ERROR_LABELS = {
+    failed: 'Errore generico',
+    unsupported: 'Link non supportato',
+    auth_required: 'Accesso o cookie richiesti',
+    unavailable: 'Contenuto non disponibile',
+    geo_blocked: 'Bloccato nel paese del server',
+    live: 'Diretta in corso',
+    too_long: 'Contenuto troppo lungo',
+    too_large: 'File troppo grande',
+    no_media: 'Nessun video o audio',
+    timeout: 'Tempo scaduto',
+    conversion_failed: 'Conversione fallita',
+    rate_limited: 'Troppi link in poco tempo',
+    pending_cap: 'Troppe richieste in attesa',
+    duplicate: 'Link già inviato di recente',
+    interrupted: 'Interrotta da un riavvio',
+    interrupted_while_sending: 'Interrotta durante l\'invio'
   }
-}
-
-function renderStatusChart(counts) {
-  const labels = Object.keys(counts)
-  const values = Object.values(counts)
-  const ctx = statusCtx.getContext('2d')
-  const colors = ['#0d6efd','#198754','#ffc107','#dc3545','#6c757d','#6f42c1','#0dcaf0']
-  if (!statusChart) {
-    statusChart = new Chart(ctx, {
-      type: 'doughnut',
-      data: { labels, datasets: [{ data: values, backgroundColor: colors.slice(0, values.length) }] },
-      options: {
-        responsive: true,
-        plugins: {
-          legend: { position: 'bottom', labels: { boxWidth: 12, padding: 6 } },
-          tooltip: { mode: 'index', intersect: false }
-        },
-        cutout: '50%'
-      }
-    })
-  } else {
-    statusChart.data.labels = labels
-    statusChart.data.datasets[0].data = values
-    statusChart.data.datasets[0].backgroundColor = colors.slice(0, values.length)
-    statusChart.update()
+  const EVENT_LABELS = {
+    request_created: 'Richiesta creata',
+    request_status: 'Cambio di stato',
+    request_updated: 'Richiesta aggiornata',
+    request_event: 'Evento della richiesta',
+    queue_cleared: 'Coda annullata',
+    rate_limit_changed: 'Limite della chat',
+    chat_unlimited: 'Chat sbloccata',
+    chat_unlimited_all: 'Tutte le chat sbloccate',
+    history_cleared: 'Storico eliminato',
+    history_pruned: 'Pulizia automatica',
+    update_created: 'Riga non strutturata'
   }
-}
-
-function computeTimeSeries(reqs, hours = 24) {
-  const now = Date.now()
-  const buckets = new Array(hours).fill(0)
-  const labels = []
-  for (let i = hours - 1; i >= 0; i--) {
-    const t = new Date(now - i * 3600 * 1000)
-    labels.push(t.getHours() + ':' + String(t.getMinutes()).padStart(2, '0'))
+  const FIELD_LABELS = {
+    original_size: 'dimensione originale',
+    final_size: 'dimensione finale',
+    compressed: 'compressione',
+    provider: 'sito',
+    media_type: 'tipo di media',
+    error_code: 'codice errore',
+    error_message: 'messaggio di errore',
+    sent_message_id: 'messaggio inviato'
   }
-  for (const r of reqs) {
-    try {
-      const ts = new Date(r.created_at).getTime()
-      const diffHours = Math.floor((now - ts) / (3600 * 1000))
-      if (diffHours >= 0 && diffHours < hours) {
-        buckets[hours - 1 - diffHours] += 1
-      }
-    } catch (e) {
-      // ignore parse errors
+  const LIMIT_SOURCES = {
+    worker: 'riportati dal worker',
+    worker_last_seen: 'ultimo heartbeat del worker',
+    gui_config: 'configurazione della console (worker non disponibile)'
+  }
+
+  // ---------------------------------------------------------------------
+  // DOM helpers
+  // ---------------------------------------------------------------------
+  const $ = (id) => document.getElementById(id)
+
+  function el (tag, opts, ...children) {
+    const node = document.createElement(tag)
+    const o = opts || {}
+    if (o.className) node.className = o.className
+    if (o.text !== undefined && o.text !== null) node.textContent = String(o.text)
+    if (o.title) node.title = String(o.title)
+    if (o.type) node.type = o.type
+    if (o.attrs) {
+      for (const [key, value] of Object.entries(o.attrs)) node.setAttribute(key, String(value))
     }
+    if (o.onClick) node.addEventListener('click', o.onClick)
+    for (const child of children) {
+      if (child !== null && child !== undefined && child !== false) node.append(child)
+    }
+    return node
   }
-  return { labels, buckets }
-}
 
-function renderTimeSeries(reqs) {
-  const series = computeTimeSeries(reqs, 24)
-  const canvas = document.getElementById('timeSeriesChart')
-  if (!canvas) return
-  const c = canvas.getContext('2d')
-  const gradient = c.createLinearGradient(0,0,0,160)
-  gradient.addColorStop(0,'rgba(13,110,253,0.18)')
-  gradient.addColorStop(1,'rgba(13,110,253,0.03)')
-  if (!timeSeriesChart) {
-    timeSeriesChart = new Chart(c, {
-      type: 'line',
-      data: { labels: series.labels, datasets: [{ label: 'Requests', data: series.buckets, borderColor: '#0d6efd', backgroundColor: gradient, fill: true, tension: 0.35, pointRadius: 2 }] },
-      options: { responsive: true, scales: { x: { ticks: { maxRotation: 0 } } }, plugins: { legend:{ display:false }, tooltip: { mode:'index', intersect:false } } }
-    })
-  } else {
-    timeSeriesChart.data.labels = series.labels
-    timeSeriesChart.data.datasets[0].data = series.buckets
-    timeSeriesChart.update()
+  function button (label, className, onClick, title) {
+    return el('button', { className: 'btn btn-sm ' + className, text: label, type: 'button', title, onClick })
   }
-}
 
-async function loadAll() {
-  try {
-    const mainEl = document.getElementById('mainContainer')
-    if (mainEl && window.getComputedStyle && window.getComputedStyle(mainEl).display === 'none') {
-      // main UI hidden (login/not-admin shown) — don't call protected APIs
-      return
-    }
-    // check whether the session is admin to avoid repeated 403s
-    const meResp = await fetchWithCreds('/api/me')
-    if (!meResp.ok) {
-      // not logged in or session expired — let initAuth handle UI
-      return
-    }
-    const me = await meResp.json()
-    if (!me.is_admin) {
-      requestsTable.innerHTML = '<tr><td colspan="9">Admin privileges required to view requests. Use the "Grant admin" button if available.</td></tr>'
-      updatesEl.textContent = 'Admin privileges required to fetch updates.'
-      return
-    }
-
-    await renderTablePage(currentPage)
-    await loadQueue()
-    const reqData = await loadRequests(currentPage)
-    await loadUpdates()
-    await loadStats()
-    const items = (reqData && reqData.items) || []
-    // prefer server-side aggregates when available
-    await loadAggregates()
-    await loadRateLimits()
-    renderTimeSeries(items)
-  } catch (err) {
-    // ignore errors — keep UI readable
-  }
-}
-
-async function loadQueue() {
-  try {
-    if (!queueQueuedEl && !queueRunningEl) return
-    const resp = await fetchWithCreds('/api/queue')
-    if (!resp.ok) {
-      queueQueuedEl.innerHTML = '<li class="list-group-item">No access</li>'
-      queueRunningEl.innerHTML = ''
-      return
-    }
-    const d = await resp.json()
-    renderQueue(d)
-  } catch (e) {
-    try { if (queueQueuedEl) queueQueuedEl.innerHTML = '<li class="list-group-item">Error</li>' } catch (e) {}
-  }
-}
-
-function formatTimeAgo(iso) {
-  try {
-    const t = new Date(iso).getTime()
-    const diff = Math.floor((Date.now() - t) / 1000)
-    if (diff < 5) return 'now'
-    if (diff < 60) return diff + 's'
-    if (diff < 3600) return Math.floor(diff/60) + 'm'
-    if (diff < 86400) return Math.floor(diff/3600) + 'h'
-    return Math.floor(diff/86400) + 'd'
-  } catch (e) { return '' }
-}
-
-function renderQueue(d) {
-  try {
-    const queued = (d && d.queued) || []
-    const running = (d && d.running) || []
-    if (queueQueuedEl) {
-      queueQueuedEl.innerHTML = ''
-      if (queued.length === 0) {
-        const li = document.createElement('li'); li.className='list-group-item small text-muted'; li.textContent='(vuota)'; queueQueuedEl.appendChild(li)
-      } else {
-        for (const it of queued.slice(0,50)) {
-          const li = document.createElement('li')
-          li.className = 'list-group-item d-flex justify-content-between align-items-start'
-          const left = document.createElement('div')
-          left.style.maxWidth = '60%'
-          const a = document.createElement('a')
-          a.href = it.url || '#'
-          a.target = '_blank'
-          a.className = 'text-truncate-link'
-          a.textContent = it.url || ('id:' + (it.request_id || ''))
-          left.appendChild(a)
-          const meta = document.createElement('div')
-          meta.className = 'small text-muted'
-          meta.textContent = it.chat_id ? ('chat:' + it.chat_id) : ''
-          left.appendChild(meta)
-          const right = document.createElement('div')
-          right.className = 'small text-muted text-end'
-          right.textContent = formatTimeAgo(it.enqueued_at || it.created_at || new Date().toISOString())
-          li.appendChild(left)
-          li.appendChild(right)
-          queueQueuedEl.appendChild(li)
-        }
-      }
-    }
-    if (queueRunningEl) {
-      queueRunningEl.innerHTML = ''
-      if (running.length === 0) {
-        const li = document.createElement('li'); li.className='list-group-item small text-muted'; li.textContent='(nessun job in esecuzione)'; queueRunningEl.appendChild(li)
-      } else {
-        for (const it of running.slice(0,50)) {
-          const li = document.createElement('li')
-          li.className = 'list-group-item d-flex justify-content-between align-items-start'
-          const left = document.createElement('div')
-          left.style.maxWidth = '60%'
-          const a = document.createElement('a')
-          a.href = it.url || '#'
-          a.target = '_blank'
-          a.className = 'text-truncate-link'
-          a.textContent = it.url || ('id:' + (it.request_id || ''))
-          left.appendChild(a)
-          const meta = document.createElement('div')
-          meta.className = 'small text-muted'
-          meta.textContent = it.chat_id ? ('chat:' + it.chat_id) : ''
-          left.appendChild(meta)
-          const right = document.createElement('div')
-          right.className = 'small text-muted text-end'
-          right.textContent = formatTimeAgo(it.enqueued_at || new Date().toISOString())
-          li.appendChild(left)
-          li.appendChild(right)
-          queueRunningEl.appendChild(li)
-        }
-      }
-    }
-  } catch (e) {
-    // ignore
-  }
-}
-
-async function loadAggregates() {
-  try {
-    const resp = await fetchWithCreds('/api/aggregates')
-    if (!resp.ok) return
-    const d = await resp.json()
-    // populate status filter options
-    if (statusFilterSelect) {
-      const existing = new Set(Array.from(statusFilterSelect.options).map(o=>o.value))
-      Object.keys(d.status_counts || {}).forEach(s => {
-        const v = s || 'unknown'
-        if (!existing.has(v)) {
-          const opt = document.createElement('option')
-          opt.value = v
-          opt.textContent = v
-          statusFilterSelect.appendChild(opt)
-        }
-      })
-    }
-    if (d.status_counts) renderStatusChart(d.status_counts)
-    if (d.top_chats) renderTopChats(d.top_chats)
-    if (d.duration_histogram) renderDurationHist(d.duration_histogram)
-  } catch (e) {
-    // ignore
-  }
-}
-
-async function loadRateLimits() {
-  try {
-    const resp = await fetchWithCreds('/api/rate_limits')
-    const el = document.getElementById('rateLimitsList')
-    if (!el) return
-    if (!resp.ok) {
-      el.innerHTML = '<div class="small text-muted">No access</div>'
-      return
-    }
-    const d = await resp.json()
-    renderRateLimits(d)
-  } catch (e) {
-    const el = document.getElementById('rateLimitsList')
-    if (el) el.innerHTML = '<div class="small text-danger">Error fetching rate limits</div>'
-  }
-}
-
-function renderRateLimits(d) {
-  const el = document.getElementById('rateLimitsList')
-  if (!el) return
-  el.innerHTML = ''
-  try {
-    // Global unlimit action
-    const topActions = document.createElement('div')
-    topActions.className = 'd-flex justify-content-end mb-2'
-    const unlimitAllBtn = document.createElement('button')
-    unlimitAllBtn.className = 'btn btn-sm btn-outline-primary'
-    unlimitAllBtn.textContent = 'Sblocca tutti (requeue)'
-    unlimitAllBtn.onclick = async () => {
+  function safeLink (url, text) {
+    if (typeof url === 'string' && url) {
       try {
-        unlimitAllBtn.disabled = true
-        await fetchWithCreds('/api/unlimit_all', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ requeue: true }) })
-        await loadRateLimits(); await loadQueue()
-      } catch (e) { console.debug('unlimit_all failed', e) }
-      unlimitAllBtn.disabled = false
-    }
-    topActions.appendChild(unlimitAllBtn)
-    el.appendChild(topActions)
-    // currently limited chats (in-memory worker data)
-    const curr = d.currently_limited || []
-    if (curr.length > 0) {
-      const hdr = document.createElement('div'); hdr.className='mb-2 small text-muted'; hdr.textContent = `Currently limited chats: ${curr.length}`; el.appendChild(hdr)
-        for (const c of curr.slice(0,50)) {
-        const div = document.createElement('div'); div.className='d-flex justify-content-between align-items-center mb-1'
-        const left = document.createElement('div'); left.className='small'; left.textContent = `chat: ${c.chat_id}`
-        const right = document.createElement('div'); right.className='d-flex gap-2 align-items-center'
-        const info = document.createElement('div'); info.className='small text-muted'; info.textContent = c.next_in_seconds ? `blocked for ${c.next_in_seconds}s` : ''
-        const btn = document.createElement('button'); btn.className='btn btn-sm btn-outline-primary'; btn.style.fontSize='0.8rem'; btn.textContent = 'Sblocca';
-        btn.onclick = async () => {
-          try {
-            btn.disabled = true
-            const requeue = confirm('Rimettere in coda le richieste persistenti per questa chat? OK = Sì, Annulla = No')
-            await unlimitChat(c.chat_id, requeue)
-            await loadRateLimits(); await loadQueue()
-          } catch(e){ console.debug('unlimit failed', e) }
-          finally { btn.disabled = false }
+        const parsed = new URL(url)
+        if (parsed.protocol === 'http:' || parsed.protocol === 'https:') {
+          const a = el('a', { text: text || url, className: 'text-truncate-link', title: url })
+          a.href = parsed.href
+          a.target = '_blank'
+          a.rel = 'noopener noreferrer'
+          return a
         }
-        right.appendChild(info); right.appendChild(btn);
-        div.appendChild(left); div.appendChild(right); el.appendChild(div)
-      }
-      const sep = document.createElement('hr'); sep.className='my-2'; el.appendChild(sep)
+      } catch (e) { /* not a URL: plain text below */ }
     }
-    const per = d.per_chat || []
-    if (per.length === 0) {
-      const div = document.createElement('div'); div.className='small text-muted'; div.textContent='No recent activity'; el.appendChild(div);
-    } else {
-      for (const p of per.slice(0,50)) {
-        const item = document.createElement('div')
-        item.className = 'mb-2'
-        const h = document.createElement('div'); h.className='d-flex justify-content-between align-items-center'
-        const left = document.createElement('div'); left.className='small'; left.textContent = 'chat: ' + p.chat_id
-        const right = document.createElement('div'); right.className='d-flex gap-2 align-items-center small text-muted';
-        const nowSec = Math.floor(Date.now()/1000)
-        let rightText = ''
-        if (p.last_rate_limited_next) {
-          const next = Math.floor(p.last_rate_limited_next)
-          if (next > nowSec) {
-            rightText = 'blocked for ' + (next - nowSec) + 's'
-          }
-        } else if (p.next_available_seconds) {
-          rightText = 'next_in ' + p.next_available_seconds + 's'
-        }
-        const infoDiv = document.createElement('div'); infoDiv.textContent = rightText
-        const btn = document.createElement('button'); btn.className='btn btn-sm btn-outline-primary'; btn.style.fontSize='0.8rem'; btn.textContent = 'Sblocca';
-        btn.onclick = async () => { try { btn.disabled = true; await unlimitChat(p.chat_id, true); await loadRateLimits(); await loadQueue() } catch(e){ console.debug('unlimit failed', e) } finally { btn.disabled = false } }
-        right.appendChild(infoDiv); right.appendChild(btn)
-        h.appendChild(left); h.appendChild(right)
-        item.appendChild(h)
-        // counters (compact)
-        const cnts = document.createElement('div'); cnts.className = 'small text-muted'
-        const parts = []
-        for (const c of (p.counters || [])) {
-          parts.push(`${c.count}/${c.limit}@${Math.floor(c.window_seconds/60) || c.window_seconds}s`)
-        }
-        cnts.textContent = parts.join(' | ')
-        item.appendChild(cnts)
-        el.appendChild(item)
-      }
-    }
-
-    // show a short link to persisted rate_limited rows (no per-link actions)
-    const persisted = d.persisted_limited_chats || []
-    if (persisted.length > 0) {
-      const hdr2 = document.createElement('div'); hdr2.className='mt-2 small text-muted'; hdr2.textContent = 'Persisted blocked chats (DB):'; el.appendChild(hdr2)
-      const list = document.createElement('div'); list.className = 'small';
-      list.style.maxHeight = '160px'; list.style.overflow = 'auto'; list.style.paddingLeft = '0.5rem'
-      for (const p of persisted.slice(0,50)) {
-        const dline = document.createElement('div'); dline.style.marginBottom='6px'; dline.className='d-flex justify-content-between align-items-center'
-        const span = document.createElement('div'); span.textContent = `chat: ${p.chat_id} (${p.count} items)`
-        const actions = document.createElement('div')
-        const btnRe = document.createElement('button'); btnRe.className='btn btn-sm btn-outline-primary me-1'; btnRe.textContent = 'Sblocca (requeue)'
-        btnRe.onclick = async () => { try { btnRe.disabled = true; await unlimitChat(p.chat_id, true); await loadRateLimits(); await loadQueue() } catch(e){ console.debug('unlimit failed', e) } finally { btnRe.disabled = false } }
-        const btnNo = document.createElement('button'); btnNo.className='btn btn-sm btn-outline-secondary'; btnNo.textContent = 'Sblocca (no requeue)'
-        btnNo.onclick = async () => { try { btnNo.disabled = true; await unlimitChat(p.chat_id, false); await loadRateLimits(); await loadQueue() } catch(e){ console.debug('unlimit failed', e) } finally { btnNo.disabled = false } }
-        actions.appendChild(btnRe); actions.appendChild(btnNo)
-        dline.appendChild(span); dline.appendChild(actions); list.appendChild(dline)
-      }
-      el.appendChild(list)
-    }
-  } catch (e) {
-    el.innerHTML = '<div class="small text-danger">Error rendering rate limits</div>'
+    return el('span', { text: text || url || '—', className: 'text-truncate-link', title: url || '' })
   }
-}
 
-async function unlimitChat(chatId, requeue) {
-  try {
-    await fetchWithCreds('/api/unlimit_chat', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ chat_id: chatId, requeue: !!requeue }) })
-    await loadRateLimits(); await loadQueue()
-  } catch (e) { console.debug('unlimitChat failed', e) }
-}
-
-async function clearQueue(chatId) {
-  const btn = document.getElementById('clearQueueBtn')
-  try {
-    if (btn) { btn.disabled = true; btn.textContent = 'Svuotando…' }
-    const body = chatId ? { chat_id: chatId } : {}
-    const resp = await fetchWithCreds('/api/clear_queue', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body) })
-    if (!resp.ok) throw new Error('server error')
-    // refresh only the queue and rate-limits to avoid triggering broad reloads
-    await loadQueue()
-    await loadRateLimits()
-  } catch (e) {
-    console.debug('clearQueue failed', e)
-    alert('Errore durante lo svuotamento della coda')
-  } finally {
-    if (btn) { btn.disabled = false; btn.textContent = 'Svuota coda' }
+  function emptyRow (columns, text) {
+    return el('tr', null, el('td', { className: 'empty-note', text, attrs: { colspan: columns } }))
   }
-}
 
-async function showConfig() {
-  try {
-    const resp = await fetchWithCreds('/config')
-    if (!resp.ok) return
-    const cfg = await resp.json()
-    const el = document.getElementById('configDump')
-    if (el) el.textContent = JSON.stringify(cfg, null, 2)
-  } catch (e) { console.debug('showConfig failed', e) }
-}
+  function emptyItem (text) {
+    return el('li', { className: 'list-group-item empty-note', text })
+  }
 
-let topChatsChart = null
-function renderTopChats(topChats) {
-  try {
-    const labels = topChats.map(t => String(t.chat_id))
-    const data = topChats.map(t => t.count)
-    const c = topChatsCtx.getContext('2d')
-    if (!topChatsChart) {
-      topChatsChart = new Chart(c, { type: 'bar', data: { labels, datasets: [{ label: 'Requests', data, backgroundColor: '#0d6efd' }] }, options: { indexAxis: 'y', responsive:true, plugins:{legend:{display:false}} } })
-    } else {
-      topChatsChart.data.labels = labels
-      topChatsChart.data.datasets[0].data = data
-      topChatsChart.update()
+  function definition (dl, label, value) {
+    dl.append(el('dt', { className: 'col-sm-5', text: label }))
+    const dd = el('dd', { className: 'col-sm-7' })
+    if (value instanceof Node) dd.append(value)
+    else dd.textContent = value === null || value === undefined || value === '' ? '—' : String(value)
+    dl.append(dd)
+  }
+
+  // ---------------------------------------------------------------------
+  // Formatting
+  // ---------------------------------------------------------------------
+  const dateFmt = new Intl.DateTimeFormat('it-IT', { dateStyle: 'short', timeStyle: 'medium' })
+  const hourFmt = new Intl.DateTimeFormat('it-IT', { hour: '2-digit', minute: '2-digit' })
+  const relFmt = new Intl.RelativeTimeFormat('it', { numeric: 'auto' })
+  const numFmt = new Intl.NumberFormat('it-IT')
+  const pctFmt = new Intl.NumberFormat('it-IT', { style: 'percent', maximumFractionDigits: 1 })
+
+  function parseDate (iso) {
+    if (!iso) return null
+    const d = new Date(iso)
+    return Number.isNaN(d.getTime()) ? null : d
+  }
+
+  function fmtDate (iso) {
+    const d = parseDate(iso)
+    return d ? dateFmt.format(d) : '—'
+  }
+
+  function fmtAgo (iso) {
+    const d = parseDate(iso)
+    if (!d) return '—'
+    const seconds = Math.round((d.getTime() - Date.now()) / 1000)
+    const abs = Math.abs(seconds)
+    if (abs < 45) return relFmt.format(seconds, 'second')
+    if (abs < 45 * 60) return relFmt.format(Math.round(seconds / 60), 'minute')
+    if (abs < 22 * 3600) return relFmt.format(Math.round(seconds / 3600), 'hour')
+    return relFmt.format(Math.round(seconds / 86400), 'day')
+  }
+
+  // A <time> element whose relative text is refreshed periodically.
+  function timeAgo (iso, prefix) {
+    const node = el('time', { text: (prefix || '') + fmtAgo(iso), title: fmtDate(iso) })
+    if (iso) {
+      node.dateTime = iso
+      node.dataset.ago = iso
+      if (prefix) node.dataset.prefix = prefix
     }
-  } catch (e) {}
-}
+    return node
+  }
 
-let durationChart = null
-function renderDurationHist(hist) {
-  try {
-    const labels = hist.labels || []
-    const data = hist.counts || []
-    const c = durationCtx.getContext('2d')
-    if (!durationChart) {
-      durationChart = new Chart(c, { type: 'bar', data: { labels, datasets: [{ label: 'Count', data, backgroundColor: '#198754' }] }, options: { responsive:true, plugins:{legend:{display:false}}, scales:{ y: { beginAtZero:true } } } })
-    } else {
-      durationChart.data.labels = labels
-      durationChart.data.datasets[0].data = data
-      durationChart.update()
+  function refreshRelativeTimes () {
+    for (const node of document.querySelectorAll('time[data-ago]')) {
+      node.textContent = (node.dataset.prefix || '') + fmtAgo(node.dataset.ago)
     }
-  } catch (e) {}
-}
-
-// server-side pagination & search (search handled server-side later)
-let currentPage = 1
-
-async function renderTablePage(page = 1) {
-  const limit = parseInt(pageSizeSelect.value, 10)
-  const data = await loadRequests(page)
-  const total = data.total || 0
-  const items = data.items || []
-  requestsTable.innerHTML = ''
-    for (const r of items) {
-    const tr = document.createElement('tr')
-      const comp = r.compressed ? 'yes' : (r.compressed === false ? 'no' : '')
-    const proc = r.processing_duration_seconds ? (r.processing_duration_seconds.toFixed(1) + 's') : ''
-    const eventsSummary = (r.events || []).map(e => `${e.type}${e.duration_seconds ? `:${e.duration_seconds.toFixed(1)}s` : ''}`).join(', ')
-    let statusClass = 'bg-secondary'
-    if (r.status === 'finished' || r.status === 'done' || r.status === 'completed') statusClass = 'bg-success'
-    else if (r.status === 'failed' || r.status === 'error') statusClass = 'bg-danger'
-    else if (r.status === 'running' || r.status === 'processing' || r.status === 'in_progress') statusClass = 'bg-info'
-    else if (r.status === 'queued' || r.status === 'pending') statusClass = 'bg-warning text-dark'
-
-    // build cells safely to avoid HTML injection
-    const tdId = document.createElement('td'); tdId.textContent = String(r.id); tr.appendChild(tdId)
-    const tdChat = document.createElement('td'); tdChat.textContent = String(r.chat_id); tr.appendChild(tdChat)
-    const tdUrl = document.createElement('td'); const a = document.createElement('a'); a.href = r.url || '#'; a.target = '_blank'; a.className = 'text-truncate-link'; a.rel = 'noopener noreferrer'; a.textContent = r.url || ''; tdUrl.appendChild(a); tr.appendChild(tdUrl)
-    // original size (MB)
-    const tdOrig = document.createElement('td'); tdOrig.className = 'mono'; tdOrig.textContent = (r.original_size_mb !== null && r.original_size_mb !== undefined) ? (String(r.original_size_mb) + ' MB') : '—'; tr.appendChild(tdOrig)
-    // final size (MB)
-    const tdFinal = document.createElement('td'); tdFinal.className = 'mono'; tdFinal.textContent = (r.final_size_mb !== null && r.final_size_mb !== undefined) ? (String(r.final_size_mb) + ' MB') : '—'; tr.appendChild(tdFinal)
-    // compressed flag
-    const tdComp = document.createElement('td'); tdComp.textContent = (r.compressed === true) ? 'yes' : (r.compressed === false ? 'no' : '—'); tr.appendChild(tdComp)
-    const tdStatus = document.createElement('td'); const span = document.createElement('span'); span.className = 'badge ' + statusClass; span.textContent = r.status || ''; tdStatus.appendChild(span); tr.appendChild(tdStatus)
-    const tdProc = document.createElement('td'); tdProc.textContent = proc; tr.appendChild(tdProc)
-    const tdCreated = document.createElement('td'); tdCreated.textContent = r.created_at || ''; tr.appendChild(tdCreated)
-    if (eventsSummary) tr.title = eventsSummary
-    requestsTable.appendChild(tr)
   }
-  // render pagination using server total
-  const totalPages = Math.max(1, Math.ceil(total / limit))
-  paginationEl.innerHTML = ''
-  const makeLi = (text, disabled, cb) => {
-    const li = document.createElement('li')
-    li.className = 'page-item' + (disabled ? ' disabled' : '')
-    const a = document.createElement('a')
-    a.className = 'page-link'
-    a.href = '#'
-    a.textContent = text
-    a.onclick = (e) => { e.preventDefault(); if (!disabled) cb(); }
-    li.appendChild(a)
-    return li
+
+  function fmtNumber (n) {
+    return n === null || n === undefined ? '—' : numFmt.format(n)
   }
-  paginationEl.appendChild(makeLi('«', page === 1, () => { currentPage = 1; renderTablePage(1) }))
-  paginationEl.appendChild(makeLi('‹', page === 1, () => { currentPage = Math.max(1, page - 1); renderTablePage(currentPage) }))
-  const startPage = Math.max(1, page - 2)
-  const endPage = Math.min(totalPages, startPage + 4)
-  for (let p = startPage; p <= endPage; p++) {
-    const li = makeLi(String(p), false, () => { currentPage = p; renderTablePage(p) })
-    if (p === page) li.classList.add('active')
-    paginationEl.appendChild(li)
-  }
-  paginationEl.appendChild(makeLi('›', page === totalPages, () => { currentPage = Math.min(totalPages, page + 1); renderTablePage(currentPage) }))
-  paginationEl.appendChild(makeLi('»', page === totalPages, () => { currentPage = totalPages; renderTablePage(totalPages) }))
-}
 
-async function loadStats() {
-  try {
-    const resp = await fetchWithCreds('/stats')
-    if (!resp.ok) return
-    const s = await resp.json()
-    document.getElementById('statAvgOrig').textContent = s.avg_original_size_mb ? (s.avg_original_size_mb + ' MB') : '—'
-    document.getElementById('statAvgFinal').textContent = s.avg_final_size_mb ? (s.avg_final_size_mb + ' MB') : '—'
-    document.getElementById('statAvgProc').textContent = s.avg_processing_seconds ? (s.avg_processing_seconds.toFixed(1) + ' s') : '—'
-    try { document.getElementById('statTotalDownloaded').textContent = s.total_downloaded !== undefined ? String(s.total_downloaded) : '—' } catch(e){}
-    try { document.getElementById('statTotalSent').textContent = s.total_sent !== undefined ? String(s.total_sent) : '—' } catch(e){}
-    try { document.getElementById('statTotalDownloadedMB').textContent = s.total_original_mb !== undefined ? (String(s.total_original_mb) + ' MB') : '—' } catch(e){}
-    try { document.getElementById('statTotalUploadedMB').textContent = s.total_final_mb !== undefined ? (String(s.total_final_mb) + ' MB') : '—' } catch(e){}
-    try { document.getElementById('statTotalProcessedMB').textContent = s.total_processed_mb !== undefined ? (String(s.total_processed_mb) + ' MB') : '—' } catch(e){}
-    try { document.getElementById('statTotalRateLimited').textContent = s.total_rate_limited_files !== undefined ? String(s.total_rate_limited_files) : '—' } catch(e){}
-    try { document.getElementById('statTotalChatsLimited').textContent = s.total_chats_rate_limited !== undefined ? String(s.total_chats_rate_limited) : '—' } catch(e){}
-    try { document.getElementById('statTotalDuplicates').textContent = s.total_duplicates !== undefined ? String(s.total_duplicates) : '—' } catch(e){}
-  } catch (e) {
-    // ignore
-  }
-}
-
-// search events
-let searchTimeout = null
-searchInput.addEventListener('input', () => { currentPage = 1; clearTimeout(searchTimeout); searchTimeout = setTimeout(() => renderTablePage(1), 250) })
-pageSizeSelect.addEventListener('change', () => { currentPage = 1; renderTablePage(1) })
-if (statusFilterSelect) statusFilterSelect.addEventListener('change', () => { currentPage = 1; renderTablePage(1) })
-
-// display login if oauth configured
-async function initAuth() {
-  try {
-    const cfg = await (await fetchWithCreds('/config')).json()
-    const me = await (await fetchWithCreds('/api/me')).json()
-    const main = document.getElementById('mainContainer')
-    const loginBox = document.getElementById('loginBox')
-    const notAdminBox = document.getElementById('notAdminBox')
-    // clear previous controls
-    authControls.innerHTML = ''
-
-    function isAuthenticated(meObj) {
-      if (!meObj) return false
-      if (meObj.is_admin) return true
-      if (!meObj.user) return false
-      const u = meObj.user
-      return Boolean(u.email || u.preferred_username || u.sub || u.name)
+  function fmtBytes (n) {
+    if (n === null || n === undefined) return '—'
+    const units = ['B', 'KiB', 'MiB', 'GiB', 'TiB']
+    let value = Number(n)
+    let unit = 0
+    while (value >= 1024 && unit < units.length - 1) {
+      value /= 1024
+      unit += 1
     }
+    const digits = unit === 0 || value >= 100 ? 0 : 1
+    return value.toLocaleString('it-IT', { maximumFractionDigits: digits }) + ' ' + units[unit]
+  }
 
-    if (cfg.oauth_configured || cfg.admin_token_set) {
-      // not logged-in -> show login box
-        if (!isAuthenticated(me)) {
-        if (main) main.style.display = 'none'
-        if (notAdminBox) notAdminBox.style.display = 'none'
-        if (loginBox) loginBox.style.display = 'block'
-        const big = document.getElementById('loginBtnLarge')
-        const loginInline = document.getElementById('loginInline')
-        if (cfg.oauth_configured) {
-          // show OAuth button
-          if (loginInline) loginInline.style.display = 'none'
-          if (big) { big.style.display = ''; big.href = '/login'; big.textContent = 'Login with OAuth' }
-        } else if (cfg.admin_token_set) {
-          // show inline token form for SPA login
-          if (big) big.style.display = 'none'
-          if (loginInline) loginInline.style.display = ''
-          if (!loginInlineInit) {
-            loginInlineInit = true
-            const tokenInput = document.getElementById('adminTokenInput')
-            const pasteBtn = document.getElementById('adminTokenPaste')
-            const toggleBtn = document.getElementById('adminTokenToggle')
-            const submitBtn = document.getElementById('adminTokenSubmit')
-            const errEl = document.getElementById('adminTokenError')
-            if (pasteBtn) pasteBtn.onclick = async () => {
-              try {
-                const text = await navigator.clipboard.readText()
-                if (text) tokenInput.value = text.trim()
-              } catch (e) { tokenInput.focus() }
-            }
-            if (toggleBtn) toggleBtn.onclick = () => {
-              if (tokenInput.type === 'password') { tokenInput.type = 'text'; toggleBtn.textContent = '🔒' } else { tokenInput.type = 'password'; toggleBtn.textContent = '👁' }
-            }
-            async function submitToken() {
-              if (!tokenInput.value || !tokenInput.value.trim()) {
-                errEl.style.display = ''
-                errEl.textContent = 'Inserisci il token'
-                return
-              }
-              submitBtn.disabled = true
-              errEl.style.display = 'none'
-              try {
-                const body = new URLSearchParams({ token: tokenInput.value.trim() })
-                const r = await fetchWithCreds('/login', { method: 'POST', headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, body })
-                if (r.status === 403) {
-                  errEl.style.display = ''
-                  errEl.textContent = 'Token non valido'
-                  submitBtn.disabled = false
-                } else {
-                  location.reload()
-                }
-              } catch (e) {
-                errEl.style.display = ''
-                errEl.textContent = 'Errore di rete'
-                submitBtn.disabled = false
-              }
-            }
-            if (submitBtn) submitBtn.onclick = submitToken
-            if (tokenInput) tokenInput.addEventListener('keydown', (e) => { if (e.key === 'Enter') submitToken() })
-          }
-        } else {
-          if (loginInline) loginInline.style.display = 'none'
-          if (big) { big.style.display = ''; big.href = '/login'; big.textContent = 'Login' }
-        }
-        return
-      }
+  function fmtSeconds (seconds) {
+    if (seconds === null || seconds === undefined) return '—'
+    const s = Number(seconds)
+    if (s < 60) return s.toLocaleString('it-IT', { maximumFractionDigits: s < 10 ? 1 : 0 }) + ' s'
+    const minutes = Math.floor(s / 60)
+    if (minutes < 60) return minutes + ' min ' + Math.round(s % 60) + ' s'
+    const hours = Math.floor(minutes / 60)
+    if (hours < 48) return hours + ' h ' + (minutes % 60) + ' min'
+    return Math.round(hours / 24) + ' giorni'
+  }
 
-      // authenticated
-      if (me.is_admin) {
-        // admin -> show main UI
-        if (main) main.style.display = ''
-        if (loginBox) loginBox.style.display = 'none'
-        if (notAdminBox) notAdminBox.style.display = 'none'
-
-        // refresh button
-        const refreshBtn = document.createElement('button')
-        refreshBtn.className = 'btn btn-sm btn-outline-secondary ms-2'
-        refreshBtn.textContent = 'Aggiorna'
-        refreshBtn.onclick = () => { loadAll() }
-        authControls.appendChild(refreshBtn)
-
-        // clear DB button (admin only)
-        const clearDbBtn = document.createElement('button')
-        clearDbBtn.className = 'btn btn-sm btn-outline-danger ms-2'
-        clearDbBtn.textContent = 'Pulisci DB'
-        clearDbBtn.title = 'Elimina lo storico delle richieste (solo per amministratori)'
-        clearDbBtn.onclick = async () => {
-          if (!confirm('Sei sicuro? Questa operazione eliminerà lo storico delle richieste.')) return
-          clearDbBtn.disabled = true
-          try {
-            const r = await fetchWithCreds('/api/db/clear', { method: 'POST' })
-            if (r.ok) {
-              alert('Storico cancellato')
-              loadAll()
-            } else {
-              alert('Errore durante la cancellazione')
-            }
-          } catch (e) {
-            alert('Errore di rete')
-          } finally {
-            clearDbBtn.disabled = false
-          }
-        }
-        authControls.appendChild(clearDbBtn)
-
-        const btn = document.createElement('a')
-        btn.className = 'btn btn-sm btn-outline-primary ms-2'
-        let display = ''
-        if (me.user) {
-          display = me.user.name || me.user.preferred_username || me.user.email || (me.user.sub || '')
-        }
-        btn.href = '/logout'
-        btn.textContent = display ? ('Logout ' + display) : 'Logout'
-        authControls.appendChild(btn)
-
-        const span = document.createElement('span')
-        span.className = 'ms-2 small text-muted'
-        span.textContent = 'Admin'
-        authControls.appendChild(span)
-        return
-      }
-
-      // authenticated but NOT admin -> show centered not-admin box
-      if (main) main.style.display = 'none'
-      if (loginBox) loginBox.style.display = 'none'
-      if (notAdminBox) notAdminBox.style.display = 'block'
-
-      let display = ''
-      if (me.user) {
-        display = me.user.name || me.user.preferred_username || me.user.email || (me.user.sub || '')
-      }
-      const dispEl = document.getElementById('notAdminDisplay')
-      if (dispEl) dispEl.textContent = `Autenticato come ${display || '<unknown>'} — non sei amministratore.`
-
-      const grantBtn = document.getElementById('notAdminGrantBtn')
-      if (grantBtn) {
-        grantBtn.onclick = async () => {
-          grantBtn.disabled = true
-          try {
-            const r = await fetchWithCreds('/api/session/grant_admin', { method: 'POST' })
-            if (r.ok) {
-              location.reload()
-            } else if (r.status === 403) {
-              alert('Non puoi ottenere i privilegi: account non idoneo.')
-            } else {
-              alert('Errore server durante la richiesta di privilegi')
-            }
-          } catch (err) {
-            alert('Impossibile contattare il server')
-          } finally {
-            grantBtn.disabled = false
-          }
-        }
+  function fmtWindow (seconds) {
+    const s = Number(seconds)
+    const units = [[86400, 'giorno', 'giorni'], [3600, 'ora', 'ore'], [60, 'minuto', 'minuti'], [1, 'secondo', 'secondi']]
+    for (const [size, one, many] of units) {
+      if (s >= size && s % size === 0) {
+        const n = s / size
+        return n + ' ' + (n === 1 ? one : many)
       }
     }
-  } catch (e) {
-    // ignore errors — keep UI usable as read-only
+    return s + ' secondi'
   }
-}
 
-// WebSocket for realtime updates with polling fallback
-let ws = null
-function wsUrl() {
-  const proto = location.protocol === 'https:' ? 'wss:' : 'ws:'
-  return `${proto}//${location.host}/ws/updates`
-}
-
-function setupWs() {
-  try {
-    ws = new WebSocket(wsUrl())
-  } catch (e) {
-    console.debug('WebSocket not available', e)
-    return
+  function statusMeta (status) {
+    return STATUS_META[status] || { label: status || '—', badge: 'text-bg-light', color: '#dee2e6' }
   }
-  ws.onopen = () => { console.debug('ws open') }
-  ws.onmessage = (ev) => {
+
+  function statusBadge (item) {
+    const key = item.deferred ? 'deferred' : item.status
+    const meta = statusMeta(key)
+    const title = item.deferred && item.not_before ? 'Differita fino a ' + fmtDate(item.not_before) : (item.status || '')
+    return el('span', { className: 'badge ' + meta.badge, text: meta.label, title })
+  }
+
+  function errorLabel (code) {
+    if (!code) return ''
+    return ERROR_LABELS[code] || code
+  }
+
+  function chatLabel (chatId, chatType) {
+    const types = { private: 'privata', group: 'gruppo', supergroup: 'gruppo', channel: 'canale' }
+    const suffix = chatType && types[chatType] ? ' (' + types[chatType] + ')' : ''
+    return chatId === null || chatId === undefined ? '—' : String(chatId) + suffix
+  }
+
+  // ---------------------------------------------------------------------
+  // Toasts
+  // ---------------------------------------------------------------------
+  const recentToasts = new Map()
+
+  function toast (message, kind) {
+    const level = kind || 'info'
+    const now = Date.now()
+    const last = recentToasts.get(message)
+    if (last && now - last < 10000) return
+    recentToasts.set(message, now)
+    const container = $('toasts')
+    const close = el('button', { className: 'btn-close btn-close-white me-2 m-auto', type: 'button', attrs: { 'aria-label': 'Chiudi' } })
+    const node = el('div', {
+      className: 'toast show align-items-center border-0 text-bg-' + level,
+      attrs: { role: level === 'danger' ? 'alert' : 'status' }
+    }, el('div', { className: 'd-flex' }, el('div', { className: 'toast-body', text: message }), close))
+    close.addEventListener('click', () => node.remove())
+    container.append(node)
+    while (container.children.length > 5) container.firstElementChild.remove()
+    setTimeout(() => node.remove(), level === 'danger' ? 9000 : 5000)
+  }
+
+  // ---------------------------------------------------------------------
+  // API
+  // ---------------------------------------------------------------------
+  class ApiError extends Error {
+    constructor (status, detail) {
+      super(detail)
+      this.status = status
+      this.detail = detail
+    }
+  }
+
+  function detailText (data, status) {
+    if (data && typeof data.detail === 'string') return data.detail
+    if (data && Array.isArray(data.detail)) {
+      return data.detail.map((d) => {
+        const where = Array.isArray(d.loc) ? d.loc.filter((p) => p !== 'body' && p !== 'query').join('.') : ''
+        return (where ? where + ': ' : '') + (d.msg || 'valore non valido')
+      }).join('; ')
+    }
+    if (status === 0) return 'Server non raggiungibile'
+    return 'Errore del server (HTTP ' + status + ')'
+  }
+
+  async function api (path, options) {
+    const o = options || {}
+    const init = { method: o.method || 'GET', credentials: 'same-origin', headers: { Accept: 'application/json' } }
+    if (o.body !== undefined) {
+      init.headers['Content-Type'] = 'application/json'
+      init.body = JSON.stringify(o.body)
+    }
+    let response
     try {
-      const msg = JSON.parse(ev.data)
-      if (msg.type === 'initial') {
-        if (msg.requests) {
-          currentPage = 1
-          renderTablePage(1)
-        }
-        if (msg.updates) loadUpdates()
-      } else if (msg.type === 'initial_updates') {
-        // server may send initial_updates separately
-        try { loadUpdates() } catch (e) { }
-      } else if (msg.type === 'request_created' || msg.type === 'request_started' || msg.type === 'request_finished' || msg.type === 'request_event') {
-        // refresh current page on request lifecycle changes
-        renderTablePage(currentPage)
-        try { loadQueue() } catch (e) {}
-      } else if (msg.type === 'request_status' || msg.type === 'request_updated') {
-        // more generic request update (status or metadata) -> refresh table and queue
-        try { renderTablePage(currentPage) } catch (e) {}
-        try { loadQueue() } catch (e) {}
-      } else if (msg.type === 'queue_cleared') {
-        // minimal refresh to avoid triggering broad reload loops
-        try { loadQueue() } catch (e) {}
-        try { loadRateLimits() } catch (e) {}
-        try { renderTablePage(currentPage) } catch (e) {}
-      } else if (msg.type === 'unlimited') {
-        // a chat was unlimited by admin; refresh rate limits and queue
-        try { loadRateLimits() } catch (e) {}
-        try { loadQueue() } catch (e) {}
-      } else if (msg.type === 'rate_limit_changed') {
-        // worker in-memory rate limit changed
-        try { loadRateLimits() } catch (e) {}
-        try { loadQueue() } catch (e) {}
-      } else if (msg.type === 'queue_rehydrated') {
-        // worker rehydrated persisted queue on startup
-        try { loadQueue() } catch (e) {}
-        try { loadRateLimits() } catch (e) {}
-        try { renderTablePage(currentPage) } catch (e) {}
-      } else if (msg.type === 'update_created') {
-        loadUpdates()
-      }
+      response = await fetch(path, init)
     } catch (e) {
-      console.debug('ws message parse error', e)
+      const error = new ApiError(0, 'Server non raggiungibile')
+      if (!o.quiet) toast(error.detail, 'danger')
+      throw error
+    }
+    let data = null
+    const text = await response.text()
+    if (text) {
+      try { data = JSON.parse(text) } catch (e) { data = null }
+    }
+    if (response.ok) return data
+    const error = new ApiError(response.status, detailText(data, response.status))
+    if (o.authHandling !== false && response.status === 401) {
+      showLogin()
+    } else if (o.authHandling !== false && response.status === 403) {
+      recheckAccess(error)
+    } else if (!o.quiet) {
+      toast(error.detail, 'danger')
+    }
+    throw error
+  }
+
+  function query (params) {
+    const search = new URLSearchParams()
+    for (const [key, value] of Object.entries(params)) {
+      if (value !== null && value !== undefined && value !== '') search.set(key, String(value))
+    }
+    const text = search.toString()
+    return text ? '?' + text : ''
+  }
+
+  // ---------------------------------------------------------------------
+  // Modal dialogs
+  // ---------------------------------------------------------------------
+  let modalResolve = null
+
+  function openModal (title, body, buttons, onOpen) {
+    closeModal(null)
+    $('modalTitle').textContent = title
+    const bodyEl = $('modalBody')
+    bodyEl.replaceChildren()
+    if (typeof body === 'string') bodyEl.append(el('p', { className: 'mb-0 pre-wrap', text: body }))
+    else if (body) bodyEl.append(body)
+    const footer = $('modalFooter')
+    footer.replaceChildren()
+    const promise = new Promise((resolve) => { modalResolve = resolve })
+    for (const spec of buttons) {
+      footer.append(button(spec.label, spec.className || 'btn-secondary', () => closeModal(spec.value)))
+    }
+    $('modal').hidden = false
+    const focusTarget = footer.querySelector('button:last-child') || $('modalClose')
+    focusTarget.focus()
+    if (onOpen) onOpen()
+    return promise
+  }
+
+  function closeModal (value) {
+    const resolve = modalResolve
+    modalResolve = null
+    detailOpenId = null
+    $('modal').hidden = true
+    if (resolve) resolve(value)
+  }
+
+  function confirmDialog (title, message, confirmLabel, danger) {
+    return openModal(title, message, [
+      { label: 'Annulla', value: false, className: 'btn-outline-secondary' },
+      { label: confirmLabel, value: true, className: danger ? 'btn-danger' : 'btn-primary' }
+    ])
+  }
+
+  // ---------------------------------------------------------------------
+  // Refresh scheduling: single flight per resource, coalesced bursts,
+  // sequence guards against stale responses.
+  // ---------------------------------------------------------------------
+  const STALE = Symbol('stale')
+  const sequences = new Map()
+
+  async function latest (key, fn) {
+    const mine = (sequences.get(key) || 0) + 1
+    sequences.set(key, mine)
+    const result = await fn()
+    return sequences.get(key) === mine ? result : STALE
+  }
+
+  const PANEL_RESOURCES = {
+    overview: ['stats', 'aggregates'],
+    requests: ['requests'],
+    queue: ['queue'],
+    limits: ['limits'],
+    events: ['events'],
+    users: ['users'],
+    system: ['system']
+  }
+  const ALL_RESOURCES = ['worker', 'detail', ...new Set(Object.values(PANEL_RESOURCES).flat())]
+  const loaders = {}
+  const dirty = new Set()
+  const inFlight = new Map()
+  const rerun = new Set()
+  let flushTimer = null
+  let currentTab = 'overview'
+
+  function activeResources () {
+    const names = new Set(['worker', ...(PANEL_RESOURCES[currentTab] || [])])
+    if (detailOpenId !== null) names.add('detail')
+    return names
+  }
+
+  function invalidate (names) {
+    for (const name of names) dirty.add(name)
+    if (!flushTimer) flushTimer = setTimeout(flush, 400)
+  }
+
+  function flush () {
+    flushTimer = null
+    if (!authed) return
+    const active = activeResources()
+    for (const name of [...dirty]) {
+      if (active.has(name)) {
+        dirty.delete(name)
+        runLoader(name)
+      }
     }
   }
-  ws.onclose = () => { console.debug('ws closed, will fallback to polling') }
-  ws.onerror = (e) => { console.debug('ws error', e) }
-}
 
-// Run auth initialization first, then start WS and load data.
-initAuth().finally(() => {
-  try { setupWs() } catch (e) { /* ignore */ }
-  try { loadAll() } catch (e) { /* ignore */ }
-})
-// fallback polling every 10s if ws not available or closed
-setInterval(async () => {
-  if (!ws || ws.readyState !== WebSocket.OPEN) {
-    await loadAll()
-  }
-}, 10000)
-// sidebar refresh button
-try {
-  const refreshBtnSidebar = document.getElementById('refreshBtnSidebar')
-  if (refreshBtnSidebar) refreshBtnSidebar.onclick = () => { loadAll() }
-  if (refreshQueueBtn) refreshQueueBtn.onclick = () => { loadQueue() }
-  const refreshRateLimitsBtn = document.getElementById('refreshRateLimitsBtn')
-  if (refreshRateLimitsBtn) refreshRateLimitsBtn.onclick = () => { loadRateLimits() }
-    if (startQueueBtn) startQueueBtn.onclick = async () => {
+  function runLoader (name, force) {
+    const loader = loaders[name]
+    if (!loader || !authed) return Promise.resolve()
+    if (inFlight.has(name) && !force) {
+      rerun.add(name)
+      return inFlight.get(name)
+    }
+    const task = (async () => {
       try {
-        startQueueBtn.disabled = true
-        startQueueBtn.textContent = 'Avviando…'
-        await fetchWithCreds('/api/queue/start', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ rehydrate: true }) })
-        await loadQueue(); await loadRateLimits()
+        await loader()
       } catch (e) {
-        console.debug('startQueue failed', e)
-        alert('Errore avviando la coda')
+        if (!(e instanceof ApiError)) {
+          console.error('Loader ' + name + ' failed', e)
+          toast('Errore durante l\'aggiornamento della pagina', 'danger')
+        }
       } finally {
-        startQueueBtn.disabled = false
-        startQueueBtn.textContent = 'Avvia coda'
+        if (inFlight.get(name) === task) inFlight.delete(name)
+        if (rerun.delete(name)) runLoader(name)
+      }
+    })()
+    inFlight.set(name, task)
+    return task
+  }
+
+  function resyncAll () {
+    for (const name of ALL_RESOURCES) dirty.add(name)
+    flush()
+  }
+
+  // ---------------------------------------------------------------------
+  // Authentication flow
+  // ---------------------------------------------------------------------
+  let authed = false
+  let me = null
+  let publicConfig = null
+
+  function showOnly (id) {
+    for (const name of ['boot', 'app', 'loginOverlay', 'notAdminOverlay']) {
+      $(name).hidden = name !== id
+    }
+  }
+
+  async function initAuth () {
+    try {
+      const results = await Promise.all([
+        api('config', { quiet: true, authHandling: false }),
+        api('api/me', { quiet: true, authHandling: false })
+      ])
+      publicConfig = results[0]
+      me = results[1]
+    } catch (e) {
+      showOnly('boot')
+      $('boot').replaceChildren(el('div', { className: 'alert alert-danger', text: 'Impossibile contattare il server della console. Riprova più tardi.' }))
+      setTimeout(initAuth, 10000)
+      return
+    }
+    if (me && me.is_admin) startApp()
+    else if (me && me.authenticated) showNotAdmin()
+    else showLogin()
+  }
+
+  function stopApp () {
+    authed = false
+    wsWanted = false
+    clearTimeout(wsTimer)
+    if (ws) {
+      const socket = ws
+      ws = null
+      socket.close()
+    }
+    closeModal(null)
+  }
+
+  function showLogin () {
+    stopApp()
+    showOnly('loginOverlay')
+    const cfg = publicConfig || {}
+    $('oauthLoginBtn').hidden = !cfg.oauth_configured
+    $('tokenForm').hidden = !cfg.admin_token_set
+    $('noLoginMethod').hidden = Boolean(cfg.oauth_configured || cfg.admin_token_set)
+    $('tokenError').hidden = true
+    if (cfg.admin_token_set) $('tokenInput').focus()
+  }
+
+  function displayName (user) {
+    if (!user) return ''
+    return user.name || user.username || user.email || user.sub || ''
+  }
+
+  function showNotAdmin () {
+    stopApp()
+    showOnly('notAdminOverlay')
+    const name = displayName(me && me.user)
+    $('notAdminText').textContent = name
+      ? 'Sei autenticato come ' + name + ' ma non sei amministratore.'
+      : 'Sei autenticato ma non sei amministratore.'
+  }
+
+  // A 403 can be a lost privilege or a refused action: ask the server.
+  async function recheckAccess (error) {
+    try {
+      me = await api('api/me', { quiet: true, authHandling: false })
+    } catch (e) {
+      return
+    }
+    if (me && me.is_admin) toast(error.detail, 'danger')
+    else if (me && me.authenticated) showNotAdmin()
+    else showLogin()
+  }
+
+  function startApp () {
+    authed = true
+    showOnly('app')
+    const name = displayName(me && me.user)
+    $('userLabel').textContent = name ? 'Accesso: ' + name : ''
+    activateTab(tabFromHash(), true)
+    resyncAll()
+    wsWanted = true
+    connectWs()
+  }
+
+  async function submitToken (event) {
+    event.preventDefault()
+    const input = $('tokenInput')
+    const errorEl = $('tokenError')
+    const token = input.value.trim()
+    if (!token) {
+      errorEl.textContent = 'Inserisci il token'
+      errorEl.hidden = false
+      return
+    }
+    $('tokenSubmit').disabled = true
+    errorEl.hidden = true
+    try {
+      await api('login', { method: 'POST', body: { token }, quiet: true, authHandling: false })
+      input.value = ''
+      await initAuth()
+    } catch (e) {
+      errorEl.textContent = e instanceof ApiError ? e.detail : 'Errore imprevisto'
+      errorEl.hidden = false
+    } finally {
+      $('tokenSubmit').disabled = false
+    }
+  }
+
+  async function logout () {
+    try {
+      await api('logout', { method: 'POST', body: {}, quiet: true, authHandling: false })
+    } catch (e) {
+      toast('Uscita non riuscita: ' + (e.detail || 'errore'), 'danger')
+      return
+    }
+    me = null
+    await initAuth()
+  }
+
+  // ---------------------------------------------------------------------
+  // Tabs
+  // ---------------------------------------------------------------------
+  function tabFromHash () {
+    const name = (location.hash || '').replace('#', '')
+    return PANEL_RESOURCES[name] ? name : 'overview'
+  }
+
+  function activateTab (name, initial) {
+    currentTab = PANEL_RESOURCES[name] ? name : 'overview'
+    for (const tab of document.querySelectorAll('[data-tab]')) {
+      const active = tab.dataset.tab === currentTab
+      tab.classList.toggle('active', active)
+      tab.setAttribute('aria-selected', active ? 'true' : 'false')
+    }
+    for (const panel of document.querySelectorAll('[data-panel]')) {
+      panel.hidden = panel.dataset.panel !== currentTab
+    }
+    if (!initial && location.hash !== '#' + currentTab) history.replaceState(null, '', '#' + currentTab)
+    flush()
+  }
+
+  // ---------------------------------------------------------------------
+  // WebSocket (live updates)
+  // ---------------------------------------------------------------------
+  let ws = null
+  let wsWanted = false
+  let wsTimer = null
+  let wsAttempts = 0
+  let wsEverOpened = false
+
+  function wsUrl () {
+    const url = new URL('ws/updates', location.href)
+    url.protocol = location.protocol === 'https:' ? 'wss:' : 'ws:'
+    url.hash = ''
+    return url.href
+  }
+
+  function setLive (state) {
+    const badge = $('liveBadge')
+    const states = {
+      online: ['text-bg-success', 'In tempo reale', 'Aggiornamenti in tempo reale attivi'],
+      connecting: ['text-bg-secondary', 'Connessione…', 'Connessione agli aggiornamenti in corso'],
+      offline: ['text-bg-warning', 'Non in tempo reale', 'Connessione persa: aggiornamento periodico finché non si riconnette']
+    }
+    const [cls, text, title] = states[state] || states.offline
+    badge.className = 'badge ' + cls
+    badge.textContent = text
+    badge.title = title
+  }
+
+  function connectWs () {
+    if (!wsWanted) return
+    clearTimeout(wsTimer)
+    setLive('connecting')
+    let socket
+    try {
+      socket = new WebSocket(wsUrl())
+    } catch (e) {
+      scheduleReconnect()
+      return
+    }
+    ws = socket
+    socket.addEventListener('open', () => {
+      if (ws !== socket) return
+      const reconnected = wsEverOpened
+      wsEverOpened = true
+      wsAttempts = 0
+      setLive('online')
+      if (reconnected) resyncAll()
+    })
+    socket.addEventListener('message', (event) => {
+      if (ws === socket) handleMessage(event.data)
+    })
+    socket.addEventListener('close', () => {
+      if (ws !== socket) return
+      ws = null
+      setLive('offline')
+      if (wsWanted) scheduleReconnect()
+    })
+  }
+
+  function scheduleReconnect () {
+    const base = Math.min(30000, 1000 * Math.pow(2, Math.min(wsAttempts, 5)))
+    const delay = base / 2 + Math.random() * (base / 2)
+    wsAttempts += 1
+    clearTimeout(wsTimer)
+    wsTimer = setTimeout(async () => {
+      if (!wsWanted) return
+      // A refused handshake looks like a network error: check the session.
+      try {
+        me = await api('api/me', { quiet: true, authHandling: false })
+      } catch (e) {
+        scheduleReconnect()
+        return
+      }
+      if (!me || !me.is_admin) {
+        if (me && me.authenticated) showNotAdmin()
+        else showLogin()
+        return
+      }
+      connectWs()
+    }, delay)
+  }
+
+  function handleMessage (text) {
+    let message
+    try { message = JSON.parse(text) } catch (e) { return }
+    if (!message || typeof message !== 'object') return
+    if (message.kind === 'events') onEvents(Array.isArray(message.events) ? message.events : [])
+    else if (message.kind === 'worker' && message.worker) renderWorker(message.worker)
+  }
+
+  function onEvents (events) {
+    if (!events.length) return
+    const names = new Set(['events'])
+    for (const event of events) {
+      switch (event.type) {
+        case 'request_created':
+        case 'request_status':
+        case 'request_updated':
+          ['requests', 'queue', 'stats', 'aggregates', 'limits'].forEach((n) => names.add(n))
+          if (detailOpenId !== null && event.request_id === detailOpenId) names.add('detail')
+          break
+        case 'request_event':
+          if (detailOpenId !== null && event.request_id === detailOpenId) names.add('detail')
+          break
+        case 'queue_cleared':
+          ['requests', 'queue', 'stats', 'aggregates'].forEach((n) => names.add(n))
+          break
+        case 'rate_limit_changed':
+        case 'chat_unlimited':
+        case 'chat_unlimited_all':
+          names.add('limits')
+          names.add('stats')
+          break
+        case 'history_cleared':
+        case 'history_pruned':
+          ALL_RESOURCES.forEach((n) => names.add(n))
+          break
+        default:
+          break
       }
     }
-    if (clearQueueBtn) clearQueueBtn.onclick = async () => { if (confirm('Svuotare la coda? Questa operazione cancella le richieste in coda.')) { await clearQueue(); } }
-    if (showConfigBtn) showConfigBtn.onclick = async () => { await showConfig() }
-} catch (e) { /* ignore */ }
+    invalidate(names)
+  }
+
+  // ---------------------------------------------------------------------
+  // Worker status (header badge, alert, queue tab)
+  // ---------------------------------------------------------------------
+  let lastWorker = null
+
+  loaders.worker = async () => {
+    const worker = await latest('worker', () => api('api/worker'))
+    if (worker !== STALE) renderWorker(worker)
+  }
+
+  function renderWorker (worker) {
+    lastWorker = worker
+    const badge = $('workerBadge')
+    const alertEl = $('workerAlert')
+    const heartbeat = worker.heartbeat_at ? 'ultimo segnale ' + fmtAgo(worker.heartbeat_at) : 'nessun segnale'
+    const states = {
+      online: ['text-bg-success', 'Worker attivo'],
+      offline: ['text-bg-danger', 'Worker non raggiungibile'],
+      stopped: ['text-bg-secondary', 'Worker fermo'],
+      unknown: ['text-bg-secondary', 'Worker mai visto']
+    }
+    const [cls, text] = states[worker.state] || states.unknown
+    badge.className = 'badge ' + cls
+    badge.textContent = text
+    badge.title = heartbeat
+    alertEl.replaceChildren()
+    if (worker.state === 'online') {
+      alertEl.hidden = true
+    } else if (worker.state === 'unknown') {
+      alertEl.hidden = false
+      alertEl.append('Nessun heartbeat del worker in questo database. Il bot è in esecuzione e usa lo stesso file REQUESTS_DB della console? Finché il worker non è attivo le richieste restano in coda.')
+    } else {
+      alertEl.hidden = false
+      alertEl.append(
+        (worker.state === 'stopped' ? 'Il worker è fermo' : 'Il worker non invia segnali') + ' (' + heartbeat + ', soglia ' +
+        fmtSeconds(worker.stale_after_seconds) + '). Le richieste in coda resteranno ferme finché il bot non riparte; quelle in esecuzione verranno recuperate al riavvio.'
+      )
+    }
+    if (currentTab === 'queue') renderWorkerInfo(worker)
+  }
+
+  function renderWorkerInfo (worker) {
+    const dl = $('workerInfo')
+    dl.replaceChildren()
+    const states = { online: 'Attivo', offline: 'Non raggiungibile', stopped: 'Fermo', unknown: 'Mai visto' }
+    definition(dl, 'Stato', states[worker.state] || worker.state)
+    definition(dl, 'Ultimo heartbeat', worker.heartbeat_at ? timeAgo(worker.heartbeat_at) : null)
+    definition(dl, 'Avviato', worker.started_at ? timeAgo(worker.started_at) : null)
+    definition(dl, 'Versione', worker.version)
+    definition(dl, 'PID', worker.pid)
+    definition(dl, 'Modalità', worker.mode)
+    definition(dl, 'Worker paralleli', worker.workers)
+    definition(dl, 'Job in esecuzione', Array.isArray(worker.running) ? worker.running.length : null)
+  }
+
+  // ---------------------------------------------------------------------
+  // Charts (created once, then updated in place)
+  // ---------------------------------------------------------------------
+  const charts = {}
+
+  function chartsAvailable () {
+    return typeof window.Chart === 'function'
+  }
+
+  function markChartUnavailable (canvasId) {
+    const canvas = $(canvasId)
+    if (!canvas || canvas.dataset.unavailable) return
+    canvas.dataset.unavailable = '1'
+    canvas.hidden = true
+    canvas.parentElement.append(el('div', { className: 'chart-unavailable', text: 'Grafico non disponibile: impossibile caricare Chart.js dalla CDN.' }))
+  }
+
+  function setChart (key, canvasId, type, labels, datasets, options) {
+    if (!chartsAvailable()) {
+      markChartUnavailable(canvasId)
+      return
+    }
+    const chart = charts[key]
+    if (chart) {
+      chart.data.labels = labels
+      datasets.forEach((dataset, index) => {
+        if (chart.data.datasets[index]) Object.assign(chart.data.datasets[index], dataset)
+        else chart.data.datasets.push(dataset)
+      })
+      chart.data.datasets.length = datasets.length
+      chart.update('none')
+      return
+    }
+    charts[key] = new window.Chart($(canvasId), {
+      type,
+      data: { labels, datasets },
+      options: Object.assign({ responsive: true, maintainAspectRatio: false, animation: false }, options || {})
+    })
+  }
+
+  const legendBottom = { legend: { position: 'bottom', labels: { boxWidth: 12 } } }
+  const noLegend = { legend: { display: false } }
+
+  // ---------------------------------------------------------------------
+  // Overview
+  // ---------------------------------------------------------------------
+  loaders.stats = async () => {
+    const stats = await latest('stats', () => api('api/stats'))
+    if (stats !== STALE) renderStats(stats)
+  }
+
+  function renderStats (s) {
+    const t = s.totals
+    const day = s.last_24h
+    $('statTotal').textContent = fmtNumber(t.total)
+    $('statTotalSub').textContent = 'ultime 24 h: ' + fmtNumber(day.total)
+    $('statDone').textContent = fmtNumber(t.done)
+    $('statDoneSub').textContent = s.success_rate === null ? 'nessuna richiesta conclusa' : 'successo: ' + pctFmt.format(s.success_rate)
+    $('statFailed').textContent = fmtNumber(t.failed)
+    $('statFailedSub').textContent = 'ultime 24 h: ' + fmtNumber(day.failed)
+    $('statActive').textContent = fmtNumber(t.queued + t.deferred + t.running)
+    $('statActiveSub').textContent = 'in coda ' + fmtNumber(t.queued) + ' · differite ' + fmtNumber(t.deferred) + ' · in corso ' + fmtNumber(t.running)
+    $('statRefused').textContent = fmtNumber(t.rate_limited + t.duplicate)
+    $('statRefusedSub').textContent = 'per limite ' + fmtNumber(t.rate_limited) + ' · duplicati ' + fmtNumber(t.duplicate)
+    $('statLimited').textContent = fmtNumber(s.limited_chats)
+    $('statBytes').textContent = fmtBytes(s.bytes.downloaded)
+    $('statBytesSub').textContent = 'inviati a Telegram: ' + fmtBytes(s.bytes.uploaded) + ' · compressi: ' + fmtNumber(s.compressed)
+    $('statAvg').textContent = fmtSeconds(s.averages.processing_seconds)
+    const avg = s.averages
+    $('statAvgSub').textContent = avg.original_size === null
+      ? 'nessuna richiesta completata'
+      : 'file medio ' + fmtBytes(avg.original_size) + ' → ' + fmtBytes(avg.final_size)
+  }
+
+  loaders.aggregates = async () => {
+    const data = await latest('aggregates', () => api('api/aggregates?hours=24&top=10'))
+    if (data !== STALE) renderAggregates(data)
+  }
+
+  function renderAggregates (d) {
+    const statuses = Object.keys(d.status_counts || {})
+    updateStatusOptions(statuses)
+    setChart('status', 'chartStatus', 'doughnut',
+      statuses.map((s) => statusMeta(s).label),
+      [{ data: statuses.map((s) => d.status_counts[s]), backgroundColor: statuses.map((s) => statusMeta(s).color) }],
+      { plugins: legendBottom, cutout: '55%' })
+
+    const points = (d.timeseries && d.timeseries.points) || []
+    const labels = points.map((p) => hourFmt.format(new Date(p.t)))
+    const other = points.map((p) => Math.max(0, p.total - p.done - p.failed - p.refused))
+    setChart('timeline', 'chartTimeline', 'bar', labels, [
+      { label: 'Completate', data: points.map((p) => p.done), backgroundColor: STATUS_META.done.color, stack: 'r' },
+      { label: 'Fallite', data: points.map((p) => p.failed), backgroundColor: STATUS_META.failed.color, stack: 'r' },
+      { label: 'Rifiutate', data: points.map((p) => p.refused), backgroundColor: STATUS_META.rate_limited.color, stack: 'r' },
+      { label: 'Altre', data: other, backgroundColor: STATUS_META.queued.color, stack: 'r' }
+    ], { plugins: legendBottom, scales: { x: { stacked: true, ticks: { maxRotation: 0, autoSkip: true } }, y: { stacked: true, beginAtZero: true, ticks: { precision: 0 } } } })
+
+    const chats = d.top_chats || []
+    setChart('chats', 'chartChats', 'bar', chats.map((c) => chatLabel(c.chat_id, c.chat_type)),
+      [{ label: 'Richieste', data: chats.map((c) => c.count), backgroundColor: '#0d6efd' }],
+      { indexAxis: 'y', plugins: noLegend, scales: { x: { beginAtZero: true, ticks: { precision: 0 } } } })
+
+    const providers = d.providers || []
+    setChart('providers', 'chartProviders', 'bar', providers.map((p) => p.name || p.provider || 'sconosciuto'),
+      [{ label: 'Richieste', data: providers.map((p) => p.count), backgroundColor: '#6f42c1' }],
+      { indexAxis: 'y', plugins: noLegend, scales: { x: { beginAtZero: true, ticks: { precision: 0 } } } })
+
+    const hist = d.duration_histogram || { labels: [], counts: [] }
+    setChart('duration', 'chartDuration', 'bar', hist.labels,
+      [{ label: 'Richieste', data: hist.counts, backgroundColor: '#198754' }],
+      { plugins: noLegend, scales: { y: { beginAtZero: true, ticks: { precision: 0 } } } })
+  }
+
+  // ---------------------------------------------------------------------
+  // Requests
+  // ---------------------------------------------------------------------
+  const requestState = { page: 1 }
+
+  function requestFilters () {
+    const chat = $('chatFilter').value.trim()
+    return {
+      q: $('searchInput').value.trim(),
+      status: $('statusFilter').value,
+      chat_id: /^-?\d+$/.test(chat) ? chat : '',
+      limit: parseInt($('pageSize').value, 10) || 25
+    }
+  }
+
+  function updateStatusOptions (extra) {
+    const select = $('statusFilter')
+    const known = new Set(Array.from(select.options).map((o) => o.value))
+    const wanted = ['queued', 'processing', 'sending', 'done', 'failed', 'rate_limited', 'duplicate', 'cancelled', 'aborted', ...(extra || [])]
+    for (const status of wanted) {
+      if (!status || status === 'unknown' || known.has(status)) continue
+      known.add(status)
+      select.append(el('option', { text: statusMeta(status).label, attrs: { value: status } }))
+    }
+  }
+
+  loaders.requests = async () => {
+    const filters = requestFilters()
+    const offset = (requestState.page - 1) * filters.limit
+    const params = { limit: filters.limit, offset, q: filters.q, status: filters.status, chat_id: filters.chat_id }
+    let data
+    try {
+      data = await latest('requests', () => api('api/requests' + query(params)))
+    } catch (e) {
+      if (e instanceof ApiError && e.status !== 401 && e.status !== 403) {
+        $('requestsBody').replaceChildren(emptyRow(9, 'Impossibile caricare le richieste: ' + e.detail))
+      }
+      throw e
+    }
+    if (data === STALE) return
+    const pages = Math.max(1, Math.ceil(data.total / filters.limit))
+    if (requestState.page > pages && data.total > 0) {
+      requestState.page = pages
+      runLoader('requests', true)
+      return
+    }
+    renderRequests(data, filters)
+  }
+
+  function sizeText (r) {
+    if (r.original_size === null && r.final_size === null) return '—'
+    if (r.final_size !== null && r.final_size !== r.original_size) return fmtBytes(r.original_size) + ' → ' + fmtBytes(r.final_size)
+    return fmtBytes(r.original_size !== null ? r.original_size : r.final_size)
+  }
+
+  function requestActions (r) {
+    const cell = el('td', { className: 'text-end' })
+    cell.append(button('Dettagli', 'btn-outline-secondary', () => openDetail(r.id)))
+    if (r.requeueable) {
+      cell.append(' ', button('Riprova', 'btn-outline-primary', () => requeueIds([r.id]), 'Rimetti in coda'))
+    }
+    return cell
+  }
+
+  function renderRequests (data, filters) {
+    const body = $('requestsBody')
+    body.replaceChildren()
+    if (!data.items.length) body.append(emptyRow(9, 'Nessuna richiesta corrisponde ai filtri.'))
+    for (const r of data.items) {
+      const tr = el('tr')
+      tr.append(
+        el('td', { className: 'mono', text: r.id }),
+        el('td', null, timeAgo(r.created_at)),
+        el('td', { className: 'mono', text: chatLabel(r.chat_id, r.chat_type) }),
+        el('td', null, safeLink(r.url), r.provider_name ? el('div', { className: 'small text-body-secondary', text: r.provider_name }) : null),
+        el('td', null, statusBadge(r)),
+        el('td', { className: 'mono', text: sizeText(r) }),
+        el('td', { text: fmtSeconds(r.processing_duration_seconds) }),
+        el('td', { className: 'wrap small', text: errorLabel(r.error_code), title: r.error_message || '' }),
+        requestActions(r)
+      )
+      body.append(tr)
+    }
+    const from = data.total ? data.offset + 1 : 0
+    const to = Math.min(data.offset + data.items.length, data.total)
+    $('requestsSummary').textContent = fmtNumber(from) + '–' + fmtNumber(to) + ' di ' + fmtNumber(data.total)
+    renderPager($('requestsPager'), requestState.page, Math.max(1, Math.ceil(data.total / filters.limit)), (page) => {
+      requestState.page = page
+      runLoader('requests', true)
+    })
+    const bulk = $('bulkRequeueBtn')
+    bulk.hidden = !(REQUEUEABLE.includes(filters.status) && data.total > 0)
+  }
+
+  function renderPager (container, page, pages, go) {
+    container.replaceChildren()
+    const item = (label, target, disabled, active, aria) => {
+      const li = el('li', { className: 'page-item' + (disabled ? ' disabled' : '') + (active ? ' active' : '') })
+      const b = el('button', { className: 'page-link', text: label, type: 'button', attrs: aria ? { 'aria-label': aria } : null })
+      if (disabled) b.disabled = true
+      else b.addEventListener('click', () => go(target))
+      if (active) b.setAttribute('aria-current', 'page')
+      li.append(b)
+      return li
+    }
+    container.append(item('«', 1, page <= 1, false, 'Prima pagina'), item('‹', page - 1, page <= 1, false, 'Pagina precedente'))
+    const start = Math.max(1, Math.min(page - 2, pages - 4))
+    const end = Math.min(pages, start + 4)
+    for (let p = start; p <= end; p++) container.append(item(String(p), p, false, p === page))
+    container.append(item('›', page + 1, page >= pages, false, 'Pagina successiva'), item('»', pages, page >= pages, false, 'Ultima pagina'))
+  }
+
+  function debounce (fn, ms) {
+    let timer = null
+    return () => {
+      clearTimeout(timer)
+      timer = setTimeout(fn, ms)
+    }
+  }
+
+  const reloadRequests = () => {
+    requestState.page = 1
+    runLoader('requests', true)
+  }
+
+  // ---------------------------------------------------------------------
+  // Request detail (modal)
+  // ---------------------------------------------------------------------
+  let detailOpenId = null
+
+  async function openDetail (id) {
+    let data
+    try {
+      data = await latest('detail', () => api('api/requests/' + encodeURIComponent(id)))
+    } catch (e) {
+      return
+    }
+    if (data === STALE) return
+    showDetail(data)
+  }
+
+  loaders.detail = async () => {
+    if (detailOpenId === null) return
+    const id = detailOpenId
+    const data = await latest('detail', () => api('api/requests/' + encodeURIComponent(id), { quiet: true }))
+    if (data !== STALE && detailOpenId === id) fillDetail(data)
+  }
+
+  function detailBody (r) {
+    const wrap = el('div')
+    const dl = el('dl', { className: 'row small detail-grid mb-3' })
+    definition(dl, 'Stato', statusBadge(r))
+    definition(dl, 'Link', safeLink(r.url))
+    definition(dl, 'Sito', r.provider_name || r.provider)
+    definition(dl, 'Chat', chatLabel(r.chat_id, r.chat_type))
+    definition(dl, 'Utente Telegram', r.user_id)
+    definition(dl, 'Creata', fmtDate(r.created_at))
+    definition(dl, 'Aggiornata', fmtDate(r.updated_at))
+    if (r.not_before) definition(dl, 'Differita fino a', fmtDate(r.not_before))
+    definition(dl, 'Tentativi', r.attempts)
+    definition(dl, 'Inizio elaborazione', fmtDate(r.processing_started_at))
+    definition(dl, 'Fine elaborazione', fmtDate(r.processing_finished_at))
+    definition(dl, 'Durata', fmtSeconds(r.processing_duration_seconds))
+    definition(dl, 'Dimensioni', sizeText(r))
+    definition(dl, 'Compressa', r.compressed === null ? null : (r.compressed ? 'sì' : 'no'))
+    definition(dl, 'Tipo di media', r.media_type)
+    definition(dl, 'Messaggio originale', r.original_message_id)
+    definition(dl, 'Messaggio inviato', r.sent_message_id)
+    if (r.error_code || r.error_message) {
+      definition(dl, 'Errore', el('div', null, el('div', { text: errorLabel(r.error_code) + (r.error_code ? ' (' + r.error_code + ')' : '') }), el('div', { className: 'pre-wrap text-body-secondary', text: r.error_message || '' })))
+    }
+    if (r.description) definition(dl, 'Testo del messaggio', el('div', { className: 'pre-wrap', text: r.description }))
+    wrap.append(dl, el('h3', { className: 'h6', text: 'Cronologia (più recenti prima)' }))
+    const table = el('table', { className: 'table table-sm small mb-0' })
+    const tbody = el('tbody')
+    table.append(el('thead', null, el('tr', null, el('th', { text: 'Data' }), el('th', { text: 'Evento' }), el('th', { text: 'Dettagli' }), el('th', { text: 'Durata' }))), tbody)
+    if (!r.events || !r.events.length) tbody.append(emptyRow(4, 'Nessun evento registrato.'))
+    for (const e of r.events || []) {
+      tbody.append(el('tr', null,
+        el('td', { text: fmtDate(e.created_at) }),
+        el('td', { text: (STATUS_META[e.type] && STATUS_META[e.type].label) || e.type }),
+        el('td', { className: 'wrap', text: e.details || '' }),
+        el('td', { text: e.duration_seconds === null ? '' : fmtSeconds(e.duration_seconds) })))
+    }
+    wrap.append(el('div', { className: 'table-responsive' }, table))
+    return wrap
+  }
+
+  function detailButtons (r) {
+    const buttons = [{ label: 'Chiudi', value: 'close', className: 'btn-outline-secondary' }]
+    if (r.cancellable) buttons.unshift({ label: 'Annulla la coda di questa chat…', value: 'cancel-chat', className: 'btn-outline-danger' })
+    if (r.requeueable) buttons.unshift({ label: 'Rimetti in coda', value: 'requeue', className: 'btn-primary' })
+    return buttons
+  }
+
+  async function showDetail (r) {
+    const choice = openModal('Richiesta #' + r.id, detailBody(r), detailButtons(r), () => { detailOpenId = r.id })
+    const value = await choice
+    if (value === 'requeue') await requeueIds([r.id])
+    else if (value === 'cancel-chat') await cancelChat(r.chat_id)
+  }
+
+  function fillDetail (r) {
+    if ($('modal').hidden) return
+    $('modalBody').replaceChildren(detailBody(r))
+  }
+
+  // ---------------------------------------------------------------------
+  // Queue
+  // ---------------------------------------------------------------------
+  let lastQueue = null
+
+  loaders.queue = async () => {
+    const data = await latest('queue', () => api('api/queue?limit=100'))
+    if (data === STALE) return
+    lastQueue = data
+    renderQueue(data)
+  }
+
+  function queueItem (r, metaNodes, actions) {
+    const left = el('div', { className: 'me-2 overflow-hidden' },
+      el('div', null, el('span', { className: 'mono me-2', text: '#' + r.id }), safeLink(r.url)),
+      el('div', { className: 'item-meta' }, ...metaNodes))
+    return el('li', { className: 'list-group-item d-flex justify-content-between align-items-start' }, left,
+      el('div', { className: 'text-nowrap' }, ...actions))
+  }
+
+  function renderQueue (d) {
+    renderWorkerInfo(d.worker)
+    renderWorker(d.worker)
+    const c = d.counts
+    $('queueCounts').textContent = 'in coda ' + fmtNumber(c.queued) + ' · differite ' + fmtNumber(c.deferred) + ' · in esecuzione ' + fmtNumber(c.running)
+    $('cancelAllBtn').disabled = c.queued + c.deferred === 0
+
+    const running = $('runningList')
+    running.replaceChildren()
+    if (!d.running.length) running.append(emptyItem('Nessun job in esecuzione.'))
+    for (const r of d.running) {
+      const meta = ['chat ' + chatLabel(r.chat_id, r.chat_type) + ' · ', statusMeta(r.status).label]
+      if (r.stage) meta.push(' · fase: ' + r.stage)
+      meta.push(' · iniziata ', timeAgo(r.processing_started_at))
+      if (r.stale) meta.push(el('span', { className: 'badge text-bg-warning ms-2', text: 'worker non attivo' }))
+      running.append(queueItem(r, meta, [button('Dettagli', 'btn-outline-secondary', () => openDetail(r.id))]))
+    }
+    const queued = $('queuedList')
+    queued.replaceChildren()
+    if (!d.queued.length) queued.append(emptyItem('La coda è vuota.'))
+    for (const r of d.queued) {
+      queued.append(queueItem(r, ['chat ' + chatLabel(r.chat_id, r.chat_type) + ' · ricevuta ', timeAgo(r.created_at)], [
+        button('Annulla chat…', 'btn-outline-danger', () => cancelChat(r.chat_id), 'Annulla le richieste in coda di questa chat')
+      ]))
+    }
+    const deferred = $('deferredList')
+    deferred.replaceChildren()
+    if (!d.deferred.length) deferred.append(emptyItem('Nessuna richiesta differita.'))
+    for (const r of d.deferred) {
+      deferred.append(queueItem(r, ['chat ' + chatLabel(r.chat_id, r.chat_type) + ' · partirà ', timeAgo(r.not_before)], [
+        button('Annulla chat…', 'btn-outline-danger', () => cancelChat(r.chat_id), 'Annulla le richieste in coda di questa chat')
+      ]))
+    }
+    const retry = $('retryableList')
+    retry.replaceChildren()
+    if (!d.retryable.length) retry.append(emptyItem('Nessuna richiesta fallita o rifiutata.'))
+    for (const r of d.retryable) {
+      const meta = [statusMeta(r.status).label, ' · chat ' + chatLabel(r.chat_id, r.chat_type) + ' · ', timeAgo(r.created_at)]
+      if (r.error_code) meta.push(' · ' + errorLabel(r.error_code))
+      retry.append(queueItem(r, meta, [
+        button('Dettagli', 'btn-outline-secondary', () => openDetail(r.id)), ' ',
+        button('Rimetti in coda', 'btn-outline-primary', () => requeueIds([r.id]))
+      ]))
+    }
+    $('requeueRetryableBtn').disabled = !d.retryable.some((r) => r.requeueable)
+  }
+
+  async function cancelAll () {
+    const counts = lastQueue ? lastQueue.counts : null
+    const total = counts ? counts.queued + counts.deferred : null
+    const ok = await confirmDialog('Annullare la coda?',
+      'Verranno annullate ' + (total === null ? 'tutte le' : fmtNumber(total)) + ' richieste in coda, comprese quelle differite. I job già in esecuzione non vengono interrotti.',
+      'Annulla la coda', true)
+    if (!ok) return
+    try {
+      const result = await api('api/queue/cancel', { method: 'POST', body: {} })
+      toast(fmtNumber(result.cancelled) + ' richieste annullate.', 'success')
+    } catch (e) { return }
+    invalidate(['queue', 'requests', 'stats'])
+  }
+
+  async function cancelChat (chatId) {
+    const ok = await confirmDialog('Annullare la coda della chat?',
+      'Verranno annullate tutte le richieste in coda (anche differite) della chat ' + chatId + '.', 'Annulla le richieste', true)
+    if (!ok) return
+    try {
+      const result = await api('api/queue/cancel', { method: 'POST', body: { chat_id: chatId } })
+      toast(fmtNumber(result.cancelled) + ' richieste della chat ' + chatId + ' annullate.', 'success')
+    } catch (e) { return }
+    invalidate(['queue', 'requests', 'stats'])
+  }
+
+  function requeueSummary (result) {
+    let text = fmtNumber(result.requeued.length) + ' richieste rimesse in coda.'
+    if (result.skipped.length) text += ' ' + fmtNumber(result.skipped.length) + ' saltate (stato non valido o link già in coda).'
+    return text
+  }
+
+  async function requeueIds (ids) {
+    try {
+      const result = await api('api/requests/requeue', { method: 'POST', body: { ids } })
+      toast(requeueSummary(result), result.requeued.length ? 'success' : 'warning')
+    } catch (e) { return }
+    invalidate(['queue', 'requests', 'stats', 'limits'])
+  }
+
+  async function requeueRetryable () {
+    const ids = lastQueue ? lastQueue.retryable.filter((r) => r.requeueable).map((r) => r.id) : []
+    if (!ids.length) return
+    const ok = await confirmDialog('Rimettere in coda?', 'Verranno rimesse in coda ' + ids.length + ' richieste fallite o rifiutate. I link già presenti in coda vengono saltati.', 'Rimetti in coda')
+    if (ok) await requeueIds(ids)
+  }
+
+  async function bulkRequeue () {
+    const filters = requestFilters()
+    const ok = await confirmDialog('Rimettere in coda i risultati?',
+      'Verranno rimesse in coda fino a 500 richieste con stato "' + statusMeta(filters.status).label + '" che corrispondono ai filtri attuali.',
+      'Rimetti in coda')
+    if (!ok) return
+    try {
+      const body = { status: filters.status, q: filters.q || null, chat_id: filters.chat_id ? Number(filters.chat_id) : null }
+      const result = await api('api/requests/requeue', { method: 'POST', body })
+      toast(requeueSummary(result), result.requeued.length ? 'success' : 'warning')
+    } catch (e) { return }
+    invalidate(['queue', 'requests', 'stats', 'limits'])
+  }
+
+  // ---------------------------------------------------------------------
+  // Rate limits
+  // ---------------------------------------------------------------------
+  loaders.limits = async () => {
+    const data = await latest('limits', () => api('api/rate_limits'))
+    if (data !== STALE) renderLimits(data)
+  }
+
+  function renderLimits (d) {
+    const limits = d.limits || {}
+    $('limitsSource').textContent = LIMIT_SOURCES[limits.source] || limits.source || ''
+    const list = $('limitsList')
+    list.replaceChildren()
+    const windows = limits.rate_limits || []
+    if (!windows.length) list.append(el('li', { text: 'Nessun limite di frequenza configurato.' }))
+    for (const w of windows) list.append(el('li', { text: 'Al massimo ' + w.count + ' link ogni ' + fmtWindow(w.seconds) + ' per chat' }))
+    if (limits.max_pending_per_chat) list.append(el('li', { text: 'Al massimo ' + limits.max_pending_per_chat + ' richieste in attesa per chat' }))
+    if (limits.duplicate_window_seconds) list.append(el('li', { text: 'Lo stesso link è un duplicato per ' + fmtWindow(limits.duplicate_window_seconds) }))
+    if (limits.max_defer_seconds) list.append(el('li', { text: 'Le richieste oltre il limite vengono differite fino a ' + fmtWindow(limits.max_defer_seconds) + ', poi rifiutate' }))
+
+    const body = $('limitedBody')
+    body.replaceChildren()
+    if (!d.limited.length) body.append(emptyRow(5, 'Nessuna chat è limitata in questo momento.'))
+    for (const c of d.limited) {
+      const latestRefused = c.latest_refused
+      body.append(el('tr', null,
+        el('td', { className: 'mono', text: c.chat_id }),
+        el('td', null, el('span', { text: fmtDate(c.blocked_until) + ' (' }), timeAgo(c.blocked_until), ')'),
+        el('td', { text: fmtNumber(c.refused_24h) }),
+        el('td', null, latestRefused ? safeLink(latestRefused.url) : '—'),
+        el('td', { className: 'text-end' }, button('Sblocca…', 'btn-outline-primary', () => unlimit(c.chat_id)))))
+    }
+    $('unlimitAllBtn').disabled = false
+
+    const refused = $('refusedBody')
+    refused.replaceChildren()
+    if (!d.recent_refused.length) refused.append(emptyRow(5, 'Nessun rifiuto recente.'))
+    for (const r of d.recent_refused) {
+      const reason = r.status === 'duplicate' ? errorLabel('duplicate') : errorLabel(r.error_code || 'rate_limited')
+      const actions = el('td', { className: 'text-end' }, button('Dettagli', 'btn-outline-secondary', () => openDetail(r.id)))
+      if (r.requeueable) actions.append(' ', button('Rimetti in coda', 'btn-outline-primary', () => requeueIds([r.id])))
+      refused.append(el('tr', null,
+        el('td', null, timeAgo(r.created_at)),
+        el('td', { className: 'mono', text: chatLabel(r.chat_id, r.chat_type) }),
+        el('td', null, safeLink(r.url)),
+        el('td', { text: reason }),
+        actions))
+    }
+  }
+
+  async function unlimit (chatId) {
+    const message = chatId === null
+      ? 'Tutte le chat ripartono da zero con i limiti di frequenza.'
+      : 'La chat ' + chatId + ' riparte da zero con i limiti di frequenza.'
+    const choice = await openModal(chatId === null ? 'Sbloccare tutte le chat?' : 'Sbloccare la chat?',
+      message + '\n\nPuoi anche rimettere in coda, per ogni link, l\'ultima richiesta rifiutata delle ultime 24 ore (solo se il link non è stato inviato di nuovo nel frattempo).',
+      [
+        { label: 'Annulla', value: null, className: 'btn-outline-secondary' },
+        { label: 'Solo sblocca', value: 'unlimit', className: 'btn-outline-primary' },
+        { label: 'Sblocca e rimetti in coda', value: 'requeue', className: 'btn-primary' }
+      ])
+    if (!choice) return
+    const requeue = choice === 'requeue'
+    try {
+      const result = chatId === null
+        ? await api('api/rate_limits/unlimit_all', { method: 'POST', body: { requeue } })
+        : await api('api/rate_limits/unlimit', { method: 'POST', body: { chat_id: chatId, requeue } })
+      let text = chatId === null ? fmtNumber(result.chats) + ' chat sbloccate.' : 'Chat ' + chatId + ' sbloccata.'
+      if (requeue) text += ' ' + fmtNumber(result.requeued.length) + ' richieste rimesse in coda.'
+      toast(text, 'success')
+    } catch (e) { return }
+    invalidate(['limits', 'queue', 'requests', 'stats'])
+  }
+
+  // ---------------------------------------------------------------------
+  // Event log
+  // ---------------------------------------------------------------------
+  const eventState = { page: 1, limit: 50 }
+
+  function intOrEmpty (value) {
+    const text = value.trim()
+    return /^-?\d+$/.test(text) ? text : ''
+  }
+
+  loaders.events = async () => {
+    const params = {
+      limit: eventState.limit,
+      offset: (eventState.page - 1) * eventState.limit,
+      type: $('eventType').value,
+      chat_id: intOrEmpty($('eventChat').value),
+      request_id: intOrEmpty($('eventRequest').value)
+    }
+    const data = await latest('events', () => api('api/events' + query(params)))
+    if (data !== STALE) renderEvents(data)
+  }
+
+  function eventSummary (e) {
+    switch (e.type) {
+      case 'request_created':
+        return 'Nuova richiesta – ' + statusMeta(e.status).label + ': ' + (e.url || '')
+      case 'request_status': {
+        let text = statusMeta(e.previous).label + ' → ' + statusMeta(e.status).label
+        if (e.error_code) text += ' · ' + errorLabel(e.error_code)
+        if (e.attempts) text += ' · tentativo ' + e.attempts
+        if (e.not_before) text += ' · fino a ' + fmtDate(e.not_before)
+        if (e.actor) text += ' · da ' + e.actor
+        return text
+      }
+      case 'request_updated': {
+        const fields = Object.keys(e).filter((k) => FIELD_LABELS[k]).map((k) => FIELD_LABELS[k])
+        return fields.length ? 'Aggiornati: ' + fields.join(', ') : 'Aggiornata'
+      }
+      case 'request_event':
+        return (e.event_type || '') + (e.duration_seconds ? ' (' + fmtSeconds(e.duration_seconds) + ')' : '')
+      case 'queue_cleared':
+        return fmtNumber(e.count) + ' richieste annullate' + (e.chat_id ? ' della chat ' + e.chat_id : '') + (e.actor ? ' da ' + e.actor : '')
+      case 'rate_limit_changed':
+        return e.blocked_until ? 'Limitata fino a ' + fmtDate(e.blocked_until) : 'Limite rimosso'
+      case 'chat_unlimited':
+        return 'Sbloccata' + (e.actor ? ' da ' + e.actor : '')
+      case 'chat_unlimited_all':
+        return fmtNumber(e.count) + ' chat sbloccate' + (e.actor ? ' da ' + e.actor : '')
+      case 'history_cleared':
+        return 'Eliminate ' + fmtNumber(e.requests) + ' richieste e ' + fmtNumber(e.updates) + ' eventi' + (e.actor ? ' da ' + e.actor : '')
+      case 'history_pruned':
+        return 'Retention: ' + fmtNumber(e.requests) + ' richieste e ' + fmtNumber(e.updates) + ' eventi eliminati'
+      case 'update_created':
+        return String(e.raw || '').slice(0, 300)
+      default: {
+        const rest = Object.assign({}, e)
+        for (const key of ['id', 'type', 'created_at']) delete rest[key]
+        return JSON.stringify(rest).slice(0, 300)
+      }
+    }
+  }
+
+  function renderEvents (data) {
+    const body = $('eventsBody')
+    body.replaceChildren()
+    if (!data.items.length) body.append(emptyRow(6, 'Nessun evento.'))
+    for (const e of data.items) {
+      const requestCell = el('td')
+      if (e.request_id !== undefined && e.request_id !== null) {
+        requestCell.append(el('button', { className: 'btn btn-link btn-sm p-0', text: '#' + e.request_id, type: 'button', onClick: () => openDetail(e.request_id) }))
+      }
+      body.append(el('tr', null,
+        el('td', { className: 'mono', text: e.id }),
+        el('td', null, timeAgo(e.created_at)),
+        el('td', null, el('span', { className: 'badge text-bg-light', text: EVENT_LABELS[e.type] || e.type })),
+        el('td', { className: 'mono', text: e.chat_id === undefined || e.chat_id === null ? '' : e.chat_id }),
+        requestCell,
+        el('td', { className: 'wrap', text: eventSummary(e) })))
+    }
+    const pages = Math.max(1, Math.ceil(data.total / eventState.limit))
+    $('eventsSummary').textContent = fmtNumber(data.total) + ' eventi'
+    renderPager($('eventsPager'), eventState.page, pages, (page) => {
+      eventState.page = page
+      runLoader('events', true)
+    })
+  }
+
+  function setupEventFilters () {
+    const select = $('eventType')
+    for (const [type, label] of Object.entries(EVENT_LABELS)) select.append(el('option', { text: label, attrs: { value: type } }))
+    const reload = () => {
+      eventState.page = 1
+      runLoader('events', true)
+    }
+    select.addEventListener('change', reload)
+    const debounced = debounce(reload, 350)
+    $('eventChat').addEventListener('input', debounced)
+    $('eventRequest').addEventListener('input', debounced)
+    $('eventFilters').addEventListener('submit', (event) => {
+      event.preventDefault()
+      reload()
+    })
+  }
+
+  // ---------------------------------------------------------------------
+  // Users
+  // ---------------------------------------------------------------------
+  loaders.users = async () => {
+    const data = await latest('users', () => api('api/users?limit=200'))
+    if (data !== STALE) renderUsers(data)
+  }
+
+  function renderUsers (data) {
+    const body = $('usersBody')
+    body.replaceChildren()
+    $('usersSummary').textContent = fmtNumber(data.total) + ' utenti, ' + fmtNumber(data.admins) + ' amministratori'
+    if (!data.items.length) body.append(emptyRow(5, 'Nessun utente registrato.'))
+    for (const u of data.items) {
+      const isAdmin = u.role === 'admin'
+      body.append(el('tr', null,
+        el('td', { text: u.email || '—' }),
+        el('td', { text: u.username || '—' }),
+        el('td', null, el('span', { className: 'badge ' + (isAdmin ? 'text-bg-primary' : 'text-bg-light'), text: isAdmin ? 'Amministratore' : 'Utente' })),
+        el('td', null, timeAgo(u.created_at)),
+        el('td', { className: 'text-end' },
+          button(isAdmin ? 'Rendi utente' : 'Rendi amministratore', 'btn-outline-primary', () => setRole(u, isAdmin ? 'user' : 'admin')), ' ',
+          button('Elimina…', 'btn-outline-danger', () => deleteUser(u)))))
+    }
+  }
+
+  async function createUser (event) {
+    event.preventDefault()
+    const body = { email: $('userEmail').value.trim(), username: $('userName').value.trim() || null, role: $('userRole').value }
+    if (!body.email) return
+    try {
+      await api('api/users', { method: 'POST', body })
+      toast('Utente ' + body.email + ' aggiunto.', 'success')
+      $('userForm').reset()
+    } catch (e) { return }
+    runLoader('users', true)
+  }
+
+  async function setRole (user, role) {
+    if (role === 'user' && me && me.user && me.user.email && user.email && me.user.email.toLowerCase() === user.email.toLowerCase()) {
+      const ok = await confirmDialog('Rimuovere i tuoi privilegi?', 'Stai togliendo il ruolo di amministratore al tuo stesso account: potresti perdere l\'accesso alla console.', 'Rimuovi', true)
+      if (!ok) return
+    }
+    try {
+      await api('api/users/' + encodeURIComponent(user.id) + '/role', { method: 'PUT', body: { role } })
+      toast('Ruolo di ' + (user.email || user.username) + ' aggiornato.', 'success')
+    } catch (e) { return }
+    runLoader('users', true)
+  }
+
+  async function deleteUser (user) {
+    const ok = await confirmDialog('Eliminare l\'utente?', 'L\'utente ' + (user.email || user.username || user.id) + ' verrà eliminato.', 'Elimina', true)
+    if (!ok) return
+    try {
+      await api('api/users/' + encodeURIComponent(user.id), { method: 'DELETE' })
+      toast('Utente eliminato.', 'success')
+    } catch (e) { return }
+    runLoader('users', true)
+  }
+
+  // ---------------------------------------------------------------------
+  // System
+  // ---------------------------------------------------------------------
+  loaders.system = async () => {
+    const data = await latest('system', () => Promise.all([api('api/config'), api('health', { quiet: true }).catch((e) => ({ ok: false, db: 'error', error: e.detail }))]))
+    if (data !== STALE) renderSystem(data[0], data[1])
+  }
+
+  function renderSystem (cfg, health) {
+    const dl = $('healthInfo')
+    dl.replaceChildren()
+    definition(dl, 'Database', health.db === 'ok' ? 'raggiungibile' : 'errore')
+    const workerStates = { online: 'attivo', offline: 'non raggiungibile', stopped: 'fermo', unknown: 'mai visto' }
+    definition(dl, 'Worker', workerStates[cfg.worker.state] || cfg.worker.state)
+    definition(dl, 'Versione della console', cfg.version)
+    definition(dl, 'Versione del worker', cfg.worker.version)
+    definition(dl, 'Client in tempo reale', cfg.gui.ws_clients)
+    definition(dl, 'Ultimo evento letto', cfg.gui.last_event_id)
+
+    const warnings = $('configWarnings')
+    warnings.replaceChildren()
+    const list = (cfg.warnings || []).slice()
+    if (cfg.auth.secret_key_ephemeral) list.unshift('SECRET_KEY non impostata: le sessioni non sopravvivono ai riavvii della console.')
+    if (list.length) {
+      const ul = el('ul', { className: 'mb-0' })
+      for (const w of list) ul.append(el('li', { text: w }))
+      warnings.append(el('div', { className: 'alert alert-warning small' }, el('strong', { text: 'Avvisi di configurazione' }), ul))
+    }
+
+    const body = $('configBody')
+    body.replaceChildren()
+    const section = (title, rows) => {
+      const sdl = el('dl', { className: 'row mb-0' })
+      for (const [label, value] of rows) definition(sdl, label, value)
+      body.append(el('div', { className: 'col-lg-6' }, el('h3', { className: 'h6', text: title }), sdl))
+    }
+    const yes = (v) => (v ? 'sì' : 'no')
+    section('Accesso', [
+      ['Token amministratore', yes(cfg.auth.token)],
+      ['OAuth/OIDC', yes(cfg.auth.oauth)],
+      ['Gruppi amministratore', (cfg.auth.oauth_admin_groups || []).join(', ') || null],
+      ['Redirect OAuth', cfg.auth.oauth_redirect_uri],
+      ['Cookie solo HTTPS', yes(cfg.auth.session_cookie_secure)],
+      ['Durata della sessione', fmtWindow(cfg.auth.session_max_age_seconds)]
+    ])
+    const limits = cfg.limits || {}
+    section('Limiti effettivi (' + (LIMIT_SOURCES[limits.source] || limits.source || '') + ')', [
+      ['Finestre', (limits.rate_limits || []).map((w) => w.count + ' / ' + fmtWindow(w.seconds)).join(', ') || 'nessuna'],
+      ['Richieste in attesa per chat', limits.max_pending_per_chat],
+      ['Finestra duplicati', limits.duplicate_window_seconds ? fmtWindow(limits.duplicate_window_seconds) : null],
+      ['Differimento massimo', limits.max_defer_seconds ? fmtWindow(limits.max_defer_seconds) : null]
+    ])
+    const settings = cfg.settings || {}
+    section('Impostazioni lette dalla console', Object.keys(settings).sort().map((key) => {
+      const value = settings[key]
+      return [key, Array.isArray(value) || (value && typeof value === 'object') ? JSON.stringify(value) : (typeof value === 'boolean' ? yes(value) : value)]
+    }))
+  }
+
+  async function clearHistory () {
+    const ok = await confirmDialog('Pulire lo storico?',
+      'Verranno eliminate definitivamente le richieste concluse con i loro eventi e il registro eventi. Le richieste in coda o in corso, gli utenti e i limiti restano invariati.',
+      'Elimina lo storico', true)
+    if (!ok) return
+    try {
+      const result = await api('api/history/clear', { method: 'POST', body: {} })
+      const d = result.deleted || {}
+      toast('Storico eliminato: ' + fmtNumber(d.requests) + ' richieste, ' + fmtNumber(d.updates) + ' eventi.', 'success')
+    } catch (e) { return }
+    resyncAll()
+  }
+
+  // ---------------------------------------------------------------------
+  // Wiring
+  // ---------------------------------------------------------------------
+  function setup () {
+    $('tokenForm').addEventListener('submit', submitToken)
+    $('tokenToggle').addEventListener('click', () => {
+      const input = $('tokenInput')
+      const show = input.type === 'password'
+      input.type = show ? 'text' : 'password'
+      $('tokenToggle').textContent = show ? 'Nascondi' : 'Mostra'
+      $('tokenToggle').setAttribute('aria-pressed', show ? 'true' : 'false')
+    })
+    $('logoutBtn').addEventListener('click', logout)
+    $('notAdminLogoutBtn').addEventListener('click', logout)
+    $('recheckBtn').addEventListener('click', initAuth)
+    $('refreshBtn').addEventListener('click', resyncAll)
+    for (const tab of document.querySelectorAll('[data-tab]')) {
+      tab.addEventListener('click', () => activateTab(tab.dataset.tab))
+    }
+    window.addEventListener('hashchange', () => activateTab(tabFromHash(), true))
+
+    $('requestFilters').addEventListener('submit', (event) => {
+      event.preventDefault()
+      reloadRequests()
+    })
+    $('searchInput').addEventListener('input', debounce(reloadRequests, 300))
+    $('chatFilter').addEventListener('input', debounce(reloadRequests, 300))
+    $('statusFilter').addEventListener('change', reloadRequests)
+    $('pageSize').addEventListener('change', reloadRequests)
+    $('bulkRequeueBtn').addEventListener('click', bulkRequeue)
+    updateStatusOptions([])
+
+    $('cancelAllBtn').addEventListener('click', cancelAll)
+    $('requeueRetryableBtn').addEventListener('click', requeueRetryable)
+    $('unlimitAllBtn').addEventListener('click', () => unlimit(null))
+    $('userForm').addEventListener('submit', createUser)
+    $('clearHistoryBtn').addEventListener('click', clearHistory)
+    setupEventFilters()
+
+    $('modalClose').addEventListener('click', () => closeModal(null))
+    $('modalDialog').addEventListener('click', (event) => {
+      if (event.target === $('modalDialog')) closeModal(null)
+    })
+    document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && !$('modal').hidden) closeModal(null)
+    })
+    document.addEventListener('visibilitychange', () => {
+      if (document.hidden || !authed) return
+      refreshRelativeTimes()
+      if (!ws && wsWanted) connectWs()
+      invalidate(['worker', ...(PANEL_RESOURCES[currentTab] || [])])
+    })
+
+    // Safety net: periodic refresh (every resource when the live channel is down).
+    setInterval(() => {
+      if (document.hidden || !authed) return
+      refreshRelativeTimes()
+      const live = ws && ws.readyState === WebSocket.OPEN
+      invalidate(live ? ['worker'] : ['worker', ...(PANEL_RESOURCES[currentTab] || [])])
+    }, 15000)
+    setInterval(() => {
+      if (!document.hidden && authed && currentTab === 'overview') invalidate(['stats', 'aggregates'])
+    }, 60000)
+    initAuth()
+  }
+
+  if (document.readyState === 'loading') document.addEventListener('DOMContentLoaded', setup)
+  else setup()
+})()
