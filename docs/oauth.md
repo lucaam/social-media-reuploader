@@ -16,6 +16,7 @@ che, o in aggiunta a, `ADMIN_TOKEN`.
 | `OAUTH_SCOPE` | Scope richiesti (default `openid profile email`). |
 | `OAUTH_REDIRECT_URI` | URL pubblico di callback, es. `https://admin.example.com/auth`. Impostalo sempre dietro un reverse proxy. |
 | `OAUTH_ADMIN_GROUPS` | Gruppi del provider (separati da virgola) i cui membri sono amministratori. Gli altri utenti sono amministratori solo se registrati con ruolo `admin` nella GUI. |
+| `OAUTH_ASSUME_EMAIL_VERIFIED` | Il ruolo `admin` registrato nella GUI vale solo per e-mail con `email_verified=true`. Con provider che non inviano il claim ma restituiscono solo e-mail verificate (GitHub) imposta `true`. Non con Microsoft Entra ID, il cui claim `email` non è verificato: usa i gruppi (`OAUTH_ADMIN_GROUPS`). |
 | `SECRET_KEY` | Chiave dei cookie di sessione, almeno 32 caratteri casuali. |
 | `SESSION_COOKIE_SECURE` | `true` quando la GUI è in HTTPS. |
 
@@ -55,10 +56,15 @@ export OAUTH_TOKEN_URL="https://github.com/login/oauth/access_token"
 export OAUTH_USERINFO_URL="https://api.github.com/user"
 export OAUTH_SCOPE="read:user user:email"
 export OAUTH_REDIRECT_URI="https://admin.example.com/auth"
+# GitHub non invia email_verified, ma l'e-mail pubblica può essere solo un indirizzo verificato
+export OAUTH_ASSUME_EMAIL_VERIFIED=true
 export SECRET_KEY="$(openssl rand -hex 32)"
 ```
 
 GitHub non ha gruppi OIDC: gli amministratori si registrano nella GUI.
+Senza `OAUTH_ASSUME_EMAIL_VERIFIED=true` il loro ruolo `admin` non viene
+riconosciuto (aggiornamento dalle versioni precedenti: aggiungi la variabile,
+altrimenti, senza `ADMIN_TOKEN`, nessuno può più amministrare la GUI).
 
 ## Con Helm
 

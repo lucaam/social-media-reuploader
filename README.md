@@ -198,13 +198,13 @@ mappa `env` di `values.yaml` (numeri e booleani vengono resi come stringhe).
 | `YTDLP_COOKIES_FROM_BROWSER` | – | Opzione `--cookies-from-browser` di yt-dlp; richiede un profilo del browser nel container, meglio `YTDLP_COOKIES_PATH`. |
 | `YTDLP_HEADERS` | – | Header HTTP aggiuntivi nel formato `Header: Valore`; più header si separano con una barra verticale. |
 | `YTDLP_IMPERSONATE` | – | Target di `--impersonate` (es. `chrome`); curl_cffi è già installato. |
-| `YTDLP_PROXY` | – | Proxy per yt-dlp, es. `socks5://host:1080`. |
+| `YTDLP_PROXY` | – | Proxy per yt-dlp, es. `socks5://host:1080`. La risoluzione degli share link (es. `pin.it`, `fb.watch`) lo usa solo se è un proxy `http(s)`; con un proxy SOCKS quelle richieste partono dirette (avviso all'avvio). |
 
 #### Provider
 
 | Variabile | Default | Descrizione |
 |---|---|---|
-| `ALLOWED_PROVIDERS` | tutti | Provider ammessi, separati da virgola: nomi degli estrattori di yt-dlp (`youtube`, `tiktok`, `instagram`, `twitter`, `reddit`, ...) o domini (`vimeo.com`). Vuoto = tutti i siti supportati da yt-dlp. |
+| `ALLOWED_PROVIDERS` | tutti | Provider ammessi, separati da virgola: nomi degli estrattori di yt-dlp (`youtube`, `tiktok`, `instagram`, `twitter`, `reddit`, ...) o domini (`vimeo.com`). Il dominio di un sito vale per tutto il sito e i suoi altri domini (`youtube.com` copre anche `youtu.be`, `x.com` anche `twitter.com`); un sottodominio (es. `vm.tiktok.com`) vale solo per quell'host. Vuoto = tutti i siti supportati da yt-dlp. |
 | `BLOCKED_PROVIDERS` | – | Provider esclusi, stesso formato. |
 | `ALLOW_COLLECTION_LINKS` | `false` | Accetta anche link a profili, canali, playlist e album (vengono pubblicati i primi `MAX_ITEMS_PER_LINK` elementi). |
 | `UNSUPPORTED_LINK_REPLY` | `private` | Quando rispondere ai link che il bot non può gestire: `private` (solo chat private), `always`, `never`. |
@@ -266,6 +266,7 @@ mappa `env` di `values.yaml` (numeri e booleani vengono resi come stringhe).
 | `OAUTH_REDIRECT_URI` | derivato dalla richiesta | URL pubblico di callback, es. `https://admin.example.com/auth`: impostalo quando la GUI è dietro un reverse proxy. |
 | `OAUTH_ADMIN_GROUPS` | – | Gruppi del provider (separati da virgola) i cui membri sono amministratori. |
 | `OAUTH_ISSUER` | – | `iss` atteso nell'id_token quando non si usa la discovery. |
+| `OAUTH_ASSUME_EMAIL_VERIFIED` | `false` | Il ruolo amministratore registrato nella GUI vale solo per e-mail con `email_verified=true`. Impostalo a `true` solo per provider che non inviano quel claim ma restituiscono esclusivamente e-mail verificate (es. GitHub). Non usarlo con Microsoft Entra ID, dove il claim `email` non è verificato: lì usa `OAUTH_ADMIN_GROUPS`. |
 | `OAUTH_TIMEOUT_SECONDS` | `10` | Timeout delle chiamate HTTP verso il provider OAuth (1-60). |
 | `GUI_DB_POLL_SECONDS` | `1` | Ogni quanto la GUI legge il log degli eventi dal database per gli aggiornamenti live (min 0.2). |
 | `GUI_REQUEUE_MAX_AGE_SECONDS` | `86400` (24 h) | "Sblocca e rimetti in coda" rimette in coda solo i link rifiutati più recenti di così. |

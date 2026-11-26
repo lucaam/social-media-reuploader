@@ -27,6 +27,7 @@ GUI_SETTINGS = {
     "OAUTH_ADMIN_GROUPS",
     "OAUTH_ISSUER",
     "OAUTH_TIMEOUT_SECONDS",
+    "OAUTH_ASSUME_EMAIL_VERIFIED",
 }
 
 
@@ -70,7 +71,7 @@ def test_the_repository_documents_every_setting(check_docs, capsys):
     assert check_docs.main() == 0
     out = capsys.readouterr().out
     assert "error:" not in out
-    assert "17 GUI settings" in out
+    assert f"{len(GUI_SETTINGS)} GUI settings" in out
 
 
 def test_gui_settings_read_by_gui_auth_are_found(check_docs):
