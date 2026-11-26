@@ -19,6 +19,9 @@ Design notes
   :func:`src.media.prepare_for_telegram` converts. ``--max-filesize`` (set to
   ``MAX_DOWNLOAD_BYTES``) is only a safety net, plus an on-disk size guard for
   protocols where yt-dlp does not enforce it (HLS/DASH fragments).
+* A download is complete or it fails: a fragment that cannot be fetched
+  aborts it (``--abort-on-unavailable-fragments``) and the file of a run that
+  exited with an error is never returned.
 * The configured cookies file is copied into the per-request workdir before
   every run: yt-dlp rewrites its ``--cookies`` file on exit and must never
   touch the operator's (often read-only) file.
@@ -857,6 +860,9 @@ def build_download_argv(
         *ytdlp_command(),
         *common_args(cookies_path=cookies_path),
         *format_args(format_id),
+        # yt-dlp skips HLS/DASH fragments it cannot get by default: the video
+        # would have a hole (and after a 404 yt-dlp even exits with 0)
+        "--abort-on-unavailable-fragments",
         "--max-filesize",
         str(_int_setting("MAX_DOWNLOAD_BYTES")),
         "--output",
@@ -1426,6 +1432,11 @@ def _prepare_item_files(
     return item_json, paths_file
 
 
+def _discard(path: str) -> None:
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(path)
+
+
 def _read_final_path(paths_file: str) -> str | None:
     try:
         with open(paths_file, encoding="utf-8") as fh:
@@ -1500,20 +1511,26 @@ async def _download_item(
             monitor=guard,
         )
     final_path = await asyncio.to_thread(_read_final_path, paths_file)
+    if result.returncode != 0:
+        if final_path is not None:
+            # yt-dlp reported an error but still wrote a file (e.g. without
+            # a fragment it gave up on): never deliver it as complete
+            logger.warning(
+                "yt-dlp exited with %s after producing %s: discarding it",
+                result.returncode,
+                os.path.basename(final_path),
+            )
+            await asyncio.to_thread(_discard, final_path)
+        raise classify_ytdlp_error(
+            result.stderr, stdout=result.stdout, returncode=result.returncode
+        )
     if final_path is None:
-        if _MAX_FILESIZE_RE.search(result.stdout) or result.returncode != 0:
+        if _MAX_FILESIZE_RE.search(result.stdout):
             raise classify_ytdlp_error(
                 result.stderr, stdout=result.stdout, returncode=result.returncode
             )
         raise NoMedia(
             "yt-dlp finished without producing a file", stderr_tail=result.stderr
-        )
-    if result.returncode != 0:
-        logger.warning(
-            "yt-dlp exited with %s after producing %s: %s",
-            result.returncode,
-            final_path,
-            classify_ytdlp_error(result.stderr).detail,
         )
     final_ext = os.path.splitext(final_path)[1].lstrip(".").lower()
     if item.kind == "video" and final_ext in _AUDIO_EXTS:
@@ -1551,7 +1568,9 @@ async def download(
 
     Raises :class:`TooLarge` when yt-dlp skipped a file because of
     ``--max-filesize`` (or the on-disk guard tripped), :class:`NoMedia` when
-    nothing was produced. For multi-item posts, failed items are skipped
+    nothing was produced, the error classified from yt-dlp's stderr when it
+    exited with an error (even if it wrote a file, which is then deleted:
+    e.g. a fragment was missing). For multi-item posts, failed items are skipped
     (logged) as long as at least one file was produced; otherwise the first
     error is raised.
     """

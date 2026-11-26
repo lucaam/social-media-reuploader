@@ -372,6 +372,8 @@ def test_download_argv_has_the_same_auth_options_and_safety_net(monkeypatch):
     assert (
         ydl["max_filesize"] == 500 * MIB
     )  # MAX_DOWNLOAD_BYTES, not the Telegram limit
+    # a fragment that cannot be fetched fails the download (no file with holes)
+    assert ydl["skip_unavailable_fragments"] is False
     assert ydl["format"].startswith("137+140/")
     assert argv[argv.index("--load-info-json") + 1] == "/work/info-01.json"
     assert argv[
@@ -1756,6 +1758,117 @@ def test_server_error_on_a_fragment_is_retryable(real_ytdlp, media_server, tmp_p
     err = excinfo.value
     assert (err.code, err.retryable) == ("failed", True)
     assert "HTTP Error 503" in err.detail
+
+
+def _hls_segments(root, count=3):
+    """Real 2 s MPEG-TS segments of one H.264/AAC clip, written to ``root``."""
+    src = root / "src.mp4"
+    _ffmpeg(
+        "-f",
+        "lavfi",
+        "-i",
+        "testsrc=size=320x240:rate=25",
+        "-f",
+        "lavfi",
+        "-i",
+        "sine=frequency=440",
+        "-t",
+        str(2 * count),
+        "-c:v",
+        "libx264",
+        "-g",
+        "50",
+        "-sc_threshold",
+        "0",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        str(src),
+    )
+    _ffmpeg(
+        "-i",
+        str(src),
+        "-c",
+        "copy",
+        "-f",
+        "segment",
+        "-segment_time",
+        "2",
+        "-reset_timestamps",
+        "0",
+        str(root / "seg%d.ts"),
+    )
+    src.unlink()
+    return sorted(path.name for path in root.glob("seg*.ts"))
+
+
+@needs_ffmpeg
+@pytest.mark.parametrize(
+    ("status", "code", "retryable"),
+    [(503, "failed", True), (404, "unavailable", False)],
+)
+def test_a_lost_fragment_is_never_delivered(
+    real_ytdlp, media_server, tmp_path, status, code, retryable
+):
+    # By default yt-dlp skips a fragment it cannot get and keeps going (after
+    # a 404 it even exits 0): the result would be a video with a hole,
+    # delivered and recorded as done.
+    root, base = media_server
+    segments = _hls_segments(root)
+    segments[1] = f"status/{status}/{segments[1]}"
+    playlist = ["#EXTM3U", "#EXT-X-VERSION:3", "#EXT-X-TARGETDURATION:2"]
+    for name in segments:
+        playlist += ["#EXTINF:2.0,", name]
+    (root / "index.m3u8").write_text("\n".join([*playlist, "#EXT-X-ENDLIST", ""]))
+    hls = {
+        "format_id": "hls-240",
+        "ext": "mp4",
+        "vcodec": "avc1.64000d",
+        "acodec": "mp4a.40.2",
+        "width": 320,
+        "height": 240,
+        "tbr": 300,
+        "protocol": "m3u8_native",
+        "url": f"{base}/index.m3u8",
+        "manifest_url": f"{base}/index.m3u8",
+    }
+    real_ytdlp(_raw_video([hls], duration=6))
+    workdir = tmp_path / "work"
+    info = run(downloader.fetch_info("https://example.invalid/vid1", str(workdir)))
+    with pytest.raises(DownloadError) as excinfo:
+        run(downloader.download(info, str(workdir)))
+    err = excinfo.value
+    assert (err.code, err.retryable) == (code, retryable)
+    assert f"HTTP Error {status}" in err.detail
+    assert not (workdir / "item-01.mp4").exists()
+
+
+def test_a_file_from_a_failed_run_is_discarded(monkeypatch, tmp_path):
+    # whatever yt-dlp managed to write, an exit status != 0 means an error
+    # (e.g. a fragment it gave up on): the file is not returned, but deleted
+    info = _fake_media_info(tmp_path, 1)
+    (tmp_path / "info-01.json").write_text("{}")
+    produced = []
+
+    async def failed_run(argv, **kwargs):
+        template = argv[argv.index("--output") + 1].replace("%%", "%")
+        path = template.replace("%(ext)s", "mp4")
+        pathlib.Path(path).write_bytes(b"\0" * 1000)
+        produced.append(path)
+        paths_file = argv[argv.index("--print-to-file") + 2].replace("%%", "%")
+        pathlib.Path(paths_file).write_text(path + "\n")
+        stderr = (
+            "ERROR: \r[download] Got error: HTTP Error 503: Service Unavailable. "
+            "Giving up after 10 retries\n"
+        )
+        return downloader.CommandResult(1, "", stderr, 1.0)
+
+    monkeypatch.setattr(downloader, "run_command", failed_run)
+    with pytest.raises(DownloadError, match="HTTP Error 503") as excinfo:
+        run(downloader.download(info, str(tmp_path)))
+    assert excinfo.value.retryable is True
+    assert produced and not os.path.exists(produced[0])
 
 
 def test_download_multi_item_post_in_order(real_ytdlp, media_server, tmp_path):
