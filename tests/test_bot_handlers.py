@@ -645,15 +645,40 @@ def test_message_text_is_never_logged(caplog):
 
 
 def test_handler_errors_are_logged_not_raised(monkeypatch, caplog):
-    async def broken(url, *, resolve=True):
+    def broken(text, entities=None):
         raise RuntimeError("boom")
 
-    monkeypatch.setattr(providers, "check_link_async", broken)
+    monkeypatch.setattr(providers, "extract_urls", broken)
     with caplog.at_level(logging.ERROR, logger="src.handlers"):
         pool = feed(text_update(YT, YT))
 
     assert pool.calls == []
     assert "Error while handling update 1: RuntimeError" in caplog.text
+
+
+def test_a_failing_link_check_does_not_drop_the_other_links(
+    monkeypatch, caplog, telegram
+):
+    real_check = providers.check_link_async
+    broken_url = "https://fb.watch/abcDEF123/"
+
+    async def check(url, *, resolve=True):
+        if url == broken_url:
+            raise ValueError("Invalid IPv6 URL")
+        return await real_check(url, resolve=resolve)
+
+    monkeypatch.setattr(providers, "check_link_async", check)
+    text = f"{YT} {broken_url}"
+    with caplog.at_level(logging.ERROR, logger="src.handlers"):
+        pool = feed(text_update(text, YT, broken_url))
+
+    assert [c["url"] for c in pool.calls] == [YT]
+    assert "Could not check a link of chat=111 message=7: ValueError" in caplog.text
+    assert "Error while handling update" not in caplog.text
+    # The failed link is answered like an unsupported one (no reaction: the
+    # worker uses it for the accepted link).
+    assert telegram["messages"][0]["text"] == f"Link non supportato. Supporto {SITES}."
+    assert telegram["reactions"] == []
 
 
 # ---------------------------------------------------------------------------

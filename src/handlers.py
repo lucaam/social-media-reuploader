@@ -34,7 +34,7 @@ from aiogram.filters import JOIN_TRANSITION, ChatMemberUpdatedFilter, Command
 from aiogram.types import ChatMemberUpdated, ErrorEvent, Message
 
 from . import config, providers, telegram_api
-from .providers import ProviderMatch, Rejection
+from .providers import LinkCheck, ProviderMatch, Rejection
 
 logger = logging.getLogger(__name__)
 
@@ -359,7 +359,7 @@ async def handle_links(
         )
         urls = urls[:limit]
 
-    checks = await asyncio.gather(*(providers.check_link_async(u) for u in urls))
+    checks = await _check_links(message, urls)
     description = providers.text_without_urls(text, entities) or None
     submitted: Counter[str] = Counter()  # submit status -> count
     refused: list[Rejection] = []
@@ -383,6 +383,29 @@ async def handle_links(
     )
     if refused and not edited and should_reply_unsupported(chat.type):
         await _reply_refused(bot, message, refused, react=not submitted)
+
+
+async def _check_links(message: Message, urls: Sequence[str]) -> list[LinkCheck]:
+    """Check every link concurrently; a failing check refuses only its link."""
+    results = await asyncio.gather(
+        *(providers.check_link_async(url) for url in urls), return_exceptions=True
+    )
+    checks: list[LinkCheck] = []
+    for url, result in zip(urls, results, strict=True):
+        if not isinstance(result, BaseException):
+            checks.append(result)
+            continue
+        if not isinstance(result, Exception):
+            raise result  # CancelledError and friends
+        logger.error(
+            "Could not check a link of chat=%s message=%s: %s",
+            message.chat.id,
+            message.message_id,
+            type(result).__name__,
+            exc_info=result,
+        )
+        checks.append(LinkCheck(url=url, match=None, reason=Rejection.UNSUPPORTED))
+    return checks
 
 
 async def _submit(
