@@ -200,12 +200,20 @@ def _page(state: GuiState, name: str, status_code: int, **values: str) -> HTMLRe
 def error_page(
     conn: HTTPConnection, status_code: int, title: str, message: str
 ) -> HTMLResponse:
+    state = _state(conn)
+    token_login = ""
+    if state.settings.token_enabled:
+        token_login = (
+            '<a class="btn btn-outline-primary" href="login?method=token">'
+            "Accedi con il token</a>"
+        )
     return _page(
-        _state(conn),
+        state,
         "error.html",
         status_code,
         title=html.escape(title),
         message=html.escape(message),
+        token_login=token_login,
     )
 
 
@@ -292,9 +300,24 @@ def callback_url(conn: HTTPConnection, settings: AuthSettings) -> str:
 
 
 @public.get("/login", include_in_schema=False)
-async def login_page(request: Request) -> Response:
-    """Start the OAuth flow, or show the admin-token form."""
+async def login_page(
+    request: Request, method: Annotated[str | None, Query(max_length=16)] = None
+) -> Response:
+    """Start the OAuth flow, or show the admin-token form.
+
+    ``?method=token`` shows the token form even when OAuth is configured (no
+    JavaScript, or the identity provider is down).
+    """
     state = _state(request)
+    if method == "token":
+        if state.settings.token_enabled:
+            return login_form(request)
+        return error_page(
+            request,
+            400,
+            "Accesso con token non disponibile",
+            "ADMIN_TOKEN non è configurato: accedi con il provider di identità.",
+        )
     client = state.oauth_client
     if client is not None:
         try:
@@ -310,12 +333,17 @@ async def login_page(request: Request) -> Response:
             ValueError,
         ) as exc:
             logger.warning("Cannot start the OAuth login: %r", exc)
+            alternative = (
+                " o accedi con il token amministratore"
+                if state.settings.token_enabled
+                else ""
+            )
             return error_page(
                 request,
                 502,
                 "Accesso non disponibile",
                 "Il provider di identità non risponde o è configurato male."
-                " Riprova più tardi o accedi con il token amministratore.",
+                f" Riprova più tardi{alternative}.",
             )
     if state.settings.token_enabled:
         return login_form(request)
@@ -830,8 +858,11 @@ def worker_status() -> dict[str, Any]:
 
 
 @api.get("/api/rate_limits")
-def rate_limits() -> dict[str, Any]:
-    return gui_queries.rate_limit_view()
+def rate_limits(request: Request) -> dict[str, Any]:
+    view = gui_queries.rate_limit_view()
+    # How old a refusal may be for "Sblocca e rimetti in coda" to requeue it.
+    view["requeue_max_age_seconds"] = _state(request).requeue_max_age
+    return view
 
 
 def _requeue_refused(state: GuiState, *, chat_id: int | None, actor: str) -> list[int]:

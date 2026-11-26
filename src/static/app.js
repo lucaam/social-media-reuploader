@@ -1290,12 +1290,15 @@
   // ---------------------------------------------------------------------
   // Rate limits
   // ---------------------------------------------------------------------
+  let lastLimits = null
+
   loaders.limits = async () => {
     const data = await latest('limits', () => api('api/rate_limits'))
     if (data !== STALE) renderLimits(data)
   }
 
   function renderLimits (d) {
+    lastLimits = d
     const limits = d.limits || {}
     $('limitsSource').textContent = LIMIT_SOURCES[limits.source] || limits.source || ''
     const list = $('limitsList')
@@ -1337,17 +1340,31 @@
     }
   }
 
+  // The requeue option of the unlimit dialog (GUI_REQUEUE_MAX_AGE_SECONDS).
+  function requeueChoice () {
+    const maxAge = lastLimits ? lastLimits.requeue_max_age_seconds : null
+    if (typeof maxAge === 'number' && maxAge <= 0) {
+      return { text: 'Rimettere in coda le richieste rifiutate è disattivato (GUI_REQUEUE_MAX_AGE_SECONDS = 0).', offered: false }
+    }
+    const age = typeof maxAge === 'number' ? ', se non è più vecchia di ' + fmtWindow(maxAge) : ' recente'
+    return {
+      text: 'Puoi anche rimettere in coda, per ogni link, l\'ultima richiesta rifiutata' + age + ' (solo se il link non è stato inviato di nuovo nel frattempo).',
+      offered: true
+    }
+  }
+
   async function unlimit (chatId) {
     const message = chatId === null
       ? 'Tutte le chat ripartono da zero con i limiti di frequenza.'
       : 'La chat ' + chatId + ' riparte da zero con i limiti di frequenza.'
+    const requeueOption = requeueChoice()
+    const buttons = [
+      { label: 'Annulla', value: null, className: 'btn-outline-secondary' },
+      { label: 'Solo sblocca', value: 'unlimit', className: 'btn-outline-primary' }
+    ]
+    if (requeueOption.offered) buttons.push({ label: 'Sblocca e rimetti in coda', value: 'requeue', className: 'btn-primary' })
     const choice = await openModal(chatId === null ? 'Sbloccare tutte le chat?' : 'Sbloccare la chat?',
-      message + '\n\nPuoi anche rimettere in coda, per ogni link, l\'ultima richiesta rifiutata delle ultime 24 ore (solo se il link non è stato inviato di nuovo nel frattempo).',
-      [
-        { label: 'Annulla', value: null, className: 'btn-outline-secondary' },
-        { label: 'Solo sblocca', value: 'unlimit', className: 'btn-outline-primary' },
-        { label: 'Sblocca e rimetti in coda', value: 'requeue', className: 'btn-primary' }
-      ])
+      message + '\n\n' + requeueOption.text, buttons)
     if (!choice) return
     const requeue = choice === 'requeue'
     try {

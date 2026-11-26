@@ -421,6 +421,9 @@ def test_unlimit_requeue_respects_the_configured_max_age(client, monkeypatch):
     set_column(request_id, "created_at", iso_ago(hours=2))
     monkeypatch.setattr(config, "GUI_REQUEUE_MAX_AGE_SECONDS", 3600, raising=False)
     short = TestClient(make_app(), headers=BEARER)
+    # the Limiti tab shows the real window in its unlimit dialog
+    assert short.get("/api/rate_limits").json()["requeue_max_age_seconds"] == 3600
+    assert client.get("/api/rate_limits").json()["requeue_max_age_seconds"] == 86400
     assert (
         short.post(
             "/api/rate_limits/unlimit", json={"chat_id": 12, "requeue": True}

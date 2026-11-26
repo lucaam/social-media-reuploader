@@ -18,13 +18,14 @@ import re
 import shutil
 import subprocess
 import sys
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
 import pytest
 from fastapi.testclient import TestClient
 
-from src import db, gui
+from src import config, db, gui
 from src.gui_auth import AuthSettings
 
 TOKEN = "admin-token-0123456789abcdef"
@@ -663,6 +664,47 @@ def test_worker_codes_stages_and_history_entries_are_translated(tmp_path, api):
         """,
         routes=routes,
         hash="#requests",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Limits tab
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("max_age", "expected"),
+    [
+        (3600, "l'ultima richiesta rifiutata, se non è più vecchia di 1 ora"),
+        (0, "disattivato (GUI_REQUEUE_MAX_AGE_SECONDS = 0)"),
+    ],
+    ids=["one-hour", "disabled"],
+)
+def test_the_unlimit_dialog_shows_the_configured_requeue_window(
+    tmp_path, monkeypatch, max_age, expected
+):
+    monkeypatch.setattr(config, "GUI_REQUEUE_MAX_AGE_SECONDS", max_age, raising=False)
+    api = TestClient(
+        gui.create_app(AuthSettings(secret_key="k" * 40, admin_token=TOKEN)),
+        headers=BEARER,
+    )
+    until = datetime.now(UTC) + timedelta(minutes=30)
+    db.set_chat_blocked_until(7, until.isoformat())
+    routes = snapshot(api, *DEFAULT_GETS)
+    buttons = ["Annulla", "Solo sblocca"]
+    if max_age:
+        buttons.append("Sblocca e rimetti in coda")
+    run_spa(
+        tmp_path,
+        f"""
+        h.button('limitedBody', 'Sblocca…').click()
+        await h.settle()
+        h.eq(h.text('modalTitle'), 'Sbloccare la chat?', 'unlimit dialog')
+        const text = h.text('modalBody')
+        h.ok(text.includes({json.dumps(expected)}), text)
+        h.ok(!text.includes('24 ore'), text)
+        h.eq(h.labels('modalFooter'), {json.dumps(buttons)}, 'choices')
+        """,
+        routes=routes,
+        hash="#limits",
     )
 
 

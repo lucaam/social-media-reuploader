@@ -798,7 +798,33 @@ def test_login_start_failure_renders_an_error_page():
 
     response = TestClient(oauth_app(Broken())).get("/login")
     assert response.status_code == 502
-    assert "token" in response.text
+    assert "accedi con il token amministratore" in response.text
+    assert 'href="login?method=token"' in response.text
+    # without ADMIN_TOKEN there is no token login to suggest
+    oauth_only = TestClient(oauth_app(Broken(), admin_token=None)).get("/login")
+    assert oauth_only.status_code == 502
+    assert "token" not in oauth_only.text.lower()
+
+
+def test_the_token_form_is_reachable_when_oauth_is_configured():
+    provider = FakeProvider({"sub": "u"})
+    client = TestClient(oauth_app(provider))
+    assert client.get("/login", follow_redirects=False).status_code == 302
+    form = client.get("/login?method=token", follow_redirects=False)
+    assert form.status_code == 200
+    assert 'name="token"' in form.text
+    ok = client.post(
+        "/login", data={"token": TOKEN}, headers=SAME, follow_redirects=False
+    )
+    assert ok.status_code == 303
+    assert client.get("/api/me").json()["auth"] == "token"
+    oauth_only = TestClient(oauth_app(provider, admin_token=None))
+    refused = oauth_only.get("/login?method=token")
+    assert refused.status_code == 400
+    assert 'name="token"' not in refused.text
+    assert "ADMIN_TOKEN" in refused.text
+    noscript = client.get("/").text.split("<noscript>", 1)[1].split("</noscript>")[0]
+    assert 'href="login?method=token"' in noscript
 
 
 def test_oauth_sessions_need_oauth_to_stay_enabled():
