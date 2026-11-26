@@ -322,7 +322,9 @@
               corrisponde a un utente con ruolo "Amministratore" oppure se appartiene a un gruppo
               indicato in OAUTH_ADMIN_GROUPS. Le e-mail di provider che non dichiarano la verifica
               (es. GitHub) contano solo con OAUTH_ASSUME_EMAIL_VERIFIED=true.
-              I diritti sono ricontrollati a ogni richiesta.
+              Il ruolo è ricontrollato a ogni richiesta; i gruppi invece sono quelli comunicati dal
+              provider all'accesso, quindi un cambio di gruppo vale dal login successivo (o dalla
+              scadenza della sessione). Cambiare SECRET_KEY chiude subito tutte le sessioni.
             </p>
             <form id="userForm" class="row g-2 align-items-end">
               <div class="col-md-5">

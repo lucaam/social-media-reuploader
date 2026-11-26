@@ -15,6 +15,8 @@ by every HTTP route, by the WebSocket handshake and by ``/api/me``:
   - OAuth sessions are admin when one of their (stored) groups is in
     ``OAUTH_ADMIN_GROUPS`` or when their verified e-mail maps to a DB user
     with role ``admin`` (looked up on every request, so demotion works).
+    The groups are the ones the provider sent at login: the IdP is not asked
+    again, so a group change applies from the next login.
     Verified means ``email_verified`` (or Discord's ``verified``) is true;
     an e-mail without any such claim counts only with
     ``OAUTH_ASSUME_EMAIL_VERIFIED=true`` (providers like GitHub that only
