@@ -65,7 +65,7 @@ def test_period_is_exact(seconds, text):
 def test_plural_and_sizes():
     assert messages.plural(1, "link", "link") == "1 link"
     assert messages.plural(2, "minuto", "minuti") == "2 minuti"
-    assert messages.size_mb(84 * 1024 * 1024) == "84.0 MB"
+    assert messages.size_mb(84 * 1024 * 1024) == "84,0 MB"  # Italian decimal comma
     assert messages.size_mb(None) == "? MB"
 
 
@@ -104,7 +104,7 @@ def test_pending_cap_deferred_and_duplicate_notices():
 
 def test_compression_note_and_caption():
     note = messages.compression_note(int(80.1 * 1024 * 1024), int(48.3 * 1024 * 1024))
-    assert note == "Video compresso: 80.1 MB → 48.3 MB"
+    assert note == "Video compresso: 80,1 MB → 48,3 MB"
     assert messages.caption(None) is None
     assert messages.caption("   ") is None
     assert messages.caption(" guarda qui ") == "guarda qui"
@@ -159,3 +159,55 @@ def test_failure_texts_carry_details():
     assert "immagini" in messages.failure("no_media")
     assert messages.failure("unknown_code") == messages.failure("failed")
     assert messages.failure(None) == messages.failure("failed")
+
+
+def test_compression_note_names_the_kind_and_the_count():
+    mib = 1024 * 1024
+    assert messages.compression_note(90 * mib, 40 * mib, kind="audio") == (
+        "Audio compresso: 90,0 MB → 40,0 MB"
+    )
+    assert messages.compression_note(2 * mib, mib, kind="video", count=2) == (
+        "Video compressi: 2,0 MB → 1,0 MB"
+    )
+    assert messages.compression_note(3 * mib, mib, kind=None, count=2) == (
+        "File compressi: 3,0 MB → 1,0 MB"
+    )
+
+
+def test_too_large_says_where_the_media_was_refused():
+    url = "https://example.com/v/1"
+    download = messages.failure("too_large", url=url, step="download")
+    assert download == (
+        "Questo contenuto è troppo grande per essere scaricato. "
+        f"Puoi aprirlo qui: {url}"
+    )
+    convert = messages.failure("too_large", url=url, kind="video", step="convert")
+    assert convert.startswith(
+        "Il video è troppo grande per Telegram e non riesco a comprimerlo abbastanza."
+    )
+    sent = messages.failure("too_large", kind="audio", step="send")
+    assert sent == "L'audio è troppo grande per Telegram."
+    for text in (download, convert, sent):
+        assert "anche compresso" not in text  # nothing says it was tried for sure
+
+
+def test_failure_texts_never_call_audio_a_video():
+    for code in (
+        "too_long",
+        "too_large",
+        "no_media",
+        "conversion_failed",
+        "send_failed",
+    ):
+        text = messages.failure(code, max_duration_seconds=3600, kind="audio")
+        assert "video" not in text.lower().replace("video o audio", "")
+    assert messages.failure("send_failed", kind="audio") == (
+        "Non sono riuscito a inviare l'audio su Telegram. Riprova più tardi."
+    )
+    assert messages.failure("conversion_failed", kind="video") == (
+        "Non sono riuscito a convertire il video in un formato adatto a Telegram."
+    )
+    assert messages.failure("too_long", max_duration_seconds=3600) == (
+        "Questo contenuto è troppo lungo: posso scaricare contenuti di al massimo "
+        "1 ora."
+    )

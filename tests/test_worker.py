@@ -210,6 +210,7 @@ class FakeMedia:
 
     def __init__(self):
         self.compress_to = None  # final size of a size-targeted re-encode
+        self.compress_audio = False  # compress_to applies to audio files too
         self.errors = {}  # item index -> exception
         self.audio_only = False  # every file probes as audio-only
         self.thumbnails = True
@@ -225,7 +226,7 @@ class FakeMedia:
         size = await asyncio.to_thread(os.path.getsize, path)
         has_video = not (self.audio_only or path.endswith((".m4a", ".mp3")))
         out, final, compressed = path, size, False
-        if self.compress_to is not None and has_video:
+        if self.compress_to is not None and (has_video or self.compress_audio):
             out, final, compressed = f"{path[:-4]}.tg.mp4", self.compress_to, True
             await asyncio.to_thread(write_file, out, final)
         probe = media.ProbeResult(
@@ -419,7 +420,7 @@ def test_compressed_video_caption_carries_the_note(env):
     env.media.compress_to = int(48.3 * MIB)
     _, row = process_new(description="ciao")
     caption = env.tg.of("send_video")[0][3]["caption"]
-    assert caption == "ciao\n\nVideo compresso: 80.1 MB → 48.3 MB"
+    assert caption == "ciao\n\nVideo compresso: 80,1 MB → 48,3 MB"
     assert env.tg.texts() == []  # no separate compression message
     assert row["compressed"] == 1
     assert row["original_size"] == int(80.1 * MIB)
@@ -658,7 +659,9 @@ def test_failures_are_explained_per_code_and_chat_type(
     assert row["error_code"] == error.code
     assert row["error_message"] == "technical detail"
     assert env.tg.reactions() == ["👀", "🍌"]
-    expected = messages.failure(error.code, url=URL, max_duration_seconds=3600)
+    expected = messages.failure(
+        error.code, url=URL, max_duration_seconds=3600, step="download"
+    )
     if chat_type == "private" or error.code == "too_large":
         assert env.tg.texts() == [expected]
         assert env.tg.of("send_message")[0][3]["reply_to_message_id"] == 7
@@ -797,7 +800,7 @@ def test_long_upload_flood_wait_fails_without_resending(env):
     assert len(env.tg.of("send_video")) == 1
     assert row["status"] == "failed"
     assert row["error_code"] == "send_failed"
-    assert env.tg.texts() == [messages.failure("send_failed")]
+    assert env.tg.texts() == [messages.failure("send_failed", kind="video")]
 
 
 @pytest.mark.parametrize(
@@ -852,6 +855,57 @@ def test_telegram_413_is_reported_as_too_large(env):
     _, row = process_new()
     assert row["error_code"] == "too_large"
     assert URL in env.tg.texts()[0]
+
+
+@pytest.mark.parametrize(
+    ("where", "text"),
+    [
+        ("download", "Il video è troppo grande per essere scaricato."),
+        (
+            "convert",
+            (
+                "Il video è troppo grande per Telegram e non riesco a comprimerlo "
+                "abbastanza."
+            ),
+        ),
+        ("send", "Il video è troppo grande per Telegram."),
+    ],
+)
+def test_too_large_text_says_where_it_was_refused(env, where, text):
+    if where == "download":
+        env.site.download_errors.append(downloader.TooLarge("about 900 MiB"))
+    elif where == "convert":
+        env.media.errors[1] = downloader.TooLarge("could not compress below 50 MiB")
+    else:
+        env.tg.respond(
+            "send_video",
+            {"ok": False, "error_code": 413, "description": "Request Entity Too Large"},
+        )
+    _, row = process_new()
+    assert row["error_code"] == "too_large"
+    assert env.tg.texts() == [f"{text} Puoi aprirlo qui: {URL}"]
+
+
+def test_audio_is_never_called_a_video(env):
+    env.site.extractor_key = "Soundcloud"
+    env.site.items = [make_item(1, "audio", title="Podcast", uploader="Radio")]
+    env.site.extensions[1] = "m4a"
+    env.site.sizes[1] = 90 * MIB
+    env.media.compress_to = 40 * MIB
+    env.media.compress_audio = True
+    env.tg.respond(
+        "send_audio",
+        {"ok": False, "error_code": 400, "description": "Bad Request: AUDIO_INVALID"},
+    )
+    _, row = process_new(
+        provider="Soundcloud", url="https://soundcloud.com/a/b", description=None
+    )
+    [(_, _, _, kwargs)] = env.tg.of("send_audio")
+    assert kwargs["caption"] == "Audio compresso: 90,0 MB → 40,0 MB"
+    assert row["error_code"] == "send_failed"
+    assert env.tg.texts() == [
+        "Non sono riuscito a inviare l'audio su Telegram. Riprova più tardi."
+    ]
 
 
 def test_reaction_fallback_status_message_is_deleted_on_success(env):

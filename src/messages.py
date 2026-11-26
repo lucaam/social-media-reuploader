@@ -34,10 +34,11 @@ def plural(count: int, singular: str, plural_form: str) -> str:
 
 
 def size_mb(size: float | None) -> str:
-    """``"80.1 MB"`` (MB = 1024 * 1024 bytes, like Telegram's 50 MB limit)."""
+    """``"80,1 MB"``: Italian decimal comma; MB = 1024 * 1024 bytes, like
+    Telegram's 50 MB limit."""
     if size is None:
         return "? MB"
-    return f"{size / MIB:.1f} MB"
+    return f"{size / MIB:.1f} MB".replace(".", ",")
 
 
 def _seconds(seconds: float) -> int:
@@ -133,11 +134,41 @@ def deferred(delay_seconds: float) -> str:
 
 
 # ---------------------------------------------------------------------------
+# The media a text talks about: ``kind`` is "video", "audio", or None when it
+# is unknown (e.g. the link could not even be read) or mixed.
+# ---------------------------------------------------------------------------
+# (subject, object, "of ...") forms. All masculine singular, so the adjectives
+# and pronouns of the texts ("troppo lungo", "aprirlo") agree with each.
+_NOUNS: Mapping[str, tuple[str, str, str]] = {
+    "video": ("Il video", "il video", "del video"),
+    "audio": ("L'audio", "l'audio", "dell'audio"),
+}
+_UNKNOWN_NOUNS = ("Questo contenuto", "il contenuto", "del contenuto")
+_NOTE_LABELS: Mapping[str, str] = {"video": "Video", "audio": "Audio"}
+
+
+def _nouns(kind: str | None) -> tuple[str, str, str]:
+    return _NOUNS.get(kind or "", _UNKNOWN_NOUNS)
+
+
+# ---------------------------------------------------------------------------
 # Captions
 # ---------------------------------------------------------------------------
-def compression_note(original_size: int | None, final_size: int | None) -> str:
-    """``"Video compresso: 80.1 MB → 48.3 MB"``."""
-    return f"Video compresso: {size_mb(original_size)} → {size_mb(final_size)}"
+def compression_note(
+    original_size: int | None,
+    final_size: int | None,
+    *,
+    kind: str | None = "video",
+    count: int = 1,
+) -> str:
+    """``"Video compresso: 80,1 MB → 48,3 MB"``.
+
+    ``kind`` is the kind of the ``count`` compressed files ("Audio
+    compresso", "File compressi" when they are mixed).
+    """
+    label = _NOTE_LABELS.get(kind or "", "File")
+    label += " compresso" if count == 1 else " compressi"
+    return f"{label}: {size_mb(original_size)} → {size_mb(final_size)}"
 
 
 def _utf16_len(text: str) -> int:
@@ -195,16 +226,29 @@ _FAILURES: Mapping[str, str] = {
         "Le dirette non sono supportate: riprova quando la diretta sarà terminata."
     ),
     "no_media": (
-        "Non ho trovato un video da scaricare in questo link "
+        "Non ho trovato video o audio da scaricare in questo link "
         "(ad esempio un post con sole immagini)."
     ),
     "unsupported": "Questo link non è supportato.",
     "timeout": "Il download ha impiegato troppo tempo. Riprova più tardi.",
-    "conversion_failed": (
-        "Non sono riuscito a convertire il video in un formato adatto a Telegram."
-    ),
-    "send_failed": "Non sono riuscito a inviare il video su Telegram. Riprova più tardi.",
     "failed": "Non sono riuscito a scaricare questo contenuto. Riprova più tardi.",
+}
+# Texts naming the media: {noun} and {of_noun} come from _nouns(kind).
+_MEDIA_FAILURES: Mapping[str, str] = {
+    "conversion_failed": (
+        "Non sono riuscito a convertire {noun} in un formato adatto a Telegram."
+    ),
+    "send_failed": "Non sono riuscito a inviare {noun} su Telegram. Riprova più tardi.",
+}
+# too_large by ``step``: refused before downloading (the download size limit),
+# while converting (it cannot be compressed enough) or by Telegram.
+_TOO_LARGE: Mapping[str, str] = {
+    "download": "{subject} è troppo grande per essere scaricato.",
+    "convert": (
+        "{subject} è troppo grande per Telegram e non riesco a comprimerlo "
+        "abbastanza."
+    ),
+    "send": "{subject} è troppo grande per Telegram.",
 }
 _SLIDESHOW = (
     "Questo post TikTok è una presentazione di foto: posso inviare solo video, "
@@ -212,17 +256,21 @@ _SLIDESHOW = (
 )
 
 
-def too_long(max_duration_seconds: float | None) -> str:
+def too_long(max_duration_seconds: float | None, *, kind: str | None = None) -> str:
+    subject = _nouns(kind)[0]
     if not max_duration_seconds or max_duration_seconds <= 0:
-        return "Il video è troppo lungo per essere scaricato."
+        return f"{subject} è troppo lungo per essere scaricato."
     return (
-        "Il video è troppo lungo: posso scaricare contenuti di al massimo "
+        f"{subject} è troppo lungo: posso scaricare contenuti di al massimo "
         f"{duration(max_duration_seconds)}."
     )
 
 
-def too_large(url: str | None) -> str:
-    text = "Il video è troppo grande per Telegram, anche compresso."
+def too_large(
+    url: str | None, *, kind: str | None = None, step: str | None = None
+) -> str:
+    template = _TOO_LARGE.get(step or "", _TOO_LARGE["send"])
+    text = template.format(subject=_nouns(kind)[0])
     return f"{text} Puoi aprirlo qui: {url}" if url else text
 
 
@@ -232,16 +280,24 @@ def failure(
     url: str | None = None,
     max_duration_seconds: float | None = None,
     slideshow: bool = False,
+    kind: str | None = None,
+    step: str | None = None,
 ) -> str:
     """The message explaining why a link could not be delivered.
 
     ``code`` is a ``downloader.DownloadError.code`` (or a worker code such as
-    ``send_failed``); unknown codes get the generic ``failed`` text.
+    ``send_failed``); unknown codes get the generic ``failed`` text. ``kind``
+    names the media (see :func:`_nouns`); ``step`` says where a ``too_large``
+    refusal happened: "download", "convert" or "send" (Telegram refused it).
     """
     if code == "too_large":
-        return too_large(url)
+        return too_large(url, kind=kind, step=step)
     if code == "too_long":
-        return too_long(max_duration_seconds)
+        return too_long(max_duration_seconds, kind=kind)
     if code == "no_media" and slideshow:
         return _SLIDESHOW
+    template = _MEDIA_FAILURES.get(code or "")
+    if template is not None:
+        _subject, noun, of_noun = _nouns(kind)
+        return template.format(noun=noun, of_noun=of_noun)
     return _FAILURES.get(code or "failed", _FAILURES["failed"])

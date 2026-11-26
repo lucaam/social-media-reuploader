@@ -41,7 +41,7 @@ import shutil
 import sqlite3
 import tempfile
 import time
-from collections.abc import Awaitable, Callable, Mapping, Sequence
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
@@ -119,6 +119,15 @@ class Phase(StrEnum):
 
     DOWNLOAD = "download"
     SEND = "send"
+
+
+# messages.failure(step=...): where a too_large refusal happened, by stage.
+_FAILURE_STEPS: Mapping[Stage, str] = {
+    Stage.CONVERTING: "convert",
+    Stage.SERVER_FETCH: "send",
+    Stage.SENDING: "send",
+    Stage.FINISHING: "send",
+}
 
 
 @dataclass
@@ -390,6 +399,12 @@ def is_tiktok_slideshow(info: MediaInfo, provider: str | None = None) -> bool:
     return bool(info.items) and all(item.kind == "audio" for item in info.items)
 
 
+def common_kind(kinds: Iterable[str]) -> str | None:
+    """The one media kind of ``kinds`` ("video"/"audio"), None if mixed or empty."""
+    found = set(kinds)
+    return found.pop() if len(found) == 1 else None
+
+
 def _make_workdir(root: str, prefix: str) -> str:
     os.makedirs(root, mode=0o700, exist_ok=True)
     return tempfile.mkdtemp(prefix=prefix, dir=root)  # private (0700)
@@ -513,6 +528,7 @@ class RequestProcessor:
         self._send_in_flight = False  # a URL send may reach Telegram (row 'processing')
         self._delivered = False  # something was posted: never retry or fail it
         self._method = "local"  # how the media reaches Telegram
+        self._kind: str | None = None  # "video"/"audio" (None: not known yet/mixed)
 
     @property
     def maybe_posted(self) -> bool:
@@ -569,6 +585,7 @@ class RequestProcessor:
             raise SlideshowNotSupported(
                 "TikTok photo slideshow: only the background music is downloadable"
             )
+        self._kind = common_kind(entry.kind for entry in info.items)
         item = self._server_fetch_item(info)
         if item is not None:
             result = await self._server_fetch(item)
@@ -578,6 +595,7 @@ class RequestProcessor:
         files = await downloader.download(info, workdir)
         self._stage(Stage.CONVERTING)
         items = await self._prepare_all(files, workdir)
+        self._kind = common_kind(ready.kind for ready in items)
         if not await db.aio(db.mark_sending, self.request.id):
             return await self._skipped("mark_sending refused")
         self._sending = True
@@ -721,6 +739,8 @@ class RequestProcessor:
             note = messages.compression_note(
                 sum(item.original_size for item in compressed),
                 sum(item.size for item in compressed),
+                kind=common_kind(item.kind for item in compressed),
+                count=len(compressed),
             )
         return messages.caption(self.request.description, note)
 
@@ -994,6 +1014,8 @@ class RequestProcessor:
             url=self.request.url,
             max_duration_seconds=setting("MAX_DURATION_SECONDS"),
             slideshow=bool(getattr(err, "slideshow", False)),
+            kind=self._kind,
+            step=_FAILURE_STEPS.get(self.state.stage, "download"),
         )
         reacted = await self.feedback.react(REACTION_FAILED)
         explain = self.request.is_private or err.code == downloader.TooLarge.code
