@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import math
 import os
 
 logger = logging.getLogger(__name__)
@@ -71,11 +72,9 @@ def env_int(
         try:
             as_float = float(value)
         except ValueError:
-            CONFIG_WARNINGS.append(
-                f"{name}={value!r} is not a number; using {default}"
-            )
+            CONFIG_WARNINGS.append(f"{name}={value!r} is not a number; using {default}")
             return default
-        if as_float != as_float or as_float in (float("inf"), float("-inf")):
+        if not math.isfinite(as_float):
             CONFIG_WARNINGS.append(f"{name}={value!r} is not finite; using {default}")
             return default
         parsed = int(as_float)
@@ -103,7 +102,7 @@ def env_float(
     except ValueError:
         CONFIG_WARNINGS.append(f"{name}={value!r} is not a number; using {default}")
         return default
-    if parsed != parsed or parsed in (float("inf"), float("-inf")):
+    if not math.isfinite(parsed):
         CONFIG_WARNINGS.append(f"{name}={value!r} is not finite; using {default}")
         return default
     if minimum is not None and parsed < minimum:
@@ -187,7 +186,9 @@ BOT_TOKEN: str | None = env_str("BOT_TOKEN")
 # without it the bot falls back to polling (and logs a warning).
 MODE: str = (env_str("MODE", "polling") or "polling").lower()
 if MODE not in ("polling", "webhook"):
-    CONFIG_WARNINGS.append(f"MODE={MODE!r} is not 'polling' or 'webhook'; using polling")
+    CONFIG_WARNINGS.append(
+        f"MODE={MODE!r} is not 'polling' or 'webhook'; using polling"
+    )
     MODE = "polling"
 
 # Public HTTPS URL Telegram should POST updates to (webhook mode). Legacy
@@ -230,6 +231,8 @@ TELEGRAM_UPLOAD_TIMEOUT: float = env_float(
 TELEGRAM_MAX_RETRIES: int = env_int("TELEGRAM_MAX_RETRIES", 3, minimum=0, maximum=10)
 # Seconds reactions stay disabled for a chat after Telegram refuses them.
 REACTION_DISABLE_SECONDS: int = env_int("REACTION_DISABLE_SECONDS", 300, minimum=0)
+# Base URL of the Bot API (set it to a local Bot API server to upload up to 2 GB).
+TELEGRAM_API_BASE: str | None = env_str("TELEGRAM_API_BASE")
 
 # ---------------------------------------------------------------------------
 # Logging / health
@@ -245,7 +248,9 @@ HEALTH_DEBUG: bool = env_bool("HEALTH_DEBUG", False)
 # ---------------------------------------------------------------------------
 # Download (yt-dlp)
 # ---------------------------------------------------------------------------
-TMP_DIR: str = env_str("TMP_DIR", "/tmp/telegram_downloader") or "/tmp/telegram_downloader"
+TMP_DIR: str = (
+    env_str("TMP_DIR", "/tmp/telegram_downloader") or "/tmp/telegram_downloader"
+)
 KEEP_DOWNLOADED_FILES: bool = env_bool("KEEP_DOWNLOADED_FILES", False)
 # Only run a plain yt-dlp download and upload its output verbatim (no remux,
 # no transcode). Useful for debugging.
@@ -287,6 +292,9 @@ YTDLP_PROXY: str | None = env_str("YTDLP_PROXY")
 # provider supported by yt-dlp (the generic extractor is never used).
 ALLOWED_PROVIDERS: tuple[str, ...] = env_list("ALLOWED_PROVIDERS")
 BLOCKED_PROVIDERS: tuple[str, ...] = env_list("BLOCKED_PROVIDERS")
+# Accept profile/channel/playlist/album links (the first MAX_ITEMS_PER_LINK
+# items are posted). Off by default: one link = one post.
+ALLOW_COLLECTION_LINKS: bool = env_bool("ALLOW_COLLECTION_LINKS", False)
 # When to answer links the bot cannot handle: "private" (default), "always",
 # "never".
 UNSUPPORTED_LINK_REPLY: str = (
@@ -375,7 +383,9 @@ def validate() -> list[str]:
     """Return human-readable problems with the effective configuration."""
     problems = list(CONFIG_WARNINGS)
     if MODE == "webhook" and not WEBHOOK_URL:
-        problems.append("MODE=webhook but WEBHOOK_URL is not set: falling back to polling")
+        problems.append(
+            "MODE=webhook but WEBHOOK_URL is not set: falling back to polling"
+        )
     if YTDLP_COOKIES_FROM_BROWSER:
         problems.append(
             "YTDLP_COOKIES_FROM_BROWSER needs a browser profile inside the container; "
@@ -383,7 +393,7 @@ def validate() -> list[str]:
         )
     if YTDLP_COOKIES_PATH and not os.path.isfile(YTDLP_COOKIES_PATH):
         problems.append(f"YTDLP_COOKIES_PATH={YTDLP_COOKIES_PATH!r} does not exist")
-    if TELEGRAM_MAX_FILE_SIZE > 50 * MIB:
+    if TELEGRAM_MAX_FILE_SIZE > 50 * MIB and not TELEGRAM_API_BASE:
         problems.append(
             "TELEGRAM_MAX_FILE_SIZE is above 50 MB: this only works with a local "
             "Bot API server"
@@ -408,6 +418,8 @@ def summary() -> dict:
         "duplicate_window_seconds": DUPLICATE_WINDOW_SECONDS,
         "allowed_providers": list(ALLOWED_PROVIDERS),
         "blocked_providers": list(BLOCKED_PROVIDERS),
+        "allow_collection_links": ALLOW_COLLECTION_LINKS,
+        "local_bot_api": bool(TELEGRAM_API_BASE),
         "unsupported_link_reply": UNSUPPORTED_LINK_REPLY,
         "generate_thumbnail": WORKER_GENERATE_THUMBNAIL,
         "simple_ytdlp_only": SIMPLE_YTDLP_ONLY,

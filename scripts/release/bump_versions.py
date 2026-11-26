@@ -89,8 +89,9 @@ def read_version_from_init(path):
 
 def write_version_to_init(path, new_version):
     txt = open(path, "r", encoding="utf-8").read()
+    # Double quotes keep src/__init__.py black-clean after every release.
     new = re.sub(
-        r"(__version__\s*=\s*)['\"][^'\"]+['\"]", r"\1'{}'".format(new_version), txt
+        r"(__version__\s*=\s*)['\"][^'\"]+['\"]", r'\1"{}"'.format(new_version), txt
     )
     open(path, "w", encoding="utf-8").write(new)
 
