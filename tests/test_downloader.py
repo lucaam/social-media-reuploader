@@ -908,6 +908,41 @@ def test_smaller_budget_picks_smaller_formats(monkeypatch):
     assert _selected_size(result) <= 20 * MIB
 
 
+@pytest.mark.parametrize(
+    ("telegram_mib", "site", "duration"),
+    [
+        (2000, "youtube", 1800),
+        (2000, "youtube", 3600),
+        (2000, "vimeo", 1800),
+        (2000, "reddit", 3600),
+        (2000, "facebook", 1800),
+        (2000, "twitter", 600),
+        (2000, "instagram", 3600),
+        (2000, "tiktok", 1800),
+        (200, "vimeo", 1800),  # through the COMPRESS_INPUT_FACTOR tier
+        (200, "facebook", 3600),
+        (200, "tiktok", 3600),
+    ],
+)
+def test_selection_never_exceeds_the_download_cap(
+    monkeypatch, telegram_mib, site, duration
+):
+    # TELEGRAM_MAX_FILE_SIZE above MAX_DOWNLOAD_BYTES / 4 (local Bot API):
+    # a first choice above the 500 MiB download cap would be refused by
+    # fetch_info although a smaller format fits
+    monkeypatch.setattr(config, "TELEGRAM_MAX_FILE_SIZE", telegram_mib * MIB)
+    result = select_with_ytdlp(SITES[site](duration))
+    assert 0 < _selected_size(result) <= 500 * MIB, result["format_id"]
+    assert downloader._entry_problem(result) is None
+
+
+def test_ready_selection_with_a_telegram_limit_above_the_download_cap(monkeypatch):
+    monkeypatch.setattr(config, "TELEGRAM_MAX_FILE_SIZE", 2000 * MIB)
+    result = select_with_ytdlp(site_youtube(1800))
+    assert result["format_id"] == "136+139"  # H.264/AAC 720p: no conversion
+    assert _selected_size(result) <= downloader.selection_budget(500 * MIB)
+
+
 def test_custom_format_is_used(monkeypatch):
     monkeypatch.setattr(config, "YTDLP_FORMAT", "bv*[vcodec^=vp9]+ba[acodec=opus]")
     assert select_with_ytdlp(site_youtube(30))["format_id"] == "248+251"

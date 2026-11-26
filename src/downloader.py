@@ -705,7 +705,13 @@ def build_format_spec(budget: int, max_download: int, max_side: int = 1280) -> s
     Unknown sizes pass the filters (``<?``); with
     ``--compat-options manifest-filesize-approx`` yt-dlp estimates HLS/DASH
     sizes from their bitrate, so most of them are filtered too.
+
+    No tier goes above ``max_download``: with a Telegram limit above it
+    (local Bot API server) an earlier tier would pick a format that
+    ``fetch_info`` then refuses, although a later tier would have fitted.
     """
+    budget = min(budget, selection_budget(max_download))
+    compress_limit = min(budget * COMPRESS_INPUT_FACTOR, max_download)
     side = f"[width<=?{max_side}][height<=?{max_side}]"
     tiers: list[str] = []
     for share in VIDEO_BUDGET_SHARES:
@@ -715,7 +721,7 @@ def build_format_spec(budget: int, max_download: int, max_side: int = 1280) -> s
     tiers.append(f"b{_H264_MP4}{_AAC_OR_UNKNOWN}{_size_filter(budget)}")
     tiers.append(f"b{_H264_MP4}{_size_filter(budget)}")
     tiers += _within(budget)
-    tiers += _within(budget * COMPRESS_INPUT_FACTOR, video_filter=side)
+    tiers += _within(compress_limit, video_filter=side)
     tiers += _within(max_download, video_filter=side)
     tiers += _within(max_download)
     tiers.append("bv*+ba/b")
@@ -1208,7 +1214,7 @@ def _entry_problem(entry: dict[str, Any] | None) -> DownloadError | None:
     max_download = _int_setting("MAX_DOWNLOAD_BYTES")
     if estimate is not None and estimate > max_download:
         return TooLarge(
-            f"smallest suitable download is about {estimate / MIB:.0f} MiB "
+            f"the selected download is about {estimate / MIB:.0f} MiB "
             f"(limit {max_download / MIB:.0f} MiB)"
         )
     return None
