@@ -1,27 +1,34 @@
 #!/usr/bin/env python3
+"""Print the current version: the latest git tag, else src/__init__.py."""
+
 import os
 import re
 import subprocess
 
 
-def get_latest_tag():
+def version_from_init() -> str | None:
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    init_py = os.path.join(here, "src", "__init__.py")
+    if not os.path.exists(init_py):
+        return None
+    with open(init_py, encoding="utf-8") as fh:
+        text = fh.read()
+    m = re.search(r"__version__\s*=\s*['\"]([^'\"]+)['\"]", text)
+    return m.group(1) if m else None
+
+
+def get_latest_tag() -> str:
     try:
         tag = (
-            subprocess.check_output(["git", "describe", "--tags", "--abbrev=0"])
+            subprocess.check_output(
+                ["git", "describe", "--tags", "--abbrev=0"], stderr=subprocess.DEVNULL
+            )
             .decode()
             .strip()
         )
         return tag.lstrip("v")
-    except Exception:
-        # fallback: read __version__ from src/__init__.py
-        here = os.path.dirname(os.path.dirname(__file__))
-        init_py = os.path.join(here, "src", "__init__.py")
-        if os.path.exists(init_py):
-            text = open(init_py, "r", encoding="utf-8").read()
-            m = re.search(r"__version__\s*=\s*['\"]([^'\"]+)['\"]", text)
-            if m:
-                return m.group(1)
-    return "0.0.0"
+    except (subprocess.CalledProcessError, OSError):
+        return version_from_init() or "0.0.0"
 
 
 if __name__ == "__main__":

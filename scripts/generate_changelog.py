@@ -16,7 +16,7 @@ def run(cmd):
 def get_origin_owner_repo():
     try:
         origin = run(["git", "config", "--get", "remote.origin.url"])
-    except Exception:
+    except (subprocess.CalledProcessError, OSError):
         return None
     m = None
     if origin.startswith("git@"):
@@ -37,7 +37,7 @@ def list_tags():
     seen = set()
     tags = []
     for t in raw_tags:
-        norm = t[1:] if t.startswith("v") else t
+        norm = t.removeprefix("v")
         if norm in seen:
             continue
         seen.add(norm)
@@ -129,7 +129,7 @@ def build_changelog(unreleased_block, tags, owner_repo):
             # No commits — keep note
             try:
                 date = run(["git", "show", "-s", "--format=%ad", "--date=short", tag])
-            except Exception:
+            except (subprocess.CalledProcessError, OSError):
                 date = ""
             lines.append(f"## [{tag}] ({date})\n")
             lines.append("- No user-facing commits found for this release.\n")
@@ -139,7 +139,7 @@ def build_changelog(unreleased_block, tags, owner_repo):
         groups, others = group_commits(commits)
         try:
             date = run(["git", "show", "-s", "--format=%ad", "--date=short", tag])
-        except Exception:
+        except (subprocess.CalledProcessError, OSError):
             date = ""
 
         compare_from = prev_tag if prev_tag else init

@@ -2,7 +2,11 @@ name: Commitlint (Conventional Commits)
 
 on:
   pull_request:
-    types: [opened, edited, synchronize]
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  contents: read
+  pull-requests: read
 
 jobs:
   commitlint:
@@ -14,4 +18,5 @@ jobs:
       - name: Commitlint
         uses: wagoid/commitlint-github-action@v6
         with:
+          # The only commitlint config of the repository (also used locally).
           configFile: commitlint.config.mjs

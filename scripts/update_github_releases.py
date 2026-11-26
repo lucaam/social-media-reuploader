@@ -18,7 +18,6 @@ import os
 import re
 import subprocess
 import tempfile
-from typing import Dict
 
 
 def gh_installed() -> bool:
@@ -27,13 +26,13 @@ def gh_installed() -> bool:
     return which("gh") is not None
 
 
-def parse_changelog(path: str = "CHANGELOG.md") -> Dict[str, str]:
+def parse_changelog(path: str = "CHANGELOG.md") -> dict[str, str]:
     if not os.path.exists(path):
         return {}
-    with open(path, "r", encoding="utf-8") as fh:
+    with open(path, encoding="utf-8") as fh:
         lines = fh.read().splitlines()
 
-    sections: Dict[str, list[str]] = {}
+    sections: dict[str, list[str]] = {}
     current: str | None = None
     buf: list[str] = []
     header_re = re.compile(r"^## \[(?P<tag>[^\]]+)\]")
@@ -97,8 +96,8 @@ def update_or_create_release(tag: str, notes: str, apply: bool) -> None:
     finally:
         try:
             os.unlink(tmpname)
-        except Exception:
-            pass
+        except OSError as exc:
+            print(f"Could not remove the temporary notes file {tmpname}: {exc}")
 
 
 def main() -> int:

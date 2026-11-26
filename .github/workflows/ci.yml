@@ -2,28 +2,56 @@ name: CI
 
 on:
   pull_request:
+  push:
+    branches: [main]
+  # Also dispatched by "Manual Version Bump" on the bump branch: pull requests
+  # opened with GITHUB_TOKEN do not trigger workflows by themselves.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+defaults:
+  run:
+    # bash -eo pipefail
+    shell: bash
 
 jobs:
+  # The job id is the required status check "build": keep it.
   build:
     runs-on: ubuntu-latest
-    env:
-      PYTHONPATH: ${{ github.workspace }}
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+
+      - name: Install ffmpeg (the media tests need ffmpeg/ffprobe)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends ffmpeg
+
       - name: Set up Python
         uses: actions/setup-python@v6.3.0
         with:
           python-version: '3.14'
+          cache: pip
+          cache-dependency-path: |
+            requirements.txt
+            requirements-dev.txt
+
       - name: Install dependencies
-        run: pip install -r requirements.txt -r requirements-dev.txt
-      - name: Prepare writable REQUESTS_DB for tests
+        run: python -m pip install -r requirements.txt -r requirements-dev.txt
+
+      - name: Check the yt-dlp runtime pieces
         run: |
-          mkdir -p "$GITHUB_WORKSPACE/test_db"
-          # export REQUESTS_DB for the current shell so python sees it
-          export REQUESTS_DB="$GITHUB_WORKSPACE/test_db/requests.db"
-          echo "REQUESTS_DB=$REQUESTS_DB" >> "$GITHUB_ENV"
-          python -c "from src import db; db.init_db()"
-        shell: bash
+          deno --version
+          python -c "import curl_cffi, yt_dlp, yt_dlp_ejs; print('yt-dlp', yt_dlp.version.__version__)"
+          ffmpeg -hide_banner -version | sed -n 1p
+
       - name: Run tests
-        run: |
-          pytest -q
+        env:
+          REQUESTS_DB: ${{ runner.temp }}/requests.db
+        run: python -m pytest -q

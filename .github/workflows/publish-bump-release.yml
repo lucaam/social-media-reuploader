@@ -5,38 +5,63 @@ on:
     types: [closed]
 
 permissions:
-  contents: write
+  contents: read
+
+defaults:
+  run:
+    # bash -eo pipefail
+    shell: bash
 
 jobs:
-  publish:
+  release:
     name: Create release when bump PR is merged
-    # Only run when a bump PR was merged (title: "chore(release): bump versions to vX.Y.Z")
+    # Only for a merged bump PR (title: "chore(release): bump versions to vX.Y.Z").
     if: "github.event.pull_request.merged == true && startsWith(github.event.pull_request.title, 'chore(release): bump versions to v')"
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    outputs:
+      tag: ${{ steps.vars.outputs.tag }}
     steps:
       - name: Extract version from PR title
         id: vars
         env:
           PR_TITLE: ${{ github.event.pull_request.title }}
         run: |
-          TITLE="$PR_TITLE"
-          VERSION=$(echo "$TITLE" | sed -n 's/.*v\([0-9]\+\.[0-9]\+\.[0-9]\+\).*/\1/p')
-          if [ -z "$VERSION" ]; then
-            echo "Could not extract version from title: $TITLE"
+          version=$(printf '%s' "$PR_TITLE" | sed -n 's/.*v\([0-9]\+\.[0-9]\+\.[0-9]\+\).*/\1/p')
+          if [ -z "$version" ]; then
+            echo "::error::could not extract a version from the title: $PR_TITLE"
             exit 1
           fi
-          TAG="v$VERSION"
-          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
-          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          {
+            echo "tag=v${version}"
+            echo "version=${version}"
+          } >> "$GITHUB_OUTPUT"
 
-      - name: Create GitHub Release
-        uses: actions/create-release@v1
-        with:
-          tag_name: ${{ steps.vars.outputs.tag }}
-          release_name: ${{ steps.vars.outputs.tag }}
-          body: "Automated release for ${{ steps.vars.outputs.tag }} created from bump PR #${{ github.event.pull_request.number }}"
-          draft: false
-          prerelease: false
-          target_commitish: ${{ github.event.pull_request.merge_commit_sha }}
+      - name: Create the GitHub release (and tag) on the merge commit
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ steps.vars.outputs.tag }}
+          TARGET: ${{ github.event.pull_request.merge_commit_sha }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          gh release create "$TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$TARGET" \
+            --title "$TAG" \
+            --notes "Automated release for ${TAG} created from bump PR #${PR_NUMBER}." \
+            --generate-notes
+
+  # A release created with GITHUB_TOKEN does not trigger docker-release.yml:
+  # publish the image from here.
+  docker:
+    name: Publish the Docker image
+    needs: release
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/docker-publish.yml
+    with:
+      tag: ${{ needs.release.outputs.tag }}
+      push-latest: true
+    secrets: inherit

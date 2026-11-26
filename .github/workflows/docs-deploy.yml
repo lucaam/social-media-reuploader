@@ -2,12 +2,13 @@ name: Deploy Docs to GitHub Pages
 
 on:
   push:
-    branches: [ main ]
+    branches: [main]
     paths:
       - 'docs/**'
       - 'mkdocs.yml'
       - 'README.md'
-
+      - 'scripts/mkdocs_hooks.py'
+      - 'requirements-dev.txt'
   workflow_dispatch:
 
 permissions:
@@ -28,8 +29,10 @@ jobs:
         uses: actions/setup-python@v6.3.0
         with:
           python-version: '3.14'
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
       - name: Install dependencies
-        run: pip install -r requirements-dev.txt
+        run: python -m pip install -r requirements-dev.txt
       - name: Build docs
         run: mkdocs build --strict
       - name: Upload Pages artifact

@@ -1,7 +1,21 @@
+# Tool configuration only: the project is not packaged (the container runs
+# `python -m src.bot` / `uvicorn src.gui:app` from the source tree).
+
 [tool.black]
 line-length = 88
-target-version = ['py312']
+# The runtime is Python 3.14 (Dockerfile, CI). py313 is listed as well so black
+# keeps the parenthesized `except (A, B):` form instead of rewriting it into
+# the 3.14-only unparenthesized syntax (PEP 758).
+target-version = ["py313", "py314"]
 
 [tool.isort]
+# Same layout as black (and as ruff's own import sorting).
 profile = "black"
 line_length = 88
+py_version = 314
+known_first_party = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# `pytest` works from the repository root without PYTHONPATH=.
+pythonpath = ["."]
