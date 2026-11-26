@@ -1714,6 +1714,42 @@ def test_pending_cap_refuses_only_the_new_link(env, monkeypatch):
     assert len(db.accepted_times(42, db.iso_from_ts(time.time() - 60))) == 3
 
 
+def test_pending_cap_notice_does_not_silence_a_later_rate_limit_notice(
+    env, monkeypatch
+):
+    monkeypatch.setattr(config, "RATE_LIMITS", ((2, 3600),))
+    monkeypatch.setattr(config, "MAX_PENDING_PER_CHAT", 2)
+    url5 = "https://www.instagram.com/reel/EEE/"
+
+    async def scenario():
+        pool = worker.WorkerPool(TOKEN)
+        statuses = []
+        for i, url in enumerate((URL, URL2, URL3, URL4), start=1):
+            result = await pool.submit(
+                42, url, provider=match(url), original_message_id=i
+            )
+            statuses.append(result.status)
+            await asyncio.sleep(0.05)  # let the notice go out
+            if i == 2:
+                ids = [row["id"] for row in db.list_requests(status="queued")]
+        for request_id in ids:  # the queue drains
+            claim(request_id)
+            db.mark_done(request_id)
+        later = await pool.submit(42, url5, provider=match(url5), original_message_id=5)
+        await wait_until(lambda: len(env.tg.texts()) == 2)
+        await pool.stop()
+        return statuses, later
+
+    statuses, later = run(scenario())
+    assert statuses == ["queued", "queued", "pending_cap", "pending_cap"]
+    assert later.status == SubmitStatus.RATE_LIMITED
+    # One pending-cap notice (throttled), then the rate limit and its wait.
+    assert env.tg.texts() == [
+        messages.pending_cap(2),
+        messages.rate_limited(later.delay_seconds, later.window),
+    ]
+
+
 def test_rate_limited_link_is_refused_with_blocked_until(env, monkeypatch):
     monkeypatch.setattr(config, "RATE_LIMITS", ((1, 3600),))
 

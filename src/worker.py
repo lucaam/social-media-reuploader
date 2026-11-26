@@ -72,7 +72,8 @@ DEFAULT_TMP_RETENTION_HOURS = 24.0
 # pending user notices may still be sent.
 CANCEL_GRACE_SECONDS = 15.0
 NOTICE_GRACE_SECONDS = 2.0
-# Deferred-link notices are sent once per message; remember this many.
+# Deferred-link notices are sent once per message; remember this many (and
+# the last pending-cap notice of this many chats).
 DEFERRED_NOTICE_MEMORY = 1024
 # Timers for deferred rows fire slightly after their not_before.
 WAKE_DELAY_EPSILON = 0.05
@@ -248,6 +249,8 @@ class WorkerPool:
         self._tasks: set[asyncio.Task[Any]] = set()
         self._timers: set[asyncio.TimerHandle] = set()
         self._deferred_notices: OrderedDict[tuple[int, int], None] = OrderedDict()
+        # chat id -> monotonic time of its last pending-cap notice
+        self._pending_notices: OrderedDict[int, float] = OrderedDict()
         self._dispatcher: asyncio.Task[None] | None = None
         self._heartbeat: asyncio.Task[None] | None = None
         self._maintenance: asyncio.Task[None] | None = None
@@ -715,12 +718,10 @@ class WorkerPool:
                 kind="rate",
             )
         elif status is SubmitStatus.PENDING_CAP:
-            self._notice(
-                chat_id,
-                messages.pending_cap(self.limiter.max_pending),
-                message_id,
-                kind="rate",
-            )
+            if self._pending_notice_due(chat_id):
+                self._notice(
+                    chat_id, messages.pending_cap(self.limiter.max_pending), message_id
+                )
         elif status is SubmitStatus.DUPLICATE and earlier is not None:
             in_progress = earlier.get("status") in db.ACTIVE_STATUSES
             reply_to = earlier.get("sent_message_id") or message_id
@@ -740,6 +741,23 @@ class WorkerPool:
         self._deferred_notices[key] = None
         while len(self._deferred_notices) > DEFERRED_NOTICE_MEMORY:
             self._deferred_notices.popitem(last=False)
+        return True
+
+    def _pending_notice_due(self, chat_id: int) -> bool:
+        """Pending-cap notices are throttled on their own (in memory: the db
+        throttle only knows "rate" and "duplicate"). Sharing "rate" let one
+        silence a later rate-limit notice, the only place that says when the
+        user may send links again."""
+        now = time.monotonic()
+        last = self._pending_notices.get(chat_id)
+        if last is not None and now - last < _float_setting(
+            "NOTIFY_RATE_THROTTLE_SECONDS"
+        ):
+            return False
+        self._pending_notices[chat_id] = now
+        self._pending_notices.move_to_end(chat_id)
+        while len(self._pending_notices) > DEFERRED_NOTICE_MEMORY:
+            self._pending_notices.popitem(last=False)
         return True
 
     def _notice(
