@@ -15,7 +15,7 @@ import pytest
 from aiogram import Bot
 from aiogram.types import Update
 
-from src import config, handlers, providers, telegram_api
+from src import config, handlers, http_client, providers, telegram_api
 from src.bot import create_dispatcher
 from src.providers import LinkCheck, ProviderMatch, Rejection
 
@@ -525,6 +525,52 @@ def test_refused_links_from_a_fake_checker(monkeypatch, telegram):
     url = "https://example.com/video/1"
     feed(text_update(url, url))
     assert "Riprova più avanti" in telegram["messages"][0]["text"]
+
+
+@pytest.fixture
+def no_http_session(monkeypatch):
+    """The resolver's session, for tests that fake providers._fetch_location."""
+
+    async def get_session():
+        return object()
+
+    monkeypatch.setattr(http_client, "get_session", get_session)
+
+
+def test_share_link_that_cannot_be_opened_is_not_called_unsupported(
+    monkeypatch, telegram, no_http_session
+):
+    async def unreachable(session, url, timeout, rule):
+        return None, None  # network error / timeout
+
+    monkeypatch.setattr(providers, "_fetch_location", unreachable)
+    url = "https://fb.watch/abcDEF123/"
+    pool = feed(text_update(url, url))
+
+    assert pool.calls == []
+    (reply,) = telegram["messages"]
+    assert reply["text"].startswith("Non riesco ad aprire questo link di condivisione")
+    assert SITES not in reply["text"]  # no "Link non supportato. Supporto ..."
+    assert telegram["reactions"] == [(111, 7, handlers.REJECT_REACTION)]
+
+
+def test_share_link_to_a_blocked_site_says_it_is_blocked(
+    monkeypatch, telegram, no_http_session
+):
+    monkeypatch.setattr(config, "BLOCKED_PROVIDERS", ("facebook",))
+    fetched = []
+
+    async def redirect(session, url, timeout, rule):
+        fetched.append(url)
+        return 302, "https://www.facebook.com/watch/?v=1234567890123456"
+
+    monkeypatch.setattr(providers, "_fetch_location", redirect)
+    url = "https://fb.watch/abcDEF123/"
+    pool = feed(text_update(url, url))
+
+    assert pool.calls == []
+    assert "disattivati" in telegram["messages"][0]["text"]
+    assert fetched == [url]
 
 
 # ---------------------------------------------------------------------------

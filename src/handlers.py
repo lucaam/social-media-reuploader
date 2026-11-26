@@ -92,6 +92,7 @@ _REASON_ORDER = (
     Rejection.COLLECTION,
     Rejection.BLOCKED,
     Rejection.BROKEN,
+    Rejection.UNRESOLVED,
     Rejection.INVALID,
     Rejection.UNSUPPORTED,
 )
@@ -106,6 +107,11 @@ _REASON_TEXT = {
     Rejection.BROKEN: (
         "Al momento non riesco a scaricare da questo sito: il supporto è "
         "temporaneamente fuori servizio. Riprova più avanti."
+    ),
+    Rejection.UNRESOLVED: (
+        "Non riesco ad aprire questo link di condivisione in questo momento: "
+        "riprova tra qualche minuto oppure mandami il link diretto del video o "
+        "del post."
     ),
     Rejection.INVALID: "Link non valido: controlla di averlo copiato per intero.",
     Rejection.UNSUPPORTED: "Link non supportato. Supporto {sites}.",

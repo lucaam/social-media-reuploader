@@ -228,7 +228,7 @@ def log_startup(mode: str) -> None:
         mode,
         os.getpid(),
     )
-    for problem in config.validate():
+    for problem in (*config.validate(), *providers.config_problems()):
         logger.warning("Configuration: %s", problem)
     logger.info(
         "Configuration: %s", json.dumps(config.summary(), sort_keys=True, default=str)

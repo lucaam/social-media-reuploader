@@ -32,7 +32,7 @@ Design notes:
   resolved with :func:`resolve_short_link`: only for a fixed allowlist of
   hosts of supported providers, HTTPS only, short timeout, at most 3
   redirects, never visiting hosts outside the provider's own domains. The
-  final URL must still pass :func:`match_provider`.
+  final URL is checked like any other link.
 * Open redirectors (``href.li``, ``consent.youtube.com``, Facebook's link
   warnings, ``t.co``) are never matched themselves: yt-dlp would hand their
   target to another extractor without the checks above. Their target is
@@ -52,7 +52,7 @@ import threading
 import time
 from collections import OrderedDict
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any, NamedTuple
 from urllib.parse import quote, unquote_plus, urlencode, urljoin, urlsplit
@@ -70,6 +70,7 @@ __all__ = [
     "check_link",
     "check_link_async",
     "clean_url",
+    "config_problems",
     "extract_urls",
     "is_short_link",
     "is_telegram_link",
@@ -107,6 +108,7 @@ class Rejection(StrEnum):
     BROKEN = "broken"  # yt-dlp marks the extractor for this URL as broken
     COLLECTION = "collection"  # profile / channel / playlist / album page
     BLOCKED = "blocked"  # excluded by ALLOWED_PROVIDERS / BLOCKED_PROVIDERS
+    UNRESOLVED = "unresolved"  # a share link that could not be followed right now
 
 
 @dataclass(frozen=True)
@@ -1147,13 +1149,19 @@ def match_provider(url: str) -> ProviderMatch | None:
 
 
 async def check_link_async(url: str, *, resolve: bool = True) -> LinkCheck:
-    """:func:`check_link` off the event loop, resolving known share links."""
+    """:func:`check_link` off the event loop, resolving known share links.
+
+    A share link is answered with the check of its target (blocked,
+    collection, unsupported site, ...); one that cannot be followed right now
+    (network or HTTP error, login wall, too many redirects) with
+    :attr:`Rejection.UNRESOLVED`.
+    """
     result = await asyncio.to_thread(check_link, url)
     if result.match is not None or not resolve or not result.resolvable:
         return result
     target = await resolve_short_link(result.url)
     if target is None:
-        return result
+        return replace(result, reason=Rejection.UNRESOLVED)
     return await asyncio.to_thread(check_link, target)
 
 
@@ -1280,6 +1288,17 @@ def _resolve_proxy() -> str | None:
     return None
 
 
+def config_problems() -> list[str]:
+    """Settings the link checks cannot fully honour (logged at startup)."""
+    problems: list[str] = []
+    if getattr(config, "YTDLP_PROXY", None) and _resolve_proxy() is None:
+        problems.append(
+            "YTDLP_PROXY is not an http(s) proxy: share links (fb.watch, pin.it, "
+            "t.co, ...) are resolved with direct connections, without the proxy"
+        )
+    return problems
+
+
 def _with_https(url: str) -> str:
     parsed = _parse(url)
     if parsed is None or parsed.scheme == "https":
@@ -1289,8 +1308,11 @@ def _with_https(url: str) -> str:
 
 async def _fetch_location(
     session: aiohttp.ClientSession, url: str, timeout: float, rule: _ShortLinkRule
-) -> str | None:
-    """``Location`` of a redirect response, or ``None`` (body never read)."""
+) -> tuple[int | None, str | None]:
+    """``(status, Location)`` of ``url``; ``(None, None)`` on network errors.
+
+    The body is never read; ``Location`` is ``None`` unless it redirects.
+    """
     try:
         async with session.get(
             url,
@@ -1300,16 +1322,11 @@ async def _fetch_location(
             proxy=_resolve_proxy(),
         ) as resp:
             if resp.status in _REDIRECT_STATUSES:
-                return resp.headers.get("Location")
-            logger.info(
-                "Share link on %s answered HTTP %s without redirect",
-                _host_of(url),
-                resp.status,
-            )
-            return None
+                return resp.status, resp.headers.get("Location")
+            return resp.status, None
     except (aiohttp.ClientError, TimeoutError) as exc:
         logger.info("Could not resolve share link on %s: %r", _host_of(url), exc)
-        return None
+        return None, None
 
 
 async def _follow(
@@ -1317,22 +1334,36 @@ async def _follow(
 ) -> str | None:
     session = await http_client.get_session()
     current = _with_https(url)
+    claimed = False  # an extractor claims ``current`` (refusing it)
     for _hop in range(max_redirects):
-        location = await _fetch_location(session, current, timeout, rule)
+        status, location = await _fetch_location(session, current, timeout, rule)
+        if claimed and status is not None and 200 <= status < 300:
+            return current  # no further redirect: the link leads to that page
         if not location:
+            if status is not None:
+                logger.info(
+                    "Share link on %s answered HTTP %s without redirect",
+                    _host_of(current),
+                    status,
+                )
             return None
-        target = clean_url(urljoin(current, location))
+        try:
+            target = clean_url(urljoin(current, location))
+        except ValueError:  # e.g. "https://host]/x": not a parsable URL
+            target = None
         if target is None:
+            logger.info("Share link on %s redirects to an invalid URL", rule.host)
             return None
-        if await asyncio.to_thread(match_provider, target) is not None:
-            return target
+        check = await asyncio.to_thread(check_link, target)
+        if check.match is not None or check.reason is Rejection.BLOCKED:
+            return target  # a blocked provider is not even visited
         if not _host_in(_host_of(target), rule.domains):
-            logger.info(
-                "Share link on %s redirects outside the provider; not following",
-                rule.host,
-            )
-            return None
-        current = _with_https(target)
+            # Never fetched: check_link_async() reports why it is refused.
+            return target
+        # Refused or unclaimed hops inside the provider are followed: they may
+        # be intermediate pages that an extractor claims by mistake (pin.it's
+        # api.pinterest.com/url_shortener/... looks like a Pinterest board).
+        current, claimed = _with_https(target), check.extractor_key is not None
     logger.info(
         "Share link on %s needs more than %d redirects", rule.host, max_redirects
     )
@@ -1347,11 +1378,16 @@ async def resolve_short_link(
 ) -> str | None:
     """Follow the redirects of a known share link (allowlisted hosts only).
 
-    Returns the first redirect target that :func:`match_provider` accepts, or
-    ``None``. Requests go over HTTPS to the allowlisted host (and that
-    provider's own domains), never read response bodies, time out after
-    ``timeout`` seconds each and stop after ``max_redirects`` redirects.
-    Results are cached for an hour (failures for two minutes).
+    Returns the URL the link points to: the first redirect target that
+    :func:`check_link` accepts or blocks, the first one outside the
+    provider's domains (never fetched), or a page that an extractor claims
+    and that answers without redirecting (e.g. a profile). ``None`` when the
+    link cannot be followed (network or HTTP error, invalid redirect, a page
+    no extractor claims such as a login wall, more than ``max_redirects``
+    redirects). Requests go over HTTPS to the allowlisted host (and that
+    provider's own domains), never read response bodies and time out after
+    ``timeout`` seconds each. Results are cached for an hour (failures for
+    two minutes).
     """
     cleaned = clean_url(url)
     if cleaned is None:

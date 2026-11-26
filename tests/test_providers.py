@@ -1339,11 +1339,39 @@ def test_resolve_upgrades_to_https(fake_session):
 
 
 def test_resolve_stops_outside_the_provider_domains(fake_session):
-    session = fake_session(
-        {"https://lnkd.in/AbCdEf12": FakeResponse(302, "https://evil.example.com/x")}
+    target = "https://evil.example.com/x"
+    session = fake_session({"https://lnkd.in/AbCdEf12": FakeResponse(302, target)})
+    # The target is returned to be checked, never fetched.
+    assert asyncio.run(providers.resolve_short_link("https://lnkd.in/AbCdEf12")) == (
+        target
     )
-    assert asyncio.run(providers.resolve_short_link("https://lnkd.in/AbCdEf12")) is None
+    check = asyncio.run(providers.check_link_async("https://lnkd.in/AbCdEf12"))
+    assert (check.reason, check.url) == (Rejection.UNSUPPORTED, target)
     assert len(session.calls) == 1
+
+
+def test_resolve_reports_why_the_target_is_refused(fake_session, monkeypatch):
+    monkeypatch.setattr(config, "BLOCKED_PROVIDERS", ("facebook",))
+    target = "https://www.facebook.com/watch/?v=1234567890123456"
+    session = fake_session({"https://fb.watch/abcDEF123/": FakeResponse(302, target)})
+    check = asyncio.run(providers.check_link_async("https://fb.watch/abcDEF123/"))
+    assert (check.reason, check.url) == (Rejection.BLOCKED, target)
+    assert len(session.calls) == 1  # the blocked provider is not even visited
+
+
+def test_resolve_share_link_to_a_collection(fake_session):
+    api = "https://api.pinterest.com/url_shortener/AbCdEf123/redirect/"
+    board = "https://www.pinterest.com/someuser/some-board/"
+    session = fake_session(
+        {
+            "https://pin.it/AbCdEf123": FakeResponse(301, api),
+            api: FakeResponse(302, board),
+            board: FakeResponse(200),  # no further redirect: the destination
+        }
+    )
+    check = asyncio.run(providers.check_link_async("https://pin.it/AbCdEf123"))
+    assert (check.reason, check.url) == (Rejection.COLLECTION, board)
+    assert len(session.calls) == 3
 
 
 def test_resolve_t_co_with_a_non_browser_user_agent(fake_session, monkeypatch):
@@ -1353,6 +1381,25 @@ def test_resolve_t_co_with_a_non_browser_user_agent(fake_session, monkeypatch):
     match = asyncio.run(providers.match_provider_async("https://t.co/AbCdEf1234"))
     assert (match.key, match.url) == ("Youtube", YT)
     assert session.calls[0][1]["headers"]["User-Agent"] == "curl"
+
+
+@pytest.mark.parametrize(
+    ("target", "reason"),
+    [
+        ("https://www.youtube.com/@MrBeast", Rejection.COLLECTION),
+        ("https://www.tiktok.com/@user/video/7234567890123456789", Rejection.BLOCKED),
+        (
+            "https://www.corriere.it/cronache/notizia-abc123.shtml",
+            Rejection.UNSUPPORTED,
+        ),
+    ],
+)
+def test_t_co_targets_go_through_the_checks(fake_session, monkeypatch, target, reason):
+    monkeypatch.setattr(config, "BLOCKED_PROVIDERS", ("tiktok",))
+    session = fake_session({"https://t.co/AbCdEf1234": FakeResponse(301, target)})
+    check = asyncio.run(providers.check_link_async("https://t.co/AbCdEf1234"))
+    assert (check.match, check.reason, check.url) == (None, reason, target)
+    assert len(session.calls) == 1  # the target is never fetched
 
 
 def test_resolve_accepts_supported_target_without_fetching_it(fake_session):
@@ -1387,6 +1434,7 @@ def test_resolve_gives_up_after_three_redirects(fake_session):
         FakeResponse(404),
         FakeResponse(302),  # redirect without Location
         FakeResponse(302, "javascript:alert(1)"),
+        FakeResponse(302, "https://www.facebook.com]/watch/?v=1"),  # urljoin fails
         aiohttp.ClientConnectionError("boom"),
         TimeoutError(),
     ],
@@ -1395,8 +1443,19 @@ def test_resolve_failures_return_none(fake_session, outcome):
     fake_session({"https://fb.watch/abc/": outcome})
     assert asyncio.run(providers.resolve_short_link("https://fb.watch/abc/")) is None
     check = asyncio.run(providers.check_link_async("https://fb.watch/abc/"))
-    assert check.reason is Rejection.UNSUPPORTED
+    # Not "unsupported": Facebook is supported, the link could not be opened.
+    assert check.reason is Rejection.UNRESOLVED
     assert check.resolvable
+
+
+def test_resolve_login_wall_is_unresolved(fake_session):
+    login = "https://www.facebook.com/login/?next=x"
+    session = fake_session(
+        {"https://fb.watch/abc/": FakeResponse(302, login), login: FakeResponse(200)}
+    )
+    check = asyncio.run(providers.check_link_async("https://fb.watch/abc/"))
+    assert check.reason is Rejection.UNRESOLVED
+    assert len(session.calls) == 2
 
 
 def test_resolve_results_are_cached(fake_session):
@@ -1445,3 +1504,12 @@ def test_resolve_uses_http_proxy_only(fake_session, monkeypatch, proxy, expected
     session = fake_session({})
     asyncio.run(providers.resolve_short_link("https://fb.watch/abc/"))
     assert session.calls[0][1]["proxy"] == expected
+
+
+def test_config_problems_report_a_proxy_the_resolver_cannot_use(monkeypatch):
+    assert providers.config_problems() == []
+    monkeypatch.setattr(config, "YTDLP_PROXY", "http://proxy:3128", raising=False)
+    assert providers.config_problems() == []
+    monkeypatch.setattr(config, "YTDLP_PROXY", "socks5://proxy:1080", raising=False)
+    (problem,) = providers.config_problems()
+    assert "YTDLP_PROXY" in problem and "without the proxy" in problem

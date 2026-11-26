@@ -638,6 +638,15 @@ def test_webhook_settings(monkeypatch, caplog):
     assert "bot.example.com" not in caplog.text
 
 
+def test_startup_reports_a_proxy_the_share_link_resolver_cannot_use(
+    monkeypatch, caplog
+):
+    monkeypatch.setattr(config, "YTDLP_PROXY", "socks5://proxy:1080", raising=False)
+    with caplog.at_level(logging.WARNING, logger="src.bot"):
+        bot_module.log_startup("polling")
+    assert "Configuration: YTDLP_PROXY is not an http(s) proxy" in caplog.text
+
+
 @pytest.mark.parametrize(
     ("secret", "path"),
     [
