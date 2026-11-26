@@ -134,6 +134,7 @@ CODES = [
     "unsupported",
     "timeout",
     "conversion_failed",
+    "conversion_timeout",
     "failed",
     "send_failed",
 ]

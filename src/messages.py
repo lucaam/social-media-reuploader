@@ -238,6 +238,9 @@ _MEDIA_FAILURES: Mapping[str, str] = {
     "conversion_failed": (
         "Non sono riuscito a convertire {noun} in un formato adatto a Telegram."
     ),
+    "conversion_timeout": (
+        "La conversione {of_noun} per Telegram ha impiegato troppo tempo."
+    ),
     "send_failed": "Non sono riuscito a inviare {noun} su Telegram. Riprova più tardi.",
 }
 # too_large by ``step``: refused before downloading (the download size limit),

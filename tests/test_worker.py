@@ -721,6 +721,50 @@ def test_retryable_error_fails_after_the_last_attempt(env):
     assert env.tg.reactions()[-1] == "🍌"
 
 
+CONVERSION_TIMEOUT = "compress (attempt 1): conversion time limit (900s) exhausted"
+
+
+def test_conversion_timeout_of_a_job_converting_alone_is_not_retried(env):
+    env.media.errors[1] = downloader.DownloadTimeout(CONVERSION_TIMEOUT)
+    result, row = process_new()
+    assert result.outcome == pipeline.Outcome.FAILED  # the same encode again: no
+    assert result.error_code == "conversion_timeout"
+    assert (row["status"], row["error_code"]) == ("failed", "conversion_timeout")
+    assert row["not_before"] is None
+    assert env.tg.texts() == [
+        "La conversione del video per Telegram ha impiegato troppo tempo."
+    ]
+    assert len(env.site.downloads) == 1
+
+
+def test_conversion_timeout_while_sharing_the_encoder_is_retried(env, monkeypatch):
+    slow, timed_out = new_request(chat_id=42), new_request(chat_id=43, url=URL2)
+    fake = env.media.prepare_for_telegram
+
+    async def scenario():
+        converting, release = asyncio.Event(), asyncio.Event()
+
+        async def prepare(path, workdir, *, max_bytes, probe_result=None):
+            if f"smr-{slow}-" in path:  # holds the encoder for a while
+                converting.set()
+                await release.wait()
+                return await fake(path, workdir, max_bytes=max_bytes)
+            await converting.wait()  # its time ran out waiting for a slot
+            raise downloader.DownloadTimeout(CONVERSION_TIMEOUT)
+
+        monkeypatch.setattr(media, "prepare_for_telegram", prepare)
+        first = asyncio.create_task(process(claim(slow)))
+        second = await process(claim(timed_out))
+        release.set()
+        return await first, second
+
+    first, second = run(scenario())
+    assert first.outcome == pipeline.Outcome.DONE
+    assert second.outcome == pipeline.Outcome.RETRY
+    assert second.error_code == "conversion_timeout"
+    assert status(timed_out) == "queued"
+
+
 def test_work_directory_failure_is_retried_later(env, monkeypatch):
     blocker = env.tmp / "not-a-directory"
     blocker.write_text("x")
