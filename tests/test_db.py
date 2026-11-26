@@ -854,7 +854,10 @@ def test_hot_queries_use_indexes(db_file, monkeypatch):
         ),
         "requeue": (
             lambda: db.requeue_requests([refused]),
-            [f"USING INDEX {status_slot} (chat_id=? AND status=?)"],
+            [
+                f"USING INDEX {status_slot} (chat_id=? AND status=?)",
+                f"USING INDEX {norm_url} (chat_id=? AND normalized_url=?)",
+            ],
         ),
     }
     for name, (call, expected) in cases.items():
@@ -1222,15 +1225,21 @@ def test_requeue_requests_from_every_requeueable_status(db_file):
         request_id = make(url=f"https://a.b/keep/{status}")
         force(request_id, status=status)
         blocked[status] = request_id
+    before = db.now_iso()
     requeued = db.requeue_requests([*ids.values(), *blocked.values(), 999], actor="op")
     assert requeued == list(ids.values())
     for request_id in ids.values():
         row = db.get_request(request_id)
-        assert row["status"] == "queued" and row["not_before"] is None
+        assert row["status"] == "queued"
+        assert before <= row["not_before"] == row["slot_at"] <= db.now_iso()  # due
         assert row["attempts"] == 0 and row["error_code"] is None
         assert history(request_id) == ["requeued"]
     for status, request_id in blocked.items():
         assert status_of(request_id) == status
+    claimed = set()
+    while (row := db.claim_next_request()) is not None:
+        claimed.add(row["id"])
+    assert claimed == {*ids.values(), blocked["queued"]}  # all due right away
 
 
 def test_requeue_never_queues_the_same_link_twice(db_file):
@@ -1242,7 +1251,63 @@ def test_requeue_never_queues_the_same_link_twice(db_file):
     assert db.requeue_requests([second]) == []  # first is still active
     db.claim_request(first)
     db.mark_done(first)
-    assert db.requeue_requests([second]) == [second]
+    assert db.requeue_requests([second]) == []  # first posted the link since
+    assert status_of(second) == "rate_limited"
+
+
+def test_requeue_never_posts_a_link_that_was_delivered(db_file, monkeypatch):
+    monkeypatch.setattr(db.config, "DUPLICATE_WINDOW_SECONDS", 5400, raising=False)
+
+    def delivered(url, *, hours_ago):
+        request_id = processing(1, url)
+        assert db.mark_done(request_id)
+        at = ago(hours_ago * 3600)
+        force(request_id, created_at=at, processing_finished_at=at)
+        return request_id
+
+    # failed during an outage, then resent by the user and delivered
+    failed = processing(1, "https://a.b/outage")
+    assert db.mark_failed(failed, error_code="unavailable")
+    force(failed, created_at=ago(3 * 3600))
+    delivered("https://a.b/outage", hours_ago=2)
+    # refused as a duplicate of a post that is now older than the window
+    delivered("https://a.b/dup", hours_ago=3)
+    duplicate = db.create_request(
+        1, "https://a.b/dup", status="duplicate", normalized_url="https://a.b/dup"
+    )
+    force(duplicate, created_at=ago(3 * 3600 - 600))
+    # resent long after an old post, then refused by the rate limit: legit
+    delivered("https://a.b/old", hours_ago=5 * 24)
+    limited = db.create_request(
+        1, "https://a.b/old", status="rate_limited", normalized_url="https://a.b/old"
+    )
+    force(limited, created_at=ago(3 * 3600))
+
+    assert db.requeue_requests([failed, duplicate, limited]) == [limited]
+    assert status_of(failed) == "failed" and status_of(duplicate) == "duplicate"
+
+
+def test_requeue_is_a_new_submission_for_order_and_quota(db_file):
+    fresh = make(2, "https://a.b/fresh")
+    force(fresh, created_at=ago(60))  # queued a minute before the requeue
+    old = make(7, "https://a.b/yesterday")
+    yesterday = ago(86400)
+    force(old, status="failed", created_at=yesterday)
+    assert db.requeue_requests([old]) == [old]
+    later = make(3, "https://a.b/later")
+    # FIFO by requeue time: neither ahead of the rows already queued, nor
+    # behind the ones submitted after it
+    assert [db.claim_next_request()["id"] for _ in range(3)] == [fresh, old, later]
+    assert db.get_request(old)["created_at"] == yesterday  # history is kept
+    # the requeued row occupies the chat's rate-limit windows from now on
+    (slot,) = db.accepted_times(7, ago(3600))
+    assert slot == pytest.approx(time.time(), abs=60)
+    # ...unless the chat was reset after the row was created (GUI unlimit)
+    refused = db.create_request(8, "https://a.b/refused", status="rate_limited")
+    force(refused, created_at=ago(7200))
+    db.reset_chat_limit(8, actor="admin")
+    assert db.requeue_requests([refused]) == [refused]
+    assert db.accepted_times(8, ago(3600)) == []
 
 
 def test_list_and_count_requests_with_filters(db_file):

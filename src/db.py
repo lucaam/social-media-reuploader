@@ -721,10 +721,10 @@ def _migration_3_rate_slots(conn: sqlite3.Connection) -> None:
     """Stored rate-limit slot (``requests.slot_at``) and a per-chat index.
 
     ``slot_at`` is when a request counts in its chat's rate-limit windows. It
-    is set at submission and never moved by claims or retries. The
-    ``(chat_id, status, slot_at)`` index keeps the per-submit reads (pending
-    cap, rate windows, active copies) proportional to the rows they return,
-    not to the chat's whole history.
+    is set at submission (a requeue is a new submission) and never moved by
+    claims or retries. The ``(chat_id, status, slot_at)`` index keeps the
+    per-submit reads (pending cap, rate windows, active copies) proportional
+    to the rows they return, not to the chat's whole history.
     """
     _add_missing_columns(conn, "requests", {"slot_at": "TEXT"})
     conn.execute(
@@ -1009,6 +1009,39 @@ def _has_active_duplicate(conn: sqlite3.Connection, row: Mapping[str, Any]) -> b
             *ACTIVE_STATUSES,
             row["normalized_url"],
             row["url"],
+        ),
+    ).fetchone()
+    return found is not None
+
+
+def _duplicate_window_seconds() -> float:
+    return max(0.0, float(getattr(config, "DUPLICATE_WINDOW_SECONDS", 0) or 0))
+
+
+def _has_delivered_copy(
+    conn: sqlite3.Connection, row: Mapping[str, Any], now: float
+) -> bool:
+    """The chat got the row's link posted after the row was submitted, or
+    less than the duplicate window before (the row was a duplicate of it)."""
+    try:
+        submitted = min(ts_from_iso(row["created_at"]), now)
+        since = iso_from_ts(submitted - _duplicate_window_seconds())
+    except (TypeError, ValueError):
+        since = ""  # unknown submission time: any delivered copy counts
+    link = row["normalized_url"] or row["url"]
+    # Both lookups use (chat_id, normalized_url); see find_recent_duplicate.
+    found = conn.execute(
+        f"""SELECT 1 FROM requests
+            WHERE chat_id = ? AND normalized_url = ? AND +status = ?
+              AND {_DELIVERED_AT_SQL} >= ?
+            UNION ALL
+            SELECT 1 FROM requests
+            WHERE chat_id = ? AND normalized_url IS NULL AND url IN (?, ?)
+              AND +status = ? AND {_DELIVERED_AT_SQL} >= ?
+            LIMIT 1""",
+        (
+            *(row["chat_id"], link, Status.DONE, since),
+            *(row["chat_id"], link, row["url"], Status.DONE, since),
         ),
     ).fetchone()
     return found is not None
@@ -1404,14 +1437,21 @@ def cancel_queued(*, chat_id: int | None = None, actor: str | None = None) -> li
 def requeue_requests(ids: Iterable[int], *, actor: str | None = None) -> list[int]:
     """Put refused/failed/cancelled/aborted requests back in the queue.
 
-    Statuses accepted: see :data:`REQUEUEABLE_STATUSES`. The row becomes
-    ``queued`` with ``not_before`` NULL, ``attempts`` 0 and no error. A row is
-    skipped when the same chat already has an active request for the same
-    link (this also keeps at most one copy per link within one call), so a
-    link is never posted twice. Returns the ids actually requeued.
+    Statuses accepted: see :data:`REQUEUEABLE_STATUSES`. A requeue counts as
+    a new submission: the row becomes ``queued`` with ``not_before`` = now (it
+    waits behind the rows already queued instead of jumping ahead with its
+    old ``created_at``), a fresh rate-limit slot (now; like any row, it is not
+    counted when the chat's limits were reset after it was created, as the
+    GUI does before requeueing a chat's refusals), ``attempts`` 0 and no
+    error. A row is skipped when the chat already has an active request for
+    the same link (this also keeps at most one copy per link within one
+    call), or got the link posted after the row was submitted or less than
+    ``DUPLICATE_WINDOW_SECONDS`` before it: so a requeue never posts a link
+    twice. Returns the ids actually requeued.
     """
     wanted = list(dict.fromkeys(int(request_id) for request_id in ids))
-    now = _utc_now()
+    current = time.time()
+    now = iso_from_ts(current)
     requeued: list[int] = []
     with write() as conn:
         rows: dict[int, sqlite3.Row] = {}
@@ -1424,7 +1464,9 @@ def requeue_requests(ids: Iterable[int], *, actor: str | None = None) -> list[in
             row = rows.get(request_id)
             if row is None or row["status"] not in REQUEUEABLE_STATUSES:
                 continue
-            if _has_active_duplicate(conn, row):
+            if _has_active_duplicate(conn, row) or _has_delivered_copy(
+                conn, row, current
+            ):
                 continue
             details = f"requeued from {row['status']}"
             if actor:
@@ -1436,7 +1478,8 @@ def requeue_requests(ids: Iterable[int], *, actor: str | None = None) -> list[in
                 to_status=Status.QUEUED,
                 now=now,
                 assignments={
-                    "not_before": None,
+                    "not_before": now,
+                    "slot_at": now,
                     "attempts": 0,
                     "error_code": None,
                     "error_message": None,
@@ -1540,7 +1583,8 @@ def accepted_times(chat_id: int, since_iso: str) -> list[float]:
     ``chat_limits.reset_at`` are ignored. The slot (``requests.slot_at``) is
     fixed at submission: ``COALESCE(not_before, created_at)``, so requests
     deferred at submit count at their ``not_before``. Claims and retries
-    (:func:`defer_request`) never move it.
+    (:func:`defer_request`) never move it; :func:`requeue_requests` gives the
+    row a new one (the requeue time).
     """
     since = _canonical_iso(since_iso)
     with connect() as conn:
