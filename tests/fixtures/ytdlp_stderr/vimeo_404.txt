@@ -1,0 +1,2 @@
+WARNING: [vimeo] 123456789: Failed to parse XML: not well-formed
+ERROR: [vimeo] 123456789: Unable to download JSON metadata: HTTP Error 404: Not Found (caused by <HTTPError 404: Not Found>)

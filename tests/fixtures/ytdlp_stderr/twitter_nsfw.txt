@@ -1,0 +1,1 @@
+ERROR: [twitter] 1790000000000000000: NSFW tweet requires authentication. Use --cookies, --cookies-from-browser, --username and --password, --netrc-cmd, or --netrc (twitter) to provide account credentials

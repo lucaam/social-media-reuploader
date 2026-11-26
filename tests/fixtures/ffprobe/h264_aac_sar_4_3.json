@@ -1,0 +1,46 @@
+{
+ "format": {
+  "bit_rate": "168592",
+  "duration": "1.000000",
+  "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+  "nb_streams": 2,
+  "size": "21074"
+ },
+ "streams": [
+  {
+   "avg_frame_rate": "25/1",
+   "bit_rate": "78504",
+   "codec_name": "h264",
+   "codec_type": "video",
+   "display_aspect_ratio": "16:9",
+   "disposition": {
+    "attached_pic": 0,
+    "default": 1
+   },
+   "duration": "1.000000",
+   "height": 360,
+   "index": 0,
+   "pix_fmt": "yuv420p",
+   "profile": "High",
+   "r_frame_rate": "25/1",
+   "sample_aspect_ratio": "4:3",
+   "width": 480
+  },
+  {
+   "avg_frame_rate": "0/0",
+   "bit_rate": "70248",
+   "channels": 1,
+   "codec_name": "aac",
+   "codec_type": "audio",
+   "disposition": {
+    "attached_pic": 0,
+    "default": 1
+   },
+   "duration": "1.000000",
+   "index": 1,
+   "profile": "LC",
+   "r_frame_rate": "0/0",
+   "sample_rate": "44100"
+  }
+ ]
+}

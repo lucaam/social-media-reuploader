@@ -1,0 +1,36 @@
+{
+ "format": {
+  "bit_rate": "66965",
+  "duration": "1.001000",
+  "format_name": "mov,mp4,m4a,3gp,3g2,mj2",
+  "nb_streams": 1,
+  "size": "8379"
+ },
+ "streams": [
+  {
+   "avg_frame_rate": "30000/1001",
+   "bit_rate": "57118",
+   "codec_name": "h264",
+   "codec_type": "video",
+   "display_aspect_ratio": "4:3",
+   "disposition": {
+    "attached_pic": 0,
+    "default": 1
+   },
+   "duration": "1.001000",
+   "height": 240,
+   "index": 0,
+   "pix_fmt": "yuv420p",
+   "profile": "High",
+   "r_frame_rate": "30000/1001",
+   "sample_aspect_ratio": "1:1",
+   "side_data_list": [
+    {
+     "rotation": 90,
+     "side_data_type": "Display Matrix"
+    }
+   ],
+   "width": 320
+  }
+ ]
+}

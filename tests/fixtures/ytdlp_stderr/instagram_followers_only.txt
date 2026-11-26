@@ -1,0 +1,1 @@
+ERROR: [Instagram] C3xYz12AbCd: This content is only available for registered users who follow this account. Use --cookies, --cookies-from-browser, --username and --password, --netrc-cmd, or --netrc (instagram) to provide account credentials

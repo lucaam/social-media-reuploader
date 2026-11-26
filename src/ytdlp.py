@@ -1,153 +1,93 @@
+"""Deprecated compatibility wrapper around :mod:`src.downloader`.
+
+The worker no longer calls this module: one ``downloader.fetch_info()`` gives
+both the metadata and :attr:`~src.downloader.MediaItem.direct_url` (the
+progressive MP4 Telegram can fetch server-side), and ``downloader.download()``
+reuses the same extraction. The yt-dlp command-line helpers are re-exported
+here for code that imported them from this module.
+"""
+
+from __future__ import annotations
+
 import asyncio
-import json
+import logging
+import os
 import shutil
-import sys
-from asyncio.subprocess import PIPE
-from typing import Optional, Tuple
+import tempfile
+import warnings
+from typing import Any
 
 from . import config
+from .downloader import (
+    DownloadError,
+    build_download_argv,
+    build_fetch_argv,
+    common_args,
+    fetch_info,
+    format_args,
+    redact,
+    ytdlp_command,
+)
+
+__all__ = [
+    "build_download_argv",
+    "build_fetch_argv",
+    "common_args",
+    "extract_direct_url_and_meta",
+    "format_args",
+    "ytdlp_command",
+]
+
+logger = logging.getLogger(__name__)
+
+
+def _make_tmpdir() -> str:
+    base = getattr(config, "TMP_DIR", None) or tempfile.gettempdir()
+    os.makedirs(base, exist_ok=True)
+    return tempfile.mkdtemp(prefix="ytdlp-", dir=base)
 
 
 async def extract_direct_url_and_meta(
     url: str,
-    timeout: int = 15,
-    ytdlp_user_agent: Optional[str] = None,
-    ytdlp_cookies: Optional[str] = None,
-    ytdlp_headers: Optional[dict] = None,
-) -> Tuple[Optional[str], Optional[dict]]:
-    """
-    Minimal helper: use `yt-dlp -g` to get a direct URL and `-j` to fetch
-    lightweight metadata. Returns (direct_url, meta) or (None, None).
-    """
-    yt_dlp_bin = shutil.which("yt-dlp") or None
-    if yt_dlp_bin:
-        base_cmd = [yt_dlp_bin]
-    else:
-        base_cmd = [sys.executable, "-m", "yt_dlp"]
+    timeout: int = 15,  # noqa: ASYNC109, RUF100
+    ytdlp_user_agent: str | None = None,
+    ytdlp_cookies: str | None = None,
+    ytdlp_headers: dict[str, str] | None = None,
+) -> tuple[str | None, dict[str, Any] | None]:
+    """Deprecated: ``(direct_url, meta)`` of the first item, or ``(None, None)``.
 
-    cmd_common = list(base_cmd) + ["--no-playlist"]
-    ua = ytdlp_user_agent or getattr(config, "YTDLP_USER_AGENT", None)
-    if ua:
-        cmd_common += ["--user-agent", ua]
-    cookies_path = ytdlp_cookies or getattr(config, "YTDLP_COOKIES", None)
-    if cookies_path:
-        cmd_common += ["--cookies", cookies_path]
-    headers = ytdlp_headers or None
-    if not headers and getattr(config, "YTDLP_HEADERS", None):
-        try:
-            headers = {}
-            for part in getattr(config, "YTDLP_HEADERS").split("|"):
-                if ":" in part:
-                    k, v = part.split(":", 1)
-                    headers[k.strip()] = v.strip()
-        except Exception:
-            headers = None
-    if headers:
-        for k, v in headers.items():
-            cmd_common += ["--add-header", f"{k}: {v}"]
-
-    # 1) get direct URL
-    cmd_g = list(cmd_common) + ["-g", "-f", "best", url]
+    Performs one extraction (previously two: ``-g`` then ``-j``). The
+    ``ytdlp_*`` overrides are ignored: yt-dlp options come from ``src.config``.
+    """
+    warnings.warn(
+        "ytdlp.extract_direct_url_and_meta() is deprecated; use downloader.fetch_info()",
+        DeprecationWarning,
+        stacklevel=2,
+    )
+    del ytdlp_user_agent, ytdlp_cookies, ytdlp_headers
+    workdir = await asyncio.to_thread(_make_tmpdir)
     try:
-        p = await asyncio.create_subprocess_exec(*cmd_g, stdout=PIPE, stderr=PIPE)
-        try:
-            outb, errb = await asyncio.wait_for(p.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            try:
-                p.kill()
-            except Exception:
-                pass
-            try:
-                await p.communicate()
-            except Exception:
-                pass
-            return None, None
-        if p.returncode != 0:
-            return None, None
-        out = outb.decode(errors="ignore").strip() if outb else ""
-        if not out:
-            return None, None
-        direct = None
-        for line in out.splitlines():
-            s = line.strip()
-            if s and (s.startswith("http://") or s.startswith("https://")):
-                direct = s
-                break
-        if not direct:
-            return None, None
-    except Exception:
+        info = await fetch_info(url, workdir, timeout=float(timeout))
+    except DownloadError as exc:
+        logger.info(
+            "direct URL lookup failed for %s: [%s] %s",
+            redact(url),
+            exc.code,
+            exc.detail,
+        )
         return None, None
-
-    # 2) optional metadata via -j
-    meta = None
-    try:
-        cmd_j = list(cmd_common) + [
-            "-j",
-            "--no-warnings",
-            "--skip-download",
-            "-f",
-            "best",
-            url,
-        ]
-        p2 = await asyncio.create_subprocess_exec(*cmd_j, stdout=PIPE, stderr=PIPE)
-        try:
-            outb2, errb2 = await asyncio.wait_for(p2.communicate(), timeout=timeout)
-        except asyncio.TimeoutError:
-            try:
-                p2.kill()
-            except Exception:
-                pass
-            try:
-                await p2.communicate()
-            except Exception:
-                pass
-            return direct, None
-        if p2.returncode == 0 and outb2:
-            try:
-                info = json.loads(outb2.decode(errors="ignore"))
-                meta = {}
-                if info.get("duration") is not None:
-                    try:
-                        meta["duration"] = float(info.get("duration"))
-                    except Exception:
-                        pass
-                if info.get("ext"):
-                    meta["format"] = info.get("ext")
-                if info.get("width"):
-                    try:
-                        meta["video_width"] = int(info.get("width"))
-                    except Exception:
-                        pass
-                if info.get("height"):
-                    try:
-                        meta["video_height"] = int(info.get("height"))
-                    except Exception:
-                        pass
-                fmts = info.get("formats") or []
-                chosen = None
-                for f in reversed(fmts):
-                    try:
-                        # Compare exact URLs to avoid false substring matches
-                        if f.get("url") and f.get("url") == direct:
-                            chosen = f
-                            break
-                    except Exception:
-                        pass
-                if chosen is None and fmts:
-                    chosen = fmts[-1]
-                if chosen:
-                    if chosen.get("vcodec"):
-                        meta["video_codec"] = chosen.get("vcodec")
-                    if chosen.get("acodec"):
-                        meta["audio_codec"] = chosen.get("acodec")
-                    if chosen.get("filesize"):
-                        try:
-                            meta["final_size"] = int(chosen.get("filesize"))
-                        except Exception:
-                            pass
-            except Exception:
-                meta = None
-    except Exception:
-        meta = None
-
-    return direct, meta
+    finally:
+        await asyncio.to_thread(shutil.rmtree, workdir, True)
+    item = info.items[0]
+    if not item.direct_url:
+        return None, None
+    meta: dict[str, Any] = {
+        "duration": item.duration,
+        "format": item.direct_ext,
+        "video_width": item.width,
+        "video_height": item.height,
+        "video_codec": item.vcodec,
+        "audio_codec": item.acodec,
+        "final_size": item.filesize,
+    }
+    return item.direct_url, {k: v for k, v in meta.items() if v is not None}
