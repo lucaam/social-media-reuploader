@@ -19,7 +19,13 @@ import time
 import pytest
 
 from src import config, downloader, media
-from src.downloader import ConversionFailed, DownloadTimeout, NoMedia, TooLarge
+from src.downloader import (
+    ConversionFailed,
+    ConversionTimeout,
+    DownloadTimeout,
+    NoMedia,
+    TooLarge,
+)
 from src.media import (
     Action,
     ProbeResult,
@@ -508,11 +514,13 @@ def _fake_ffmpeg(monkeypatch, *, encode_seconds: float, limits: list) -> None:
 
     async def fake_run(argv, *, time_limit, label, **kwargs):
         limits.append(time_limit)
+        output = pathlib.Path(argv[-1].removeprefix("file:"))
+        output.write_bytes(b"\0" * 10)  # ffmpeg creates its output right away
         if time_limit < encode_seconds:
             await asyncio.sleep(time_limit)
             raise DownloadTimeout(f"{label} timed out after {time_limit:g}s")
         await asyncio.sleep(encode_seconds)
-        pathlib.Path(argv[-1].removeprefix("file:")).write_bytes(b"\0" * 1000)
+        output.write_bytes(b"\0" * 1000)
         return downloader.CommandResult(0, "", "", encode_seconds)
 
     async def fake_probe(path):
@@ -559,6 +567,58 @@ def test_waiting_for_a_transcode_slot_does_not_use_up_the_timeout(
     assert len(limits) == 3
     # every encode got (almost) the whole TRANSCODE_TIMEOUT for itself
     assert min(limits) > 0.9, limits
+
+
+def test_conversion_timeout_is_a_permanent_conversion_failure(monkeypatch, tmp_path):
+    # A too slow conversion would be just as slow on a retry (which would
+    # also download everything again): not retryable, not a "download" error.
+    monkeypatch.setattr(config, "TRANSCODE_TIMEOUT", 0.2)
+    limits: list[float] = []
+    _fake_ffmpeg(monkeypatch, encode_seconds=5.0, limits=limits)
+    [src] = _vp9_inputs(tmp_path, 1)
+    with pytest.raises(ConversionTimeout, match="transcode timed out") as excinfo:
+        run(
+            media.prepare_for_telegram(
+                src, str(tmp_path), max_bytes=50 * MIB, probe_result=VP9_PROBE
+            )
+        )
+    err = excinfo.value
+    assert isinstance(err, ConversionFailed) and not isinstance(err, DownloadTimeout)
+    assert err.code == "conversion_failed"
+    assert err.retryable is False
+    assert "TRANSCODE_TIMEOUT" in err.detail
+    assert not (tmp_path / "in0.tg.mp4").exists()  # partial output removed
+
+
+def test_cheap_conversion_timeout_does_not_fall_back_to_an_encode(
+    monkeypatch, tmp_path
+):
+    # H.264/AAC in Matroska: a remux is tried first; running out of time there
+    # must not start the (slower) full transcode.
+    monkeypatch.setattr(config, "TRANSCODE_TIMEOUT", 0.2)
+    limits: list[float] = []
+    _fake_ffmpeg(monkeypatch, encode_seconds=5.0, limits=limits)
+    src = tmp_path / "in.mkv"
+    src.write_bytes(b"\0" * 5000)
+    probe = make_probe(container="matroska", format_name="matroska,webm")
+    with pytest.raises(ConversionTimeout, match="remux timed out"):
+        run(
+            media.prepare_for_telegram(
+                str(src), str(tmp_path), max_bytes=50 * MIB, probe_result=probe
+            )
+        )
+    assert len(limits) == 1  # no second ffmpeg run
+
+
+def test_exhausted_conversion_deadline_is_a_conversion_timeout():
+    async def scenario():
+        deadline = media._Deadline(0.01)
+        await asyncio.sleep(0.05)
+        deadline.remaining("compress (attempt 2)")
+
+    with pytest.raises(ConversionTimeout, match=r"compress \(attempt 2\)") as excinfo:
+        run(scenario())
+    assert excinfo.value.retryable is False
 
 
 # ---------------------------------------------------------------------------
@@ -996,8 +1056,9 @@ def test_transcode_timeout_kills_ffmpeg(gen, monkeypatch, tmp_path):
     monkeypatch.setattr(config, "TRANSCODE_TIMEOUT", 1.0)
     work = _workdir(tmp_path)
     started = time.monotonic()
-    with pytest.raises(DownloadTimeout, match="timed out"):
+    with pytest.raises(ConversionTimeout, match="timed out") as excinfo:
         run(media.prepare_for_telegram(src, work, max_bytes=50 * MIB))
+    assert excinfo.value.retryable is False
     assert time.monotonic() - started < 10
     assert _processes_mentioning(work) == []
     assert not os.path.exists(

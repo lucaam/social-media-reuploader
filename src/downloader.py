@@ -162,6 +162,15 @@ class ConversionFailed(DownloadError):
     code = "conversion_failed"
 
 
+class ConversionTimeout(ConversionFailed):
+    """The conversion exceeded ``TRANSCODE_TIMEOUT`` (raised by :mod:`src.media`).
+
+    Not retryable, unlike :class:`DownloadTimeout`: the same input on the same
+    CPU would be just as slow, and a retry downloads and converts everything
+    again. The code stays ``conversion_failed`` (same user text and label).
+    """
+
+
 # ---------------------------------------------------------------------------
 # Redaction
 # ---------------------------------------------------------------------------

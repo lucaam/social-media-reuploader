@@ -28,6 +28,8 @@ from src import config, downloader
 from src.downloader import (
     AuthRequired,
     ContentUnavailable,
+    ConversionFailed,
+    ConversionTimeout,
     DownloadError,
     DownloadTimeout,
     GeoBlocked,
@@ -234,6 +236,12 @@ def test_error_classes_follow_the_contract():
     assert str(err) == err.detail
     assert DownloadTimeout("t").retryable is True
     assert TooLarge("t").retryable is False
+    # a too slow conversion is a (permanent) conversion failure, not a timeout
+    # of the site: same code and user text as any failed conversion
+    assert issubclass(ConversionTimeout, ConversionFailed)
+    assert not issubclass(ConversionTimeout, DownloadTimeout)
+    assert ConversionTimeout.code == ConversionFailed.code == "conversion_failed"
+    assert ConversionTimeout("t").retryable is False
 
 
 # ---------------------------------------------------------------------------

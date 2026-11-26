@@ -37,6 +37,7 @@ from typing import Any
 
 from .downloader import (
     ConversionFailed,
+    ConversionTimeout,
     DownloadError,
     DownloadTimeout,
     NoMedia,
@@ -876,8 +877,9 @@ class _Deadline:
     def remaining(self, label: str) -> float:
         left = self._end - self._loop.time()
         if left <= 0:
-            raise DownloadTimeout(
-                f"{label}: conversion time limit ({self.seconds:g}s) exhausted"
+            raise ConversionTimeout(
+                f"{label}: conversion time limit "
+                f"(TRANSCODE_TIMEOUT={self.seconds:g}s) exhausted"
             )
         return left
 
@@ -916,6 +918,13 @@ class _Job:
             result = await run_command(
                 argv, time_limit=self.deadline.remaining(label), label=label
             )
+        except DownloadTimeout as exc:
+            _unlink(dst)
+            raise ConversionTimeout(
+                f"{exc.detail}; a conversion may take at most "
+                f"TRANSCODE_TIMEOUT={self.deadline.seconds:g}s",
+                stderr_tail=exc.stderr_tail,
+            ) from exc
         except BaseException:
             _unlink(dst)
             raise
@@ -949,6 +958,8 @@ class _Job:
         falls back to a heavier strategy (timeouts/cancellation still raise)."""
         try:
             return await self.run(argv, dst, action, label)
+        except ConversionTimeout:
+            raise  # out of time: a heavier strategy cannot finish either
         except ConversionFailed as exc:
             logger.warning("%s; falling back to a full conversion", exc.detail)
             return None
@@ -1110,10 +1121,11 @@ async def prepare_for_telegram(
     See the module docstring for the strategy. ``PreparedMedia.probe``
     always describes ``PreparedMedia.path`` (re-probed after conversion), so
     use its ``display_width``/``display_height``/``duration`` for sendVideo.
-    Raises :class:`TooLarge` (cannot fit), :class:`NoMedia` (no streams),
-    :class:`ConversionFailed` (ffmpeg error/missing) or
-    :class:`DownloadTimeout` (``TRANSCODE_TIMEOUT`` exceeded; ffmpeg killed).
-    With ``SIMPLE_YTDLP_ONLY`` the file is never converted.
+    Raises :class:`TooLarge` (cannot fit), :class:`NoMedia` (no streams) or
+    :class:`ConversionFailed` (ffmpeg error/missing); its subclass
+    :class:`ConversionTimeout` (not retryable) when ``TRANSCODE_TIMEOUT`` is
+    exceeded and ffmpeg was killed. With ``SIMPLE_YTDLP_ONLY`` the file is
+    never converted.
     """
     original_size = await asyncio.to_thread(os.path.getsize, path)
     p = probe_result if probe_result is not None else await probe(path)
