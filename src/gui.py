@@ -1123,8 +1123,23 @@ async def _database_error(request: Request, exc: Exception) -> JSONResponse:
     )
 
 
-class _AccessLogFilter(logging.Filter):
-    """Hide /health probe lines; redact ``token=`` query values (old bookmarks)."""
+_TOKEN_QUERY_RE = re.compile(r"(?i)(token=)[^&\s\"']*")
+
+
+def _redact_tokens(value: Any) -> Any:
+    if isinstance(value, str) and "token=" in value.lower():
+        return _TOKEN_QUERY_RE.sub(r"\1[REDACTED]", value)
+    return value
+
+
+class _UvicornLogFilter(logging.Filter):
+    """Redact ``token=`` query values (old bookmarks and scripts) in every
+    string argument; optionally hide the /health probe lines.
+
+    ``uvicorn.access`` logs ``(client, method, path, ...)``; ``uvicorn.error``
+    logs WebSocket handshakes as ``'%s - "WebSocket %s" 403'`` with
+    ``(client, path)``.
+    """
 
     def __init__(self, *, hide_health: bool) -> None:
         super().__init__()
@@ -1132,25 +1147,35 @@ class _AccessLogFilter(logging.Filter):
 
     def filter(self, record: logging.LogRecord) -> bool:
         args = record.args
-        if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
-            path = args[2]
-            if self.hide_health and path.split("?", 1)[0] == "/health":
+        if isinstance(args, Mapping):
+            record.args = {key: _redact_tokens(value) for key, value in args.items()}
+        elif args:
+            path = args[2] if len(args) >= 3 else None
+            if (
+                self.hide_health
+                and isinstance(path, str)
+                and path.split("?", 1)[0] == "/health"
+            ):
                 return False
-            if "token=" in path.lower():
-                redacted = re.sub(r"(?i)(token=)[^&]*", r"\1[REDACTED]", path)
-                record.args = (*args[:2], redacted, *args[3:])
+            record.args = tuple(_redact_tokens(arg) for arg in args)
+        elif isinstance(record.msg, str):  # no arguments: the text is final
+            record.msg = _redact_tokens(record.msg)
         return True
 
 
-_ACCESS_LOG_FILTER = _AccessLogFilter(
-    hide_health=not getattr(config, "HEALTH_DEBUG", False)
-)
+_LOG_FILTERS = {
+    "uvicorn.access": _UvicornLogFilter(
+        hide_health=not getattr(config, "HEALTH_DEBUG", False)
+    ),
+    "uvicorn.error": _UvicornLogFilter(hide_health=False),
+}
 
 
 def _configure_logging() -> None:
-    access = logging.getLogger("uvicorn.access")
-    if _ACCESS_LOG_FILTER not in access.filters:
-        access.addFilter(_ACCESS_LOG_FILTER)
+    for name, log_filter in _LOG_FILTERS.items():
+        uvicorn_logger = logging.getLogger(name)
+        if log_filter not in uvicorn_logger.filters:
+            uvicorn_logger.addFilter(log_filter)
     root = logging.getLogger()
     if not root.handlers:  # plain uvicorn: give our loggers a handler
         logging.basicConfig(

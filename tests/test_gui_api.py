@@ -1,6 +1,7 @@
 """Admin GUI JSON API against a real temporary database."""
 
 import contextlib
+import logging
 import re
 import sqlite3
 import threading
@@ -917,6 +918,54 @@ def test_html_is_csp_friendly_and_cdn_assets_are_pinned(client):
     script = (Path(gui.STATIC_DIR) / "app.js").read_text()
     assert ".innerHTML" not in script
     assert "eval(" not in script
+
+
+class Lines(logging.Handler):
+    def __init__(self):
+        super().__init__()
+        self.lines = []
+
+    def emit(self, record):
+        self.lines.append(record.getMessage())
+
+
+def test_tokens_are_redacted_from_uvicorn_log_lines():
+    gui._configure_logging()
+    secret = "admin-token-0123456789abcdef"
+    loggers = [logging.getLogger(name) for name in ("uvicorn.error", "uvicorn.access")]
+    handler = Lines()
+    levels = [item.level for item in loggers]
+    for item in loggers:
+        item.addHandler(handler)
+        item.setLevel(logging.INFO)
+    try:
+        error_log, access_log = loggers
+        # uvicorn's WebSocket handshake lines (uvicorn.error, 2 or 3 arguments)
+        error_log.info(
+            '%s - "WebSocket %s" 403', "10.0.0.5:5000", f"/ws/updates?token={secret}"
+        )
+        error_log.info(
+            '%s - "WebSocket %s" %d', "10.0.0.5:5000", f"/ws?a=1&token={secret}", 500
+        )
+        access_log.info(
+            '%s - "%s %s HTTP/%s" %d',
+            "10.0.0.5:5000",
+            "GET",
+            f"/api/me?token={secret}&x=2",
+            "1.1",
+            200,
+        )
+        error_log.info(f'pre-formatted "WebSocket /ws/updates?token={secret}" 403')
+    finally:
+        for item, level in zip(loggers, levels, strict=True):
+            item.removeHandler(handler)
+            item.setLevel(level)
+    assert handler.lines == [
+        '10.0.0.5:5000 - "WebSocket /ws/updates?token=[REDACTED]" 403',
+        '10.0.0.5:5000 - "WebSocket /ws?a=1&token=[REDACTED]" 500',
+        '10.0.0.5:5000 - "GET /api/me?token=[REDACTED]&x=2 HTTP/1.1" 200',
+        'pre-formatted "WebSocket /ws/updates?token=[REDACTED]" 403',
+    ]
 
 
 def test_docs_are_disabled(client):
