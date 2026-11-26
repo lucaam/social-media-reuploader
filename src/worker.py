@@ -113,7 +113,10 @@ def _float_setting(name: str) -> float:
 
 
 def _effective_mode() -> str:
-    """``webhook`` only when it is configured with a URL (like the entrypoint)."""
+    """``webhook`` only when it is configured with a URL (like the entrypoint).
+
+    A fallback: the bot knows the mode it runs in (``WorkerPool.mode``).
+    """
     mode = str(_setting("MODE") or "polling").lower()
     if mode == "webhook" and getattr(config, "WEBHOOK_URL", None):
         return "webhook"
@@ -235,11 +238,17 @@ def recover_crashed(request_id: int, *, max_attempts: int) -> bool:
 class WorkerPool:
     """Accepts links (:meth:`submit`) and processes the queue (see module doc)."""
 
-    def __init__(self, token: str, workers: int | None = None) -> None:
+    def __init__(
+        self, token: str, workers: int | None = None, *, mode: str | None = None
+    ) -> None:
         if workers is None:
             workers = int(_setting("WORKERS"))
         self.token = token
         self.workers = max(1, int(workers))
+        # How the bot receives updates ("polling"/"webhook"), published in the
+        # heartbeat; the bot sets it (``python -m src.main`` forces webhook
+        # whatever MODE says). None: derived from the configuration.
+        self.mode = mode
         self.limiter = RateLimiter()
         self._chat_locks: dict[int, _ChatLock] = {}
         self._jobs: dict[int, _Job] = {}
@@ -305,7 +314,7 @@ class WorkerPool:
             "Worker pool started: %d slot(s), poll every %.1fs, mode %s",
             self.workers,
             _float_setting("WORKER_POLL_SECONDS"),
-            _effective_mode(),
+            self.mode or _effective_mode(),
         )
 
     async def _prepare_start(self) -> None:
@@ -950,7 +959,7 @@ class WorkerPool:
             "version": __version__,
             "started_at": self._started_at,
             "state": state,
-            "mode": _effective_mode(),
+            "mode": self.mode or _effective_mode(),
             "workers": self.workers,
             "running": [job.state.as_status() for job in self._jobs.values()],
             "queued": int(counts.get("queued", 0)),

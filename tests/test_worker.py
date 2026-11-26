@@ -1973,6 +1973,25 @@ def test_heartbeat_publishes_the_pool_status(env):
     assert final["running"] == []
 
 
+def test_heartbeat_publishes_the_mode_the_bot_runs_in(env):
+    # `python -m src.main` runs the webhook whatever MODE (here polling) says.
+    assert config.MODE == "polling"
+
+    async def scenario():
+        pool = worker.WorkerPool(TOKEN, mode="webhook")
+        await pool.start()
+        try:
+            await wait_until(lambda: db.get_worker_status() is not None)
+            return db.get_worker_status()["mode"], pool
+        finally:
+            await pool.stop()
+
+    published, pool = run(scenario())
+    assert published == "webhook"
+    pool.mode = None  # unknown: derived from the configuration
+    assert pool.status_payload()["mode"] == "polling"
+
+
 def test_start_recovers_interrupted_requests(env):
     interrupted = new_request(chat_id=42, message_id=1)
     claim(interrupted)  # 'processing' when the previous process died
