@@ -28,11 +28,15 @@ Design notes:
   ``config.ALLOW_COLLECTION_LINKS`` is true: posting a channel link must not
   make the bot re-upload the channel.
 * A few share/short links that no extractor claims (``fb.watch``,
-  ``facebook.com/share/...``, ``v.redd.it``, ``pin.it``, ...) can be resolved
-  with :func:`resolve_short_link`: only for a fixed allowlist of hosts of
-  supported providers, HTTPS only, short timeout, at most 3 redirects, never
-  visiting hosts outside the provider's own domains. The final URL must still
-  pass :func:`match_provider`.
+  ``facebook.com/share/...``, ``v.redd.it``, ``pin.it``, ``t.co``, ...) can be
+  resolved with :func:`resolve_short_link`: only for a fixed allowlist of
+  hosts of supported providers, HTTPS only, short timeout, at most 3
+  redirects, never visiting hosts outside the provider's own domains. The
+  final URL must still pass :func:`match_provider`.
+* Open redirectors (``href.li``, ``consent.youtube.com``, Facebook's link
+  warnings, ``t.co``) are never matched themselves: yt-dlp would hand their
+  target to another extractor without the checks above. Their target is
+  unwrapped offline (or resolved, for ``t.co``) and checked instead.
 * Everything except the extractor lookup is pure string processing and safe to
   call from any thread or from the event loop.
 """
@@ -496,12 +500,17 @@ _HOST_ALIASES = {
     "fxbsky.app": "bsky.app",
     "m.bilibili.com": "www.bilibili.com",
 }
-# Outbound-link wrappers: host -> (path, query parameter holding the target).
-_REDIRECT_WRAPPERS = {
+# Outbound-link wrappers and open redirectors: host -> (path, query parameter
+# holding the target; None when the whole query string is the target).
+_REDIRECT_WRAPPERS: dict[str, tuple[str, str | None]] = {
     "l.facebook.com": ("/l.php", "u"),
     "lm.facebook.com": ("/l.php", "u"),
     "l.instagram.com": ("/", "u"),
+    "consent.youtube.com": ("/m", "continue"),  # YouTube's cookie consent page
+    "href.li": ("/", None),  # https://href.li/?<url>
 }
+# Facebook's external link warning (any facebook.com host): /flx/warn/?u=<url>.
+_FACEBOOK_LINK_WARNING = "/flx/warn"
 
 
 @dataclass(frozen=True)
@@ -596,14 +605,29 @@ def _youtube_video_id(parsed: _Url) -> str | None:
     return found.group(1) if found else None
 
 
-def _unwrap(parsed: _Url) -> _Url:
-    """Resolve outbound-link wrappers and retired short domains offline."""
+def _wrapped_target(parsed: _Url) -> str | None:
+    """The URL behind an outbound-link wrapper or open redirector, if any."""
     wrapper = _REDIRECT_WRAPPERS.get(parsed.host)
     if wrapper is not None and parsed.path == wrapper[0]:
-        target = clean_url(_query_value(parsed.query, wrapper[1]) or "")
-        unwrapped = _parse(target) if target else None
-        if unwrapped is not None:
-            return unwrapped
+        name = wrapper[1]
+        if name is not None:
+            return _query_value(parsed.query, name)
+        fragment = f"#{parsed.fragment}" if parsed.fragment else ""
+        return parsed.query + fragment if parsed.query else None
+    if (
+        _host_in(parsed.host, ("facebook.com",))
+        and parsed.path.rstrip("/") == _FACEBOOK_LINK_WARNING
+    ):
+        return _query_value(parsed.query, "u")
+    return None
+
+
+def _unwrap(parsed: _Url) -> _Url:
+    """Resolve outbound-link wrappers and retired short domains offline."""
+    target = clean_url(_wrapped_target(parsed) or "")
+    unwrapped = _parse(target) if target else None
+    if unwrapped is not None:
+        return unwrapped
     if _host_in(parsed.host, _YOUTUBE_DOMAINS) and parsed.path == "/attribution_link":
         inner = _query_value(parsed.query, "u") or ""
         if inner.startswith("/"):
@@ -755,8 +779,19 @@ def normalize_url(url: str) -> str:
 # ---------------------------------------------------------------------------
 # yt-dlp extractor registry
 # ---------------------------------------------------------------------------
-# Never used for matching (Generic would accept any page).
-_EXCLUDED_KEYS = frozenset({"Generic"})
+# Never used for matching: Generic would accept any page, and the open
+# redirectors hand any URL to another extractor, skipping every check of
+# check_link() (block lists, collections, dedupe). Their targets are unwrapped
+# offline (_unwrap) or resolved as share links (t.co) and checked instead.
+_EXCLUDED_KEYS = frozenset(
+    {
+        "Generic",
+        "FacebookRedirectURL",
+        "HrefLiRedirect",
+        "TwitterShortener",
+        "YoutubeConsentRedirect",
+    }
+)
 # Families of error-only extractors (KnownDRM, KnownPiracy, ...).
 _UNSUPPORTED_FAMILIES = frozenset({"unsupported", "commonmistakes"})
 # Collections whose _RETURN_TYPE is not "playlist" (feeds, channel tabs, ...).
@@ -1137,11 +1172,15 @@ class _ShortLinkRule:
     host: str
     domains: tuple[str, ...]  # hosts the resolver may visit for this rule
     path: re.Pattern[str] | None = None  # required path; None = any non-root path
+    user_agent: str | None = None  # instead of the configured/browser one
 
 
 # Share links of supported providers that no yt-dlp extractor claims
-# (verified against yt-dlp 2026.11.23).
+# (verified against yt-dlp 2026.11.23). t.co is X's shortener for any link:
+# it redirects non-browser clients only (browsers get an HTML page), like
+# yt-dlp's own TwitterShortener extractor, which is excluded above.
 _SHORT_LINK_RULES = (
+    _ShortLinkRule("t.co", ("t.co",), user_agent="curl"),
     _ShortLinkRule("fb.watch", ("fb.watch", "facebook.com")),
     _ShortLinkRule("fb.me", ("fb.me", "facebook.com")),
     _ShortLinkRule("facebook.com", ("facebook.com",), re.compile(r"/share/")),
@@ -1223,9 +1262,12 @@ class _ResolveCache:
 _resolve_cache = _ResolveCache()
 
 
-def _resolve_headers() -> dict[str, str]:
+def _resolve_headers(rule: _ShortLinkRule) -> dict[str, str]:
+    user_agent = (
+        rule.user_agent or getattr(config, "YTDLP_USER_AGENT", None) or _BROWSER_UA
+    )
     return {
-        "User-Agent": getattr(config, "YTDLP_USER_AGENT", None) or _BROWSER_UA,
+        "User-Agent": user_agent,
         "Accept": "text/html,application/xhtml+xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "it-IT,it;q=0.9,en;q=0.8",
     }
@@ -1246,7 +1288,7 @@ def _with_https(url: str) -> str:
 
 
 async def _fetch_location(
-    session: aiohttp.ClientSession, url: str, timeout: float
+    session: aiohttp.ClientSession, url: str, timeout: float, rule: _ShortLinkRule
 ) -> str | None:
     """``Location`` of a redirect response, or ``None`` (body never read)."""
     try:
@@ -1254,7 +1296,7 @@ async def _fetch_location(
             url,
             allow_redirects=False,
             timeout=aiohttp.ClientTimeout(total=timeout),
-            headers=_resolve_headers(),
+            headers=_resolve_headers(rule),
             proxy=_resolve_proxy(),
         ) as resp:
             if resp.status in _REDIRECT_STATUSES:
@@ -1276,7 +1318,7 @@ async def _follow(
     session = await http_client.get_session()
     current = _with_https(url)
     for _hop in range(max_redirects):
-        location = await _fetch_location(session, current, timeout)
+        location = await _fetch_location(session, current, timeout, rule)
         if not location:
             return None
         target = clean_url(urljoin(current, location))

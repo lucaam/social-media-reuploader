@@ -456,6 +456,29 @@ def test_refusal_reason_texts(monkeypatch, telegram, url, expected):
     assert SITES not in telegram["messages"][0]["text"]
 
 
+@pytest.mark.parametrize(
+    ("url", "expected"),
+    [
+        ("https://href.li/?https://www.tiktok.com/@user/video/1", "disattivati"),
+        (
+            (
+                "https://consent.youtube.com/m?continue=https%3A%2F%2Fwww.youtube.com"
+                "%2F%40MrBeast&gl=NL"
+            ),
+            "profilo, di un canale o di una playlist",
+        ),
+    ],
+)
+def test_open_redirectors_are_refused_like_their_target(
+    monkeypatch, telegram, url, expected
+):
+    monkeypatch.setattr(config, "BLOCKED_PROVIDERS", ("tiktok",))
+    pool = feed(text_update(url, url))
+
+    assert pool.calls == []
+    assert expected in telegram["messages"][0]["text"]
+
+
 def test_different_reasons_share_one_reply(telegram):
     collection, unsupported = (
         "https://www.youtube.com/@MrBeast",

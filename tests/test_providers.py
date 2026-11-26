@@ -7,6 +7,7 @@ resolution is tested with a fake HTTP session.
 
 import asyncio
 import threading
+from urllib.parse import quote
 
 import aiohttp
 import pytest
@@ -604,7 +605,6 @@ SUPPORTED = [
         "Twitter",
         "X (Twitter)",
     ),
-    ("https://t.co/AbCdEf1234", "TwitterShortener", "X (Twitter)"),
     # Reddit
     (
         "https://www.reddit.com/r/videos/comments/1abcde/some_title/",
@@ -742,6 +742,10 @@ REFUSED = [
     ("https://www.tiktok.com/@user/photo/7234567890123456789", Rejection.UNSUPPORTED),
     # Known DRM sites are answered by an error-only extractor.
     ("https://open.spotify.com/episode/0AbCdEfGhIjKlMnOpQrStU", Rejection.UNSUPPORTED),
+    # Open redirectors with nothing to unwrap are never matched themselves.
+    ("https://consent.youtube.com/m?gl=NL&hl=en", Rejection.UNSUPPORTED),
+    ("https://href.li/", Rejection.UNSUPPORTED),
+    ("https://www.facebook.com/flx/warn/?h=AT0abc", Rejection.UNSUPPORTED),
     # Collections (profiles, channels, playlists, albums, feeds).
     ("https://www.youtube.com/@MrBeast", Rejection.COLLECTION),
     ("https://www.youtube.com/channel/UC_x5XG1OV2P6uZZ5FSM9Ttw", Rejection.COLLECTION),
@@ -812,6 +816,46 @@ def test_check_link_reports_the_claiming_extractor():
     assert result.reason is None
 
 
+@pytest.mark.parametrize(
+    "template",
+    [
+        "https://href.li/?{url}",
+        "https://consent.youtube.com/m?continue={quoted}&gl=NL&m=0&pc=yt&hl=en",
+        "https://www.facebook.com/flx/warn/?h=AT0abc&u={quoted}&s=1",
+        "https://m.facebook.com/flx/warn?u={quoted}",
+    ],
+)
+def test_open_redirectors_are_checked_like_their_target(monkeypatch, template):
+    """yt-dlp would hand the target to any extractor, skipping every check."""
+
+    def wrap(url):
+        return template.format(url=url, quoted=quote(url, safe=""))
+
+    channel = "https://www.youtube.com/@MrBeast"
+    check = providers.check_link(wrap(channel))
+    assert (check.reason, check.url) == (Rejection.COLLECTION, channel)
+
+    vimeo = "https://vimeo.com/123456789"
+    match = providers.match_provider(wrap(vimeo))
+    assert (match.key, match.url) == ("Vimeo", vimeo)
+    assert match.normalized_url == providers.normalize_url(vimeo)  # dedupe
+
+    monkeypatch.setattr(config, "BLOCKED_PROVIDERS", ("tiktok",))
+    video = "https://www.tiktok.com/@user/video/7234567890123456789"
+    assert providers.check_link(wrap(video)).reason is Rejection.BLOCKED
+
+
+def test_open_redirector_extractors_are_never_used():
+    registry = providers._registry()
+    for key in (
+        "FacebookRedirectURL",
+        "HrefLiRedirect",
+        "TwitterShortener",
+        "YoutubeConsentRedirect",
+    ):
+        assert key not in registry.by_key
+
+
 SHORT_LINKS = [
     "https://fb.watch/abcDEF123/",
     "https://fb.me/abcdef",
@@ -828,6 +872,7 @@ SHORT_LINKS = [
     "https://b23.tv/AbCdEf1",
     "https://t.snapchat.com/AbCdEf12",
     "https://lnkd.in/AbCdEf12",
+    "https://t.co/AbCdEf1234",
 ]
 
 
@@ -1299,6 +1344,15 @@ def test_resolve_stops_outside_the_provider_domains(fake_session):
     )
     assert asyncio.run(providers.resolve_short_link("https://lnkd.in/AbCdEf12")) is None
     assert len(session.calls) == 1
+
+
+def test_resolve_t_co_with_a_non_browser_user_agent(fake_session, monkeypatch):
+    # t.co answers browsers with an HTML page instead of a redirect.
+    monkeypatch.setattr(config, "YTDLP_USER_AGENT", "Custom/1.0", raising=False)
+    session = fake_session({"https://t.co/AbCdEf1234": FakeResponse(301, YT)})
+    match = asyncio.run(providers.match_provider_async("https://t.co/AbCdEf1234"))
+    assert (match.key, match.url) == ("Youtube", YT)
+    assert session.calls[0][1]["headers"]["User-Agent"] == "curl"
 
 
 def test_resolve_accepts_supported_target_without_fetching_it(fake_session):
