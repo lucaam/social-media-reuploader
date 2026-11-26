@@ -307,6 +307,12 @@ class WorkerPool:
 
     async def _prepare_start(self) -> None:
         await db.aio(db.init_db)
+        # Rows the last process was working on carry its 👀 reaction.
+        interrupted = await db.aio(
+            db.list_requests,
+            db.MAX_PAGE_SIZE,
+            status=(db.Status.PROCESSING, db.Status.SENDING),
+        )
         counts = await db.aio(
             db.recover_interrupted,
             rehydrate=bool(_setting("WORKER_REHYDRATE_ON_START")),
@@ -314,6 +320,7 @@ class WorkerPool:
         )
         if any(counts.values()):
             logger.info("Recovered requests interrupted by the last run: %s", counts)
+        await self._clear_stale_reactions(interrupted)
         root = str(pipeline.setting("TMP_DIR"))
         try:
             await asyncio.to_thread(_make_dir, root)
@@ -321,6 +328,32 @@ class WorkerPool:
             logger.error("Cannot create TMP_DIR %s: %s", root, exc.strerror or exc)
             return
         await self._sweep_workdirs(startup=True)
+
+    async def _clear_stale_reactions(self, rows: list[dict[str, Any]]) -> None:
+        """Remove the 👀 of interrupted rows the recovery settled for good
+        (failed or aborted): nothing would ever replace it. Requeued rows
+        keep it; they are processed again."""
+        for row in rows:
+            current = await db.aio(db.get_request, int(row["id"]))
+            if current is None or current["status"] not in db.TERMINAL_STATUSES:
+                continue
+            chat_id, message_id = current["chat_id"], current["original_message_id"]
+            if isinstance(chat_id, int) and isinstance(message_id, int):
+                self._spawn(
+                    self._clear_reaction(chat_id, message_id), f"unreact-{chat_id}"
+                )
+
+    async def _clear_reaction(self, chat_id: int, message_id: int) -> None:
+        result = await telegram_api.set_message_reaction(
+            self.token, chat_id, message_id, None
+        )
+        if not result.get("ok"):
+            logger.info(
+                "Cannot remove the reaction on message %s of chat %s: %s",
+                message_id,
+                chat_id,
+                telegram_api.redact(result.get("description"), self.token),
+            )
 
     async def stop(
         self,

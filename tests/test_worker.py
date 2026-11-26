@@ -1132,6 +1132,101 @@ def test_cancelled_server_side_fetch_is_never_resent(env):
     assert db.get_request(request_id)["error_code"] == "interrupted_while_sending"
 
 
+def test_interrupted_upload_does_not_keep_the_eyes(env):
+    request_id = new_request()
+    row = claim(request_id)
+
+    async def scenario():
+        env.tg.upload_gate = asyncio.Event()
+        env.tg.upload_started = asyncio.Event()
+        task = asyncio.create_task(process(row))
+        await env.tg.upload_started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    run(scenario())
+    assert status(request_id) == "failed"  # never retried: 👀 would be a lie
+    assert env.tg.reactions() == ["👀", None]
+    assert env.tg.texts() == []
+
+
+def test_job_cancelled_after_a_delivery_is_done_with_the_trophy(env, monkeypatch):
+    env.site.items = [make_item(i) for i in range(1, 12)]  # two album parts
+    request_id = new_request()
+    row = claim(request_id)
+    first_part = telegram_api.send_media_group  # the fake
+
+    async def scenario():
+        second_part, gate = asyncio.Event(), asyncio.Event()
+
+        async def send_media_group(token, chat_id, entries, **kwargs):
+            if env.tg.of("send_media_group"):
+                second_part.set()
+                await gate.wait()
+            return await first_part(token, chat_id, entries, **kwargs)
+
+        monkeypatch.setattr(telegram_api, "send_media_group", send_media_group)
+        task = asyncio.create_task(process(row))
+        await second_part.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+    run(scenario())
+    row = db.get_request(request_id)
+    assert (row["status"], row["media_type"]) == ("done", None)
+    assert env.tg.reactions() == ["👀", "🏆"]
+
+
+def cancel_during_mark_sending(env, monkeypatch, *, commit_first):
+    """Cancel the job while mark_sending runs in its thread."""
+    real = db.mark_sending
+    inside = threading.Event()
+
+    def slow(request_id):
+        if commit_first:  # the claim lands, then e.g. closing the connection
+            answer = real(request_id)
+            inside.set()
+            time.sleep(0.3)
+            return answer
+        inside.set()  # cancelled before the claim lands
+        time.sleep(0.3)
+        return real(request_id)
+
+    monkeypatch.setattr(db, "mark_sending", slow)
+    request_id = new_request()
+    row = claim(request_id)
+
+    async def scenario():
+        task = asyncio.create_task(process(row))
+        await asyncio.to_thread(inside.wait, 5)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        await asyncio.sleep(0.5)  # the claim's thread finishes
+
+    run(scenario())
+    return db.get_request(request_id)
+
+
+def test_claim_landing_during_a_cancellation_does_not_strand_the_row(env, monkeypatch):
+    row = cancel_during_mark_sending(env, monkeypatch, commit_first=True)
+    # A 'sending' row cannot be requeued, but it must not stay 'sending' (a
+    # pending slot, then "interrupted while uploading" at the next start).
+    assert (row["status"], row["error_code"]) == ("failed", "interrupted")
+    assert "before anything was uploaded" in row["error_message"]
+    assert env.tg.uploads() == []
+    assert env.tg.reactions() == ["👀", None]
+
+
+def test_cancellation_before_the_claim_lands_requeues_the_row(env, monkeypatch):
+    row = cancel_during_mark_sending(env, monkeypatch, commit_first=False)
+    assert row["status"] == "queued"  # the late claim is refused
+    assert env.tg.uploads() == []
+    assert env.tg.reactions() == ["👀"]  # it will be processed again
+
+
 def test_work_directory_is_removed_after_a_failure(env):
     env.site.download_errors.append(downloader.NoMedia("nothing"))
     process_new()
@@ -1866,6 +1961,36 @@ def test_start_recovers_interrupted_requests(env):
     row = db.get_request(exhausted)
     assert (row["status"], row["error_code"]) == ("failed", "interrupted")
     assert [call[1] for call in env.tg.uploads()] == [42]  # never resent
+
+
+def test_start_removes_the_eyes_of_requests_the_recovery_failed(env):
+    requeued = new_request(chat_id=42, message_id=1)
+    claim(requeued)
+    uploading = new_request(chat_id=43, message_id=2)
+    claim(uploading)
+    db.mark_sending(uploading)
+    exhausted = new_request(chat_id=44, message_id=3)
+    claim(exhausted)
+    force(exhausted, attempts=3)
+
+    def cleared():
+        return sorted(
+            (call[1], call[2][0])
+            for call in env.tg.of("set_message_reaction")
+            if call[2][1] is None
+        )
+
+    async def scenario():
+        pool = await started_pool()
+        try:
+            await wait_until(lambda: status(requeued) == "done")
+            await wait_until(lambda: len(cleared()) == 2)
+        finally:
+            await pool.stop()
+
+    run(scenario())
+    assert cleared() == [(43, 2), (44, 3)]  # the requeued one got 👀 then 🏆
+    assert [call[1] for call in env.tg.uploads()] == [42]
 
 
 def test_start_without_rehydrate_aborts_waiting_requests(env, monkeypatch):

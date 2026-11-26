@@ -21,7 +21,9 @@ Every attempt ends with exactly one outcome (:class:`Outcome`):
   already handled): nothing is sent.
 * interrupted (the task is cancelled by a shutdown): the row goes back to the
   queue, or to ``failed``/``interrupted_while_sending`` when an upload may
-  already have reached Telegram; the ``CancelledError`` propagates.
+  already have reached Telegram (``failed``/``interrupted`` when the upload
+  was claimed but nothing was sent: a claimed row cannot be requeued); the
+  👀 of a request that is over is removed; the ``CancelledError`` propagates.
 
 Outcome writes are retried on database errors; one the database keeps
 refusing is returned as ``JobResult.settlement`` and written later by the
@@ -645,8 +647,9 @@ class RequestProcessor:
         self.state = state
         self.request = request
         self.feedback = Feedback(token, request)
+        self._claim_started = False  # mark_sending was called (it may still land)
         self._sending = False  # mark_sending succeeded: the row is 'sending'
-        self._send_in_flight = False  # a URL send may reach Telegram (row 'processing')
+        self._send_in_flight = False  # a send (URL fetch or upload) may reach Telegram
         self._delivered = False  # something was posted: never retry or fail it
         self._delivery: Delivery | None = None  # what was posted, once known
         self._method = "local"  # how the media reaches Telegram
@@ -719,6 +722,8 @@ class RequestProcessor:
         self._stage(Stage.CONVERTING)
         items = await self._prepare_all(files, workdir)
         self._kind = common_kind(ready.kind for ready in items)
+        # Its thread commits even if the job is cancelled meanwhile.
+        self._claim_started = True
         if not await db.aio(db.mark_sending, self.request.id):
             return await self._skipped("mark_sending refused")
         self._sending = True
@@ -910,7 +915,9 @@ class RequestProcessor:
         """Run one claimed upload; retry it in place only when it surely failed."""
         attempt = 0
         while True:
+            self._send_in_flight = True  # cleared only when Telegram answered
             result = await send()
+            self._send_in_flight = False
             if result.get("ok"):
                 self._delivered = True
                 return result
@@ -1171,22 +1178,11 @@ class RequestProcessor:
     async def _interrupted(self) -> None:
         """The job is being cancelled (shutdown): leave the row recoverable."""
         request = self.request
-        maybe_posted = self.maybe_posted
+        over = self.maybe_posted  # if nothing can be recorded: never retried
         try:
-            if self._delivered:
-                await db.aio(db.mark_done, request.id)
-            elif maybe_posted:
-                await db.aio(
-                    db.mark_failed,
-                    request.id,
-                    error_code="interrupted_while_sending",
-                    error_message="worker stopped during the upload; not resent",
-                )
-            else:
-                await db.aio(
-                    db.defer_request, request.id, db.now_iso(), reason="worker stopped"
-                )
+            outcome, over = await self._record_interruption()
         except sqlite3.Error:
+            outcome = "not recorded"
             logger.warning(
                 "Request %s: cannot record the interruption; recovery at the next "
                 "start will settle it",
@@ -1197,11 +1193,48 @@ class RequestProcessor:
             "Request %s interrupted during %s (%s)",
             request.id,
             self.state.stage,
-            "upload outcome unknown" if maybe_posted else "back in the queue",
+            outcome,
         )
         with contextlib.suppress(TimeoutError):
             async with asyncio.timeout(CANCEL_CLEANUP_SECONDS):
+                if self._delivered:
+                    await self.feedback.finish(REACTION_DONE)
+                elif over:
+                    await self.feedback.clear_reaction()  # no 👀 on a dead request
                 await self.feedback.clear_status()
+
+    async def _record_interruption(self) -> tuple[str, bool]:
+        """Settle the row of a cancelled job: (log text, is the request over)."""
+        request_id = self.request.id
+        if self._delivered:
+            delivery = self._delivery or UNKNOWN_DELIVERY
+            await db.aio(db.mark_done, request_id, **delivery.row_fields())
+            return "delivered", True
+        if self._send_in_flight:
+            await db.aio(
+                db.mark_failed,
+                request_id,
+                error_code="interrupted_while_sending",
+                error_message="worker stopped during the upload; not resent",
+            )
+            return "upload outcome unknown; not resent", True
+        if not self._sending and await db.aio(
+            db.defer_request, request_id, db.now_iso(), reason="worker stopped"
+        ):
+            return "back in the queue", False
+        # Not 'processing': the upload was claimed (mark_sending may also have
+        # landed while the job was being cancelled), yet nothing was sent. A
+        # 'sending' row cannot go back to the queue: fail it saying so (an
+        # admin can requeue it) instead of leaving it to the next start, which
+        # would call it interrupted while uploading.
+        if (self._sending or self._claim_started) and await db.aio(
+            db.mark_failed,
+            request_id,
+            error_code="interrupted",
+            error_message="worker stopped before anything was uploaded; not resent",
+        ):
+            return "nothing uploaded, but a claimed upload cannot be requeued", True
+        return "not requeued: the row was no longer processing", False
 
     async def _cleanup(self) -> None:
         path = self.state.workdir
