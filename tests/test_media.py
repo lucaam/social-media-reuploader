@@ -616,7 +616,7 @@ def test_conversion_timeout_is_a_permanent_conversion_failure(monkeypatch, tmp_p
         )
     err = excinfo.value
     assert isinstance(err, ConversionFailed) and not isinstance(err, DownloadTimeout)
-    assert err.code == "conversion_failed"
+    assert err.code == "conversion_timeout"
     assert err.retryable is False
     assert "TRANSCODE_TIMEOUT" in err.detail
     assert not (tmp_path / "in0.tg.mp4").exists()  # partial output removed

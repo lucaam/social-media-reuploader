@@ -341,7 +341,8 @@ def test_error_classes_follow_the_contract():
     # of the site: same code and user text as any failed conversion
     assert issubclass(ConversionTimeout, ConversionFailed)
     assert not issubclass(ConversionTimeout, DownloadTimeout)
-    assert ConversionTimeout.code == ConversionFailed.code == "conversion_failed"
+    assert ConversionTimeout.code == "conversion_timeout"
+    assert ConversionFailed.code == "conversion_failed"
     assert ConversionTimeout("t").retryable is False
 
 

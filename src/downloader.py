@@ -170,8 +170,12 @@ class ConversionTimeout(ConversionFailed):
 
     Not retryable, unlike :class:`DownloadTimeout`: the same input on the same
     CPU would be just as slow, and a retry downloads and converts everything
-    again. The code stays ``conversion_failed`` (same user text and label).
+    again. The wait for a free encoder slot is not counted against the limit,
+    so contention with other jobs cannot cause it. Own code (and user text)
+    ``conversion_timeout``.
     """
+
+    code = "conversion_timeout"
 
 
 # ---------------------------------------------------------------------------

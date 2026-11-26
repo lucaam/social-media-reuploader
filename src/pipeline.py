@@ -346,17 +346,6 @@ class SendForbidden(SendFailed):
     code = "forbidden"
 
 
-class ConversionTimeout(DownloadError):
-    """``TRANSCODE_TIMEOUT`` ran out while converting (media's DownloadTimeout).
-
-    Not a download timeout: another attempt would download the file again
-    and run the same encode. Retryable only when other jobs were converting
-    at the same time (see :data:`_converting`).
-    """
-
-    code = "conversion_timeout"
-
-
 _CONNECT_FAILURES = ("ClientConnector", "ConnectionTimeoutError")
 _LOCAL_SEND_FAILURES = (
     "cannot read file",
@@ -610,11 +599,6 @@ class Feedback:
 # ---------------------------------------------------------------------------
 # The processor
 # ---------------------------------------------------------------------------
-# Jobs converting files right now. They share media's encoder slots
-# (TRANSCODE_CONCURRENCY) and media counts the wait for a slot in
-# TRANSCODE_TIMEOUT, so a conversion timeout is worth a retry only for a job
-# that did not have the encoder to itself.
-_converting: set[RequestProcessor] = set()
 
 
 async def process(token: str, row: Mapping[str, Any], state: JobState) -> JobResult:
@@ -654,7 +638,6 @@ class RequestProcessor:
         self._delivery: Delivery | None = None  # what was posted, once known
         self._method = "local"  # how the media reaches Telegram
         self._kind: str | None = None  # "video"/"audio" (None: not known yet/mixed)
-        self._encoder_shared = False  # another job converted at the same time
 
     @property
     def maybe_posted(self) -> bool:
@@ -820,27 +803,20 @@ class RequestProcessor:
         max_bytes = int(setting("TELEGRAM_MAX_FILE_SIZE"))
         ready: list[PreparedItem] = []
         errors: list[DownloadError] = []
-        _converting.add(self)
-        if len(_converting) > 1:
-            for job in _converting:
-                job._encoder_shared = True
-        try:
-            for downloaded in files:
-                try:
-                    ready.append(await self._prepare(downloaded, workdir, max_bytes))
-                except DownloadError as err:
-                    if len(files) == 1:
-                        raise
-                    logger.warning(
-                        "Request %s: item %s skipped: [%s] %s",
-                        self.request.id,
-                        downloaded.item.index,
-                        err.code,
-                        err.detail,
-                    )
-                    errors.append(err)
-        finally:
-            _converting.discard(self)
+        for downloaded in files:
+            try:
+                ready.append(await self._prepare(downloaded, workdir, max_bytes))
+            except DownloadError as err:
+                if len(files) == 1:
+                    raise
+                logger.warning(
+                    "Request %s: item %s skipped: [%s] %s",
+                    self.request.id,
+                    downloaded.item.index,
+                    err.code,
+                    err.detail,
+                )
+                errors.append(err)
         if not ready:
             raise errors[0] if errors else NoMedia("nothing to send")
         return ready
@@ -848,17 +824,12 @@ class RequestProcessor:
     async def _prepare(
         self, downloaded: DownloadedFile, workdir: str, max_bytes: int
     ) -> PreparedItem:
-        try:
-            prepared = await media.prepare_for_telegram(
-                downloaded.path, workdir, max_bytes=max_bytes
-            )
-        except downloader.DownloadTimeout as err:
-            # Alone, the encode itself was too slow: a retry would repeat it.
-            raise ConversionTimeout(
-                err.detail,
-                retryable=self._encoder_shared,
-                stderr_tail=err.stderr_tail,
-            ) from err
+        # A too slow conversion raises downloader.ConversionTimeout (code
+        # conversion_timeout, not retryable: a retry would repeat the same
+        # encode); media does not count the wait for an encoder slot.
+        prepared = await media.prepare_for_telegram(
+            downloaded.path, workdir, max_bytes=max_bytes
+        )
         probe = prepared.probe
         if probe.has_video:
             kind = "video"
