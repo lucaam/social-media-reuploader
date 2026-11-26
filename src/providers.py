@@ -1075,10 +1075,12 @@ def check_link(url: str) -> LinkCheck:
     host = _host_of(canonical)
     if entry.key in _INVALID_LINK_KEYS:
         reason = Rejection.INVALID
+    elif entry.collection and not _collections_allowed():
+        # Refused by policy whether or not the extractor works: "retry later"
+        # would be wrong (many profile extractors, e.g. Instagram's, are broken).
+        reason = Rejection.COLLECTION
     elif not entry.working:
         reason = Rejection.BROKEN
-    elif entry.collection and not _collections_allowed():
-        reason = Rejection.COLLECTION
     elif not _provider_allowed(entry, host):
         reason = Rejection.BLOCKED
     if reason is not None:

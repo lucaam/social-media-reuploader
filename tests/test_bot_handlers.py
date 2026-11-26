@@ -434,7 +434,15 @@ def test_unsupported_link_reply_policy(
     ("url", "expected"),
     [
         ("https://www.youtube.com/@MrBeast", "profilo, di un canale o di una playlist"),
-        ("https://www.instagram.com/someuser/", "temporaneamente fuori servizio"),
+        # A profile whose extractor is also broken: still a profile.
+        (
+            "https://www.instagram.com/someuser/",
+            "profilo, di un canale o di una playlist",
+        ),
+        (
+            "https://www.cbssports.com/college-football/video/cover-3-stanford-spring-gleaning/",
+            "temporaneamente fuori servizio",
+        ),
         (f"https://www.youtube.com/watch?v={YT_ID[:3]}", "Link non valido"),
         ("https://www.tiktok.com/@user/video/7234567890123456789", "disattivati"),
     ],

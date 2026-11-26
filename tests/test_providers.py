@@ -762,8 +762,14 @@ REFUSED = [
     ("https://www.pinterest.com/someuser/some-board/", Rejection.COLLECTION),
     ("https://someartist.bandcamp.com/album/some-album", Rejection.COLLECTION),
     ("https://www.twitch.tv/someuser/videos", Rejection.COLLECTION),
+    # A collection even though yt-dlp marks the extractor as broken: retrying
+    # later would not help.
+    ("https://www.instagram.com/someuser/", Rejection.COLLECTION),
     # yt-dlp marks the extractor as broken.
-    ("https://www.instagram.com/someuser/", Rejection.BROKEN),
+    (
+        "https://www.cbssports.com/college-football/video/cover-3-stanford-spring-gleaning/",
+        Rejection.BROKEN,
+    ),
     # Truncated id: yt-dlp would only print an error.
     ("https://www.youtube.com/watch?v=abc", Rejection.INVALID),
     # Telegram's own links.
@@ -991,7 +997,9 @@ def test_allow_collection_links(monkeypatch):
     assert match is not None
     assert match.key == "YoutubeTab"
     # Broken extractors stay refused.
-    assert providers.match_provider("https://www.instagram.com/someuser/") is None
+    assert providers.check_link("https://www.instagram.com/someuser/").reason is (
+        Rejection.BROKEN
+    )
 
 
 # ---------------------------------------------------------------------------
