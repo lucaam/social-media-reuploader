@@ -47,8 +47,15 @@ Documentazione completa: <https://lucaam.github.io/social-media-reuploader/>
 |---|---|---|
 | Link non supportato | risposta con l'elenco dei siti supportati (`UNSUPPORTED_LINK_REPLY=private`, default) | nessuna risposta (salvo `UNSUPPORTED_LINK_REPLY=always`) |
 | Link rifiutato (rate limit, troppi link in coda, duplicato) | messaggio con il motivo e quando riprovare (avvisi limitati da `NOTIFY_*_THROTTLE_SECONDS`) | nessun messaggio |
-| Errore (contenuto privato, rimosso, troppo lungo, troppo grande, live, ...) | messaggio con il motivo | solo la reazione 🍌 |
+| Errore (contenuto privato, rimosso, troppo lungo, live, ...) | messaggio con il motivo | solo la reazione 🍌 |
+| Errore "troppo grande" (vedi [Limiti](#limiti)) | messaggio con il motivo e il link originale | uguale |
 | Successo | media in risposta al messaggio, reazione 🏆 | uguale |
+
+Se Telegram rifiuta le reazioni (reazioni disattivate o limitate nella chat,
+messaggio originale già cancellato), il bot risponde al link con "In lavorazione
+👀", anche nei gruppi: il messaggio viene cancellato quando il media arriva e
+diventa la spiegazione dell'errore se la richiesta fallisce. Dopo un rifiuto il
+bot non riprova le reazioni in quella chat per `REACTION_DISABLE_SECONDS`.
 
 I testi per gli utenti sono in italiano. Se un messaggio viene modificato,
 vengono elaborati solo i link nuovi.
@@ -227,7 +234,7 @@ mappa `env` di `values.yaml` (numeri e booleani vengono resi come stringhe).
 | `WORKER_POLL_SECONDS` | `2` | Ogni quanto il worker controlla la coda nel database, ad esempio per le richieste rimesse in coda dalla GUI (min 0.2). Nome legacy: `WORKER_PERIODIC_REHYDRATE_SECONDS`. |
 | `WORKER_HEARTBEAT_SECONDS` | `5` | Ogni quanto il worker pubblica il proprio stato per la GUI. |
 | `WORKER_SHUTDOWN_TIMEOUT` | `30` | Secondi concessi alle richieste in corso allo spegnimento prima di annullarle (il chart usa il grace period del pod meno 15 secondi). Docker deve concedere al container almeno questo valore più 45 secondi prima di ucciderlo (`stop_grace_period: 75s` in `docker-compose.yml`, `--stop-timeout` con `docker run`). |
-| `WORKER_MAX_ATTEMPTS` | `3` | Tentativi massimi di una richiesta interrotta da crash o riavvii. |
+| `WORKER_MAX_ATTEMPTS` | `3` | Tentativi massimi di una richiesta: ogni presa in carico da parte del worker conta come un tentativo, anche se viene interrotta da uno spegnimento. Arrivati a questo numero gli errori temporanei non vengono più ritentati e una richiesta interrotta da un crash viene segnata come fallita all'avvio successivo. "Rimetti in coda" dalla GUI azzera il conteggio. |
 | `WORKER_RETRY_BACKOFF_SECONDS` | `30` | Base del backoff esponenziale per gli errori temporanei (30, 60, 120 s, ... fino a 15 minuti, mai meno del `retry_after` di Telegram). |
 
 #### Database e retention

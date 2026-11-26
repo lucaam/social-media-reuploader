@@ -286,7 +286,9 @@ env:
   # Seconds to let running jobs finish on shutdown before cancelling them.
   # Default: terminationGracePeriodSeconds - 15.
   WORKER_SHUTDOWN_TIMEOUT: null
-  # Max attempts of a request across crashes/restarts (default 3).
+  # Max attempts of a request (default 3). Every run counts, also one cut short
+  # by a shutdown; then temporary errors are no longer retried and a run cut
+  # short by a crash is marked failed at the next start.
   WORKER_MAX_ATTEMPTS: null
   # Base of the exponential backoff for retryable failures (default 30 s).
   WORKER_RETRY_BACKOFF_SECONDS: null

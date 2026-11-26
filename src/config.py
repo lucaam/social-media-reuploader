@@ -390,7 +390,9 @@ WORKER_HEARTBEAT_SECONDS: float = env_float(
 )
 # Seconds to wait for running jobs on shutdown before cancelling them.
 WORKER_SHUTDOWN_TIMEOUT: int = env_int("WORKER_SHUTDOWN_TIMEOUT", 30, minimum=0)
-# A request is retried at most this many times after crashes/restarts.
+# Max attempts of a request: every claim counts (also a run cut short by a
+# shutdown). Temporary errors are retried, and runs cut short by a crash
+# resumed, only while fewer attempts were made.
 WORKER_MAX_ATTEMPTS: int = env_int("WORKER_MAX_ATTEMPTS", 3, minimum=1)
 # Base of the exponential backoff for retryable failures (30, 60, 120 s ...,
 # capped at 15 minutes and never shorter than Telegram's retry_after).

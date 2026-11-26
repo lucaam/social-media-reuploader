@@ -52,10 +52,22 @@ Nelle **chat private** il bot spiega sempre cosa succede (in italiano):
 - errore: contenuto privato o che richiede il login, rimosso, bloccato nel
   paese, diretta, troppo lungo, troppo grande, nessun video nel post, ...
 
-Nei **gruppi e nei canali** il bot non scrive messaggi per i rifiuti, per non
-disturbare: i link non supportati vengono ignorati (salvo
-`UNSUPPORTED_LINK_REPLY=always`) e gli errori sono indicati solo dalla reazione
-🍌.
+Nei **gruppi e nei canali** il bot scrive il meno possibile, per non
+disturbare:
+
+- i link non supportati vengono ignorati (salvo
+  `UNSUPPORTED_LINK_REPLY=always`) e i link rifiutati (rate limit, coda,
+  duplicati) non ricevono messaggi;
+- gli errori sono indicati dalla reazione 🍌, tranne "troppo grande" (vedi
+  [Limiti](#limiti)): il bot risponde con il motivo e il link originale, così
+  il contenuto si può aprire lo stesso.
+
+Se Telegram rifiuta le reazioni (reazioni disattivate o limitate nella chat,
+messaggio originale già cancellato), in qualsiasi chat, gruppi compresi, il bot
+risponde al link con "In lavorazione 👀": il messaggio viene cancellato quando
+il media arriva e diventa la spiegazione dell'errore se la richiesta fallisce.
+Dopo un rifiuto il bot non riprova le reazioni in quella chat per
+`REACTION_DISABLE_SECONDS` (5 minuti).
 
 Gli avvisi ripetuti alla stessa chat sono limitati
 (`NOTIFY_RATE_THROTTLE_SECONDS`, `NOTIFY_DUPLICATE_THROTTLE_SECONDS`).
