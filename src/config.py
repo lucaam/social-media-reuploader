@@ -441,6 +441,11 @@ def validate() -> list[str]:
             "TELEGRAM_MAX_FILE_SIZE is above 50 MB: this only works with a local "
             "Bot API server"
         )
+    if TELEGRAM_MAX_FILE_SIZE > MAX_DOWNLOAD_BYTES:
+        problems.append(
+            "TELEGRAM_MAX_FILE_SIZE is above MAX_DOWNLOAD_BYTES: files larger than "
+            "MAX_DOWNLOAD_BYTES are never downloaded, raise both together"
+        )
     return problems
 
 

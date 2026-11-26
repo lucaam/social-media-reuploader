@@ -52,6 +52,7 @@
     no_media: 'Nessun video o audio',
     timeout: 'Tempo scaduto',
     conversion_failed: 'Conversione fallita',
+    conversion_timeout: 'Conversione troppo lenta',
     rate_limited: 'Troppi link in poco tempo',
     pending_cap: 'Troppe richieste in attesa',
     duplicate: 'Link già inviato di recente',
@@ -86,7 +87,7 @@
     chat_unlimited: 'Chat sbloccata',
     chat_unlimited_all: 'Tutte le chat sbloccate',
     history_cleared: 'Storico eliminato',
-    history_pruned: 'Pulizia dello storico', // retention, and the deletions of a clear
+    history_pruned: 'Pulizia automatica', // retention (UPDATES/REQUESTS_RETENTION_DAYS)
     update_created: 'Riga non strutturata'
   }
   const FIELD_LABELS = {
@@ -1104,7 +1105,8 @@
     definition(dl, 'Utente Telegram', r.user_id)
     definition(dl, 'Creata', fmtDate(r.created_at))
     definition(dl, 'Aggiornata', fmtDate(r.updated_at))
-    if (r.not_before) definition(dl, 'Differita fino a', fmtDate(r.not_before))
+    // requeued rows also get a not_before (the requeue time): only future ones are deferrals
+    if (r.deferred && r.not_before) definition(dl, 'Differita fino a', fmtDate(r.not_before))
     definition(dl, 'Tentativi', r.attempts)
     definition(dl, 'Inizio elaborazione', fmtDate(r.processing_started_at))
     definition(dl, 'Fine elaborazione', fmtDate(r.processing_finished_at))

@@ -407,6 +407,9 @@ class BotApp:
             self.state.polling = http_server.PollingMonitor()
             bot.session.middleware(self.state.polling)
         self._pool = self._pool_factory(self.token)
+        # The worker heartbeat must report the mode the bot really runs in
+        # (python -m src.main forces webhook mode whatever config.MODE says).
+        self._pool.mode = self.mode
         dispatcher = self._dispatcher = create_dispatcher(self._pool)
 
         app = http_server.create_app(self.state)
