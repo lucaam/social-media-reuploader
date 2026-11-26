@@ -836,6 +836,42 @@ def test_health(client, monkeypatch):
     assert response.json() == {"ok": False, "db": "error"}
 
 
+HUGE = 10**20  # beyond SQLite's 64-bit integers
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "body"),
+    [
+        ("get", f"/api/requests?chat_id={HUGE}", None),
+        ("get", f"/requests?chat_id={2**63}", None),
+        ("get", f"/api/requests?offset={HUGE}", None),
+        ("get", f"/api/requests/{HUGE}", None),
+        ("get", f"/api/events?request_id={HUGE}", None),
+        ("get", f"/api/events?chat_id={-(2**63) - 1}", None),
+        ("get", f"/api/events?offset={HUGE}", None),
+        ("get", f"/api/users?offset={HUGE}", None),
+        ("post", "/api/requests/requeue", {"ids": [1, HUGE]}),
+        ("post", "/api/requests/requeue", {"status": "failed", "chat_id": HUGE}),
+        ("post", "/api/queue/cancel", {"chat_id": HUGE}),
+        ("post", "/api/rate_limits/unlimit", {"chat_id": HUGE}),
+        ("put", f"/api/users/{HUGE}/role", {"role": "user"}),
+        ("delete", f"/api/users/{HUGE}", None),
+    ],
+)
+def test_integers_beyond_sqlite_are_rejected_not_500(client, method, path, body):
+    kwargs = {"json": body} if body is not None else {}
+    response = getattr(client, method)(path, **kwargs)
+    assert response.status_code == 422, response.text
+
+
+def test_the_largest_sqlite_integers_are_accepted(client):
+    largest = 2**63 - 1
+    assert client.get(f"/api/requests?chat_id={largest}").json()["total"] == 0
+    assert client.get(f"/api/requests/{largest}").status_code == 404
+    unlimit = client.post("/api/rate_limits/unlimit", json={"chat_id": -(2**63)})
+    assert unlimit.status_code == 200
+
+
 def test_database_errors_are_503_json(client, monkeypatch):
     def locked(**kwargs):
         raise sqlite3.OperationalError("database is locked")

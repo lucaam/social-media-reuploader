@@ -40,6 +40,7 @@ from typing import Annotated, Any
 from urllib.parse import parse_qs
 
 import anyio
+import fastapi
 import httpx
 from authlib.common.errors import AuthlibBaseError
 from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
@@ -687,19 +688,29 @@ class _Body(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
 
+# SQLite integers are 64-bit: binding a larger id raises OverflowError (a 500),
+# so every id, chat id and offset that reaches SQL is range-checked (422).
+INT64_MIN = -(2**63)
+INT64_MAX = 2**63 - 1
+DbInt = Annotated[int, Field(ge=INT64_MIN, le=INT64_MAX)]
+DbIntQuery = Annotated[int | None, Query(ge=INT64_MIN, le=INT64_MAX)]
+DbIdPath = Annotated[int, fastapi.Path(ge=INT64_MIN, le=INT64_MAX)]
+OffsetQuery = Annotated[int, Query(ge=0, le=INT64_MAX)]
+
+
 class RequeueBody(_Body):
-    ids: list[int] | None = Field(default=None, max_length=MAX_REQUEUE_IDS)
+    ids: list[DbInt] | None = Field(default=None, max_length=MAX_REQUEUE_IDS)
     status: str | None = Field(default=None, max_length=32)
     q: str | None = Field(default=None, max_length=200)
-    chat_id: int | None = None
+    chat_id: DbInt | None = None
 
 
 class CancelBody(_Body):
-    chat_id: int | None = None
+    chat_id: DbInt | None = None
 
 
 class UnlimitBody(_Body):
-    chat_id: int
+    chat_id: DbInt
     requeue: bool = False
 
 
@@ -738,10 +749,10 @@ def _query_text(raw: str | None) -> str | None:
 @api.get("/requests", include_in_schema=False)
 def list_requests(
     limit: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = 50,
-    offset: Annotated[int, Query(ge=0)] = 0,
+    offset: OffsetQuery = 0,
     status: Annotated[str | None, Query(max_length=400)] = None,
     q: Annotated[str | None, Query(max_length=200)] = None,
-    chat_id: int | None = None,
+    chat_id: DbIntQuery = None,
 ) -> dict[str, Any]:
     """Requests, newest first; ``q`` searches URL, description and chat id."""
     return gui_queries.requests_page(
@@ -755,7 +766,7 @@ def list_requests(
 
 @api.get("/api/requests/{request_id}")
 @api.get("/requests/{request_id}", include_in_schema=False)
-def request_detail(request_id: int) -> dict[str, Any]:
+def request_detail(request_id: DbIdPath) -> dict[str, Any]:
     detail = gui_queries.request_detail(request_id)
     if detail is None:
         raise HTTPException(404, "Richiesta non trovata")
@@ -883,10 +894,10 @@ def aggregates(
 @api.get("/api/events")
 def events(
     limit: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = 50,
-    offset: Annotated[int, Query(ge=0)] = 0,
+    offset: OffsetQuery = 0,
     event_type: Annotated[str | None, Query(alias="type", max_length=64)] = None,
-    chat_id: int | None = None,
-    request_id: int | None = None,
+    chat_id: DbIntQuery = None,
+    request_id: DbIntQuery = None,
 ) -> dict[str, Any]:
     """The event log (newest first)."""
     return gui_queries.list_events(
@@ -1030,7 +1041,7 @@ def _change_user(state: GuiState, user_id: int, role: str | None) -> None:
 @api.get("/api/users")
 def list_users(
     limit: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = 100,
-    offset: Annotated[int, Query(ge=0)] = 0,
+    offset: OffsetQuery = 0,
 ) -> dict[str, Any]:
     rows = db.list_users(limit=limit, offset=offset)
     return {
@@ -1064,7 +1075,7 @@ def create_user(body: UserCreateBody, principal: AdminPrincipal) -> dict[str, An
 
 @api.put("/api/users/{user_id}/role")
 def set_user_role(
-    user_id: int, body: UserRoleBody, request: Request, principal: AdminPrincipal
+    user_id: DbIdPath, body: UserRoleBody, request: Request, principal: AdminPrincipal
 ) -> dict[str, Any]:
     role = _valid_role(body.role)
     _change_user(_state(request), user_id, role)
@@ -1077,7 +1088,7 @@ def set_user_role(
 
 @api.delete("/api/users/{user_id}")
 def delete_user(
-    user_id: int, request: Request, principal: AdminPrincipal
+    user_id: DbIdPath, request: Request, principal: AdminPrincipal
 ) -> dict[str, Any]:
     _change_user(_state(request), user_id, None)
     logger.info("%s deleted user %s", principal.actor, user_id)
