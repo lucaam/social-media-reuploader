@@ -247,6 +247,8 @@ class WorkerPool:
         except BaseException:
             self._started = False
             raise
+        if self._closing:
+            return  # stop() was called while starting: start nothing
         self._dispatcher = self._spawn(self._dispatch_loop(), "worker-dispatcher")
         self._heartbeat = self._spawn(self._heartbeat_loop(), "worker-heartbeat")
         self._maintenance = self._spawn(self._maintenance_loop(), "worker-maintenance")

@@ -9,6 +9,7 @@ import asyncio
 import os
 import subprocess
 import sys
+import threading
 import time
 from collections import defaultdict
 from pathlib import Path
@@ -1571,6 +1572,63 @@ def test_stop_cancels_long_jobs_and_the_next_start_resumes_them(env):
     run(second_run())
     assert db.get_request(result.request_id)["attempts"] == 2
     assert len(env.tg.uploads()) == 1
+
+
+def test_row_claimed_while_stopping_is_given_back(env, monkeypatch):
+    request_id = new_request()
+    real_claim = db.claim_next_request
+    entered, release = threading.Event(), threading.Event()
+
+    def slow_claim(now_iso=None):
+        entered.set()
+        release.wait(5)
+        return real_claim(now_iso)
+
+    monkeypatch.setattr(db, "claim_next_request", slow_claim)
+
+    async def scenario():
+        pool = await started_pool()
+        await asyncio.to_thread(entered.wait, 5)  # the claim is in flight
+        stopping = asyncio.create_task(pool.stop(timeout=1))
+        await asyncio.sleep(0.05)
+        release.set()
+        await stopping
+
+    run(scenario())
+    row = db.get_request(request_id)
+    assert row["status"] == "queued"
+    assert env.site.fetches == []
+    assert env.tg.calls == []
+
+
+def test_stop_during_start_starts_nothing(env, monkeypatch):
+    real_recover = db.recover_interrupted
+    entered, release = threading.Event(), threading.Event()
+
+    def slow_recover(**kwargs):
+        entered.set()
+        release.wait(5)
+        return real_recover(**kwargs)
+
+    monkeypatch.setattr(db, "recover_interrupted", slow_recover)
+    request_id = new_request()
+
+    async def scenario():
+        pool = worker.WorkerPool(TOKEN)
+        starting = asyncio.create_task(pool.start())
+        await asyncio.to_thread(entered.wait, 5)
+        stopping = asyncio.create_task(pool.stop(timeout=1))
+        await asyncio.sleep(0.05)
+        release.set()
+        await starting
+        await stopping
+        await asyncio.sleep(0.2)
+        return pool
+
+    pool = run(scenario())
+    assert pool._tasks == set()
+    assert status(request_id) == "queued"
+    assert env.site.fetches == []
 
 
 def test_stop_without_start_is_harmless(env):
