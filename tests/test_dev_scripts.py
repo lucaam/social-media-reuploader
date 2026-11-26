@@ -87,8 +87,10 @@ def release_repo(tmp_path):
         pytest.skip("git is not installed")
     repo = tmp_path / "repo"
     repo.mkdir()
+    # Git exports GIT_DIR, GIT_INDEX_FILE, ... to hooks (pytest runs as a
+    # pre-push hook): drop them, or these commands would use the real repo.
     env = {
-        **os.environ,
+        **{k: v for k, v in os.environ.items() if not k.startswith("GIT_")},
         "GIT_CONFIG_GLOBAL": os.devnull,
         "GIT_CONFIG_NOSYSTEM": "1",
         "GIT_AUTHOR_NAME": "Test",
