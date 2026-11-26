@@ -323,6 +323,23 @@ def effective_limits(worker: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def history_keep_seconds(limits: Mapping[str, Any]) -> float:
+    """How long accepted requests must survive a history clear.
+
+    The largest rate-limit window or the duplicate window of ``limits`` (see
+    :func:`effective_limits`), whichever is longer: the rate limiter
+    (``db.accepted_times``) and the duplicate check
+    (``db.find_recent_duplicate``) read those rows.
+    """
+    windows = [
+        _number(item.get("seconds")) or 0.0
+        for item in limits.get("rate_limits") or ()
+        if isinstance(item, Mapping)
+    ]
+    windows.append(_number(limits.get("duplicate_window_seconds")) or 0.0)
+    return max(0.0, *windows)
+
+
 def load_worker() -> dict[str, Any]:
     return worker_summary(db.get_worker_status())
 

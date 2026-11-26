@@ -483,3 +483,37 @@ def test_a_failing_scenario_fails_the_test(tmp_path, api):
     routes = snapshot(api, *DEFAULT_GETS)
     with pytest.raises(AssertionError, match="expected"):
         run_spa(tmp_path, "h.eq(1, 2, 'numbers')", routes=routes)
+
+
+# ---------------------------------------------------------------------------
+# System tab
+# ---------------------------------------------------------------------------
+def test_clearing_the_history_says_which_requests_are_kept(tmp_path, api):
+    db.set_worker_status(
+        {"pid": 1, "rate_limits": [[20, 30 * 86400]], "duplicate_window_seconds": 5400}
+    )
+    routes = snapshot(api, *DEFAULT_GETS)
+    routes["POST api/history/clear"] = {
+        "body": {
+            "ok": True,
+            "deleted": {"requests": 2, "request_events": 4, "updates": 9},
+            "kept_seconds": 30 * 86400,
+        }
+    }
+    run_spa(
+        tmp_path,
+        """
+        h.el('clearHistoryBtn').click()
+        await h.settle()
+        const text = h.text('modalBody')
+        h.ok(text.includes('richieste completate o fallite più recenti di 30 giorni'), text)
+        h.ok(text.includes('limiti di frequenza'), text)
+        h.button('modalFooter', 'Elimina lo storico').click()
+        await h.settle()
+        const posts = h.calls.filter((call) => call.method === 'POST').map((call) => call.path)
+        h.eq(posts, ['api/history/clear'], 'one clear request')
+        h.ok(h.text('toasts').includes('Storico eliminato: 2 richieste, 9 eventi.'), h.text('toasts'))
+        """,
+        routes=routes,
+        hash="#system",
+    )

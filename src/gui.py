@@ -7,7 +7,7 @@ bot ONLY through the SQLite database:
   worker's liveness, running jobs and effective limits, which the worker
   publishes as a heartbeat row (``db.get_worker_status()``);
 * every admin action is a DB write (``db.cancel_queued``,
-  ``db.requeue_requests``, ``db.reset_chat_limit``, ``db.clear_history``, ...);
+  ``db.requeue_requests``, ``db.reset_chat_limit``, ``db.prune``, ...);
 * live updates come from one background task that tails the DB event log and
   broadcasts each event once to the WebSocket clients (:mod:`src.ws_broadcast`).
 
@@ -92,6 +92,8 @@ MAX_LOGIN_BODY = 4096
 MAX_REQUEUE_IDS = 1000
 FILTER_REQUEUE_LIMIT = 500
 DEFAULT_REQUEUE_MAX_AGE = 86400.0
+# db.prune() deletes rows older than N days: ~0.1 ms means "everything so far".
+CLEAR_UP_TO_NOW_DAYS = 1e-9
 WS_RECHECK_SECONDS = 30.0
 WS_CLOSE_GOING_AWAY = 1001
 WS_CLOSE_POLICY = 1008
@@ -872,6 +874,7 @@ def runtime_config(request: Request) -> dict[str, Any]:
     state = _state(request)
     settings = state.settings
     worker = gui_queries.load_worker()
+    limits = gui_queries.effective_limits(worker)
     summary = getattr(config, "summary", None)
     validate = getattr(config, "validate", None)
     return {
@@ -891,11 +894,12 @@ def runtime_config(request: Request) -> dict[str, Any]:
         "gui": {
             "db_poll_seconds": state.tailer.poll_interval,
             "requeue_max_age_seconds": state.requeue_max_age,
+            "history_keep_seconds": gui_queries.history_keep_seconds(limits),
             "ws_clients": state.hub.client_count,
             "last_event_id": state.tailer.last_id,
         },
         "worker": worker,
-        "limits": gui_queries.effective_limits(worker),
+        "limits": limits,
         "settings": summary() if callable(summary) else {},
         "warnings": [*settings.warnings, *(validate() if callable(validate) else [])],
     }
@@ -903,10 +907,32 @@ def runtime_config(request: Request) -> dict[str, Any]:
 
 @api.post("/api/history/clear")
 def clear_history(principal: AdminPrincipal) -> dict[str, Any]:
-    """Delete finished requests and the event log (active requests are kept)."""
-    counts = db.clear_history(actor=principal.actor)
-    logger.warning("%s cleared the history: %s", principal.actor, counts)
-    return {"ok": True, "deleted": counts}
+    """Delete finished requests and the event log.
+
+    Active requests are kept, and so are the accepted ones (done, failed)
+    still inside the worker's largest rate-limit or duplicate window: the rate
+    limiter and the duplicate check read them, so deleting them would reset
+    every chat's quota. ``db.prune`` applies exactly that protection.
+    """
+    keep = gui_queries.history_keep_seconds(
+        gui_queries.effective_limits(gui_queries.load_worker())
+    )
+    pruned = db.prune(
+        updates_days=CLEAR_UP_TO_NOW_DAYS,
+        requests_days=CLEAR_UP_TO_NOW_DAYS,
+        keep_accepted_seconds=keep,
+    )
+    counts = {key: pruned[key] for key in ("requests", "request_events", "updates")}
+    db.add_event(
+        db.EventType.HISTORY_CLEARED, actor=principal.actor, kept_seconds=keep, **counts
+    )
+    logger.warning(
+        "%s cleared the history (accepted requests of the last %.0f s kept): %s",
+        principal.actor,
+        keep,
+        counts,
+    )
+    return {"ok": True, "deleted": counts, "kept_seconds": keep}
 
 
 # Users -----------------------------------------------------------------------

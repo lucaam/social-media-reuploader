@@ -65,7 +65,7 @@
     chat_unlimited: 'Chat sbloccata',
     chat_unlimited_all: 'Tutte le chat sbloccate',
     history_cleared: 'Storico eliminato',
-    history_pruned: 'Pulizia automatica',
+    history_pruned: 'Pulizia dello storico', // retention, and the deletions of a clear
     update_created: 'Riga non strutturata'
   }
   const FIELD_LABELS = {
@@ -1479,12 +1479,15 @@
   // ---------------------------------------------------------------------
   // System
   // ---------------------------------------------------------------------
+  let systemConfig = null
+
   loaders.system = async () => {
     const data = await latest('system', () => Promise.all([api('api/config'), api('health', { quiet: true }).catch((e) => ({ ok: false, db: 'error', error: e.detail }))]))
     if (data !== STALE) renderSystem(data[0], data[1])
   }
 
   function renderSystem (cfg, health) {
+    systemConfig = cfg
     const dl = $('healthInfo')
     dl.replaceChildren()
     definition(dl, 'Database', health.db === 'ok' ? 'raggiungibile' : 'errore')
@@ -1535,9 +1538,23 @@
     }))
   }
 
+  // What a history clear keeps besides the active requests (see /api/config).
+  function keptByClear () {
+    const keep = systemConfig && systemConfig.gui ? systemConfig.gui.history_keep_seconds : null
+    const base = 'Restano le richieste in coda o in corso, gli utenti e i limiti delle chat'
+    if (keep === null || keep === undefined) {
+      return base + ', oltre alle richieste recenti che servono ai limiti di frequenza e al controllo dei duplicati.'
+    }
+    if (keep > 0) {
+      return base + ', oltre alle richieste completate o fallite più recenti di ' + fmtWindow(keep) +
+        ', che servono ai limiti di frequenza e al controllo dei duplicati.'
+    }
+    return base + '.'
+  }
+
   async function clearHistory () {
     const ok = await confirmDialog('Pulire lo storico?',
-      'Verranno eliminate definitivamente le richieste concluse con i loro eventi e il registro eventi. Le richieste in coda o in corso, gli utenti e i limiti restano invariati.',
+      'Verranno eliminate definitivamente le richieste concluse con i loro eventi e il registro eventi. ' + keptByClear(),
       'Elimina lo storico', true)
     if (!ok) return
     try {
