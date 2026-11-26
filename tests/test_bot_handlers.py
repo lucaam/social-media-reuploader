@@ -271,6 +271,14 @@ def test_links_are_submitted_in_text_order_and_deduplicated():
     assert [c["provider"].key for c in pool.calls] == ["Youtube", "Vimeo"]
 
 
+def test_each_media_of_a_post_is_submitted(telegram):
+    post = "https://x.com/someuser/status/1234567890123456789"
+    first, second = f"{post}/video/1", f"{post}/video/2"
+    pool = feed(text_update(f"{first} {second}", first, second))
+    assert [c["url"] for c in pool.calls] == [first, second]
+    assert len({c["provider"].normalized_url for c in pool.calls}) == 2
+
+
 @pytest.mark.parametrize(
     "template",
     ["guarda {url}.", "guarda ({url})", "«{url}»!", "{url}, {url}"],

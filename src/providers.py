@@ -658,11 +658,16 @@ _SITE_HOST_PREFIXES: tuple[tuple[str, tuple[str, ...]], ...] = (
 _CANONICAL_HOSTS = {"twitter.com": "x.com", "youtube-nocookie.com": "youtube.com"}
 _NORMALIZE_DROP = frozenset({"si", "feature"})
 _INSTAGRAM_ID_RE = re.compile(r"/(?:[^/]+/)?(?:p|reels?|tv)/([^/?#&]+)")
-_X_STATUS_RE = re.compile(r"/(?:i/web|i|[^/]+)/status(?:es)?/(\d+)")
+# /video/N and /photo/N select one media item of a post (yt-dlp downloads only
+# that one with --no-playlist; both count the post's media list from 1).
+_X_STATUS_RE = re.compile(
+    r"/(?:(?:i/web|i|[^/]+)/status(?:es)?|statuses)/(\d+)(?:/(?:video|photo)/(\d+))?"
+)
 _REDDIT_POST_RE = re.compile(r"/(?:(?:r|u|user)/[^/]+/)?comments/([a-z0-9]+)")
 _FACEBOOK_VIDEO_RE = re.compile(r"/(?:[^/]+/videos/(?:[^/]+/)?|watch/|reel/)(\d+)")
 _VIMEO_ID_RE = re.compile(r"/(?:video/|channels/[^/]+/)?(\d+)(?:/([0-9a-f]{6,}))?/?$")
-_DAILYMOTION_ID_RE = re.compile(r"/(?:embed/)?video/([a-z0-9]+)")
+# Ids are case-sensitive: private/partner videos have mixed-case "k..." ids.
+_DAILYMOTION_ID_RE = re.compile(r"/(?:embed/)?video/([0-9A-Za-z]+)")
 
 
 def _normalize_host(host: str) -> str:
@@ -689,7 +694,8 @@ def _identity_url(host: str, parsed: _Url) -> str | None:
     if host == "instagram.com" and (found := _INSTAGRAM_ID_RE.match(path)):
         return f"https://instagram.com/p/{found.group(1)}"
     if host == "x.com" and (found := _X_STATUS_RE.match(path)):
-        return f"https://x.com/i/status/{found.group(1)}"
+        media = f"/video/{found.group(2)}" if found.group(2) else ""
+        return f"https://x.com/i/status/{found.group(1)}{media}"
     if host == "reddit.com" and (found := _REDDIT_POST_RE.match(path)):
         return f"https://reddit.com/comments/{found.group(1)}"
     if host == "facebook.com":

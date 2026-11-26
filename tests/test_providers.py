@@ -183,6 +183,17 @@ def test_extract_urls_keeps_different_links():
     assert providers.extract_urls(text) == [YT, "https://youtu.be/AAAAAAAAAAA"]
 
 
+def test_extract_urls_keeps_each_media_of_one_post():
+    post = "https://x.com/u/status/1234567890123456789"
+    text = f"{post}/video/1 {post}/video/2 {post}/photo/1"
+    assert providers.extract_urls(text) == [f"{post}/video/1", f"{post}/video/2"]
+    first, second = (
+        "https://www.dailymotion.com/video/kTb8bOcK1gC8Kv3oPCH",
+        "https://www.dailymotion.com/video/kAbcdefGhij",
+    )
+    assert providers.extract_urls(f"{first} {second}") == [first, second]
+
+
 def test_extract_urls_utf16_offsets():
     """The example of the spec: an emoji before the link, entity at offset 3."""
     text = f"{UTF16_EMOJI} https://youtu.be/x"
@@ -343,10 +354,18 @@ def test_text_without_urls():
                 "https://x.com/i/status/1234567890123456789",
                 "https://mobile.twitter.com/someuser/status/1234567890123456789",
                 "https://fxtwitter.com/someuser/status/1234567890123456789",
-                "https://x.com/someuser/status/1234567890123456789/video/1",
                 "https://twitter.com/i/web/status/1234567890123456789",
+                "https://twitter.com/statuses/1234567890123456789",
             ],
             "https://x.com/i/status/1234567890123456789",
+        ),
+        (
+            [
+                "https://x.com/someuser/status/1234567890123456789/video/2",
+                "https://twitter.com/someuser/status/1234567890123456789/photo/2",
+                "https://x.com/i/web/status/1234567890123456789/video/2?s=20",
+            ],
+            "https://x.com/i/status/1234567890123456789/video/2",
         ),
         (
             [
@@ -418,6 +437,24 @@ def test_normalize_url_equivalent_forms(variants, expected):
 def test_normalize_url_distinguishes_different_media():
     assert providers.normalize_url(YT) != providers.normalize_url(
         "https://youtu.be/AAAAAAAAAAA"
+    )
+    # Media of one X post: yt-dlp --no-playlist downloads only the selected
+    # one, the bare post URL downloads all of them.
+    post = "https://x.com/someuser/status/1234567890123456789"
+    keys = {
+        providers.normalize_url(url)
+        for url in (post, f"{post}/video/1", f"{post}/video/2", f"{post}/video/3")
+    }
+    assert len(keys) == 4
+    # Dailymotion ids are case-sensitive (private "k..." ids are mixed case).
+    assert providers.normalize_url(
+        "https://www.dailymotion.com/video/kTb8bOcK1gC8Kv3oPCH"
+    ) == ("https://dailymotion.com/video/kTb8bOcK1gC8Kv3oPCH")
+    assert providers.normalize_url(
+        "https://www.dailymotion.com/video/kAbcdefGhij"
+    ) != providers.normalize_url("https://www.dailymotion.com/video/kTb8bOcK1gC8")
+    assert providers.normalize_url("https://dai.ly/kTb8bOcK1gC8Kv3oPCH") == (
+        "https://dailymotion.com/video/kTb8bOcK1gC8Kv3oPCH"
     )
     assert providers.normalize_url("https://example.com/a?id=1") != (
         providers.normalize_url("https://example.com/a?id=2")
