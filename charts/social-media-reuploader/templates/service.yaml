@@ -1,14 +1,21 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "social-media-reuploader.fullname" . | default "social-media-reuploader" }}
+  name: {{ include "social-media-reuploader.fullname" . }}
   labels:
-{{ include "social-media-reuploader.labels" . | nindent 4 }}
+    {{- include "social-media-reuploader.labels" . | nindent 4 }}
+    app.kubernetes.io/component: bot
+  {{- with .Values.service.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
   type: {{ .Values.service.type | default "ClusterIP" }}
   ports:
-    - port: {{ .Values.service.port | default 80 }}
-      targetPort: 8080
+    # /health, /metrics and (webhook mode) WEBHOOK_PATH
+    - name: http
+      port: {{ .Values.service.port | default 80 | int64 }}
+      targetPort: http
+      protocol: TCP
   selector:
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    app.kubernetes.io/component: bot
+    {{- include "social-media-reuploader.selectorLabels" (list . "bot") | nindent 4 }}

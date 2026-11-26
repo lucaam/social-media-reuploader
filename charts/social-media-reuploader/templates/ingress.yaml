@@ -2,23 +2,41 @@
 apiVersion: networking.k8s.io/v1
 kind: Ingress
 metadata:
-  name: {{ include "social-media-reuploader.fullname" . | default "social-media-reuploader" }}
+  name: {{ include "social-media-reuploader.fullname" . }}
   labels:
-{{ include "social-media-reuploader.labels" . | nindent 4 }}
+    {{- include "social-media-reuploader.labels" . | nindent 4 }}
+  {{- with .Values.ingress.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
+  {{- with .Values.ingress.className }}
+  ingressClassName: {{ . | quote }}
+  {{- end }}
+  {{- with .Values.ingress.tls }}
+  tls:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
   rules:
-  {{- range .Values.ingress.hosts }}
-    - host: {{ .host }}
+    {{- range .Values.ingress.hosts }}
+    {{- if .host }}
+    - host: {{ .host | quote }}
       http:
+    {{- else }}
+    - http:
+    {{- end }}
         paths:
-        {{- range .paths }}
-          - path: {{ . }}
-            pathType: Prefix
+          {{- range .paths }}
+          {{- /* A path is "/" (legacy string form) or {path, pathType, service}. */}}
+          {{- $path := ternary (dict "path" .) . (kindIs "string" .) }}
+          {{- $backend := include "social-media-reuploader.backend" (list $ $path.service) | fromYaml }}
+          - path: {{ $path.path | default "/" | quote }}
+            pathType: {{ $path.pathType | default "Prefix" }}
             backend:
               service:
-                name: {{ include "social-media-reuploader.fullname" . | default "social-media-reuploader" }}
+                name: {{ $backend.name }}
                 port:
-                  number: {{ $.Values.service.port }}
-        {{- end }}
-  {{- end }}
-{{- end -}}
+                  number: {{ $backend.port | int64 }}
+          {{- end }}
+    {{- end }}
+{{- end }}

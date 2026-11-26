@@ -1,0 +1,43 @@
+{{- $fullname := include "social-media-reuploader.fullname" . -}}
+{{- $env := .Values.env | default dict -}}
+{{- $mode := include "social-media-reuploader.envString" (get $env "MODE" | default "polling") | lower -}}
+social-media-reuploader {{ .Chart.AppVersion }} installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+
+Bot ({{ $mode }} mode, {{ .Values.replicaCount }} replica):
+{{- if include "social-media-reuploader.useBotSecret" . }}
+  token from Secret "{{ include "social-media-reuploader.botSecretName" . }}" (key {{ .Values.secret.botTokenKey | default "BOT_TOKEN" }})
+{{- else }}
+  WARNING: no bot token configured. Create a Secret and reference it:
+    kubectl -n {{ .Release.Namespace }} create secret generic {{ $fullname }}-secret --from-literal=BOT_TOKEN='<token>'
+    helm upgrade {{ .Release.Name }} <chart> --reuse-values --set secret.name={{ $fullname }}-secret
+{{- end }}
+{{- if and .Values.secret.name (include "social-media-reuploader.botTokenValue" .) (not .Values.secret.create) }}
+  NOTE: secret.botToken / env.BOT_TOKEN is ignored because secret.name is set.
+{{- end }}
+  logs:   kubectl -n {{ .Release.Namespace }} logs deploy/{{ $fullname }} -f
+  health: kubectl -n {{ .Release.Namespace }} port-forward svc/{{ $fullname }} 8080:{{ .Values.service.port }}  then  curl http://127.0.0.1:8080/health
+{{- if eq $mode "webhook" }}
+  Webhook mode: route {{ get $env "WEBHOOK_URL" }} to the bot Service (an ingress/gatewayApi path with service: bot).
+{{- end }}
+  In groups the bot only sees ordinary messages if BotFather privacy mode is
+  disabled (/setprivacy -> Disable) or the bot is an administrator.
+
+{{- if .Values.gui.enabled }}
+
+Admin GUI:
+  kubectl -n {{ .Release.Namespace }} port-forward svc/{{ include "social-media-reuploader.guiFullname" . }} {{ .Values.gui.port }}:{{ .Values.gui.port }}
+  then open http://127.0.0.1:{{ .Values.gui.port }}/
+{{- if include "social-media-reuploader.createGuiSecret" . }}
+{{- if or .Values.gui.secrets.adminToken (not (or .Values.gui.secrets.oauthClientId .Values.gui.secrets.oauthServerMetadataUrl .Values.gui.secrets.oauthAuthorizeUrl)) }}
+  Admin token:
+    kubectl -n {{ .Release.Namespace }} get secret {{ include "social-media-reuploader.guiSecretName" . }} -o jsonpath='{.data.ADMIN_TOKEN}' | base64 -d; echo
+{{- end }}
+{{- else }}
+  Credentials from the existing Secret "{{ include "social-media-reuploader.guiSecretName" . }}".
+{{- end }}
+  The GUI shares the DB volume with the bot and runs on the same node.
+{{- end }}
+{{- if or .Values.ingress.enabled .Values.gatewayApi.enabled }}
+
+Exposed through {{ if .Values.ingress.enabled }}Ingress{{ end }}{{ if and .Values.ingress.enabled .Values.gatewayApi.enabled }} and {{ end }}{{ if .Values.gatewayApi.enabled }}HTTPRoute{{ end }}.
+{{- end }}

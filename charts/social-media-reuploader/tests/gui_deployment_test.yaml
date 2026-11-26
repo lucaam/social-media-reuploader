@@ -1,0 +1,382 @@
+suite: GUI Deployment
+templates:
+  - templates/gui-deployment.yaml
+release:
+  name: smr
+  namespace: bots
+tests:
+  - it: renders the GUI by default
+    asserts:
+      - isKind:
+          of: Deployment
+      - equal:
+          path: metadata.name
+          value: smr-social-media-reuploader-gui
+      - equal:
+          path: spec.template.spec.containers[0].name
+          value: social-media-reuploader-gui
+      - equal:
+          path: spec.selector.matchLabels
+          value:
+            app.kubernetes.io/instance: smr
+            app.kubernetes.io/component: gui
+      - equal:
+          path: spec.template.spec.containers[0].ports[0]
+          value:
+            name: http
+            containerPort: 8081
+            protocol: TCP
+
+  - it: is not rendered when disabled
+    set:
+      gui.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: needs the shared DB volume
+    set:
+      db.pvc.enabled: false
+    asserts:
+      - failedTemplate:
+          errorPattern: "gui.enabled=true needs db.pvc.enabled=true"
+
+  - it: runs uvicorn behind the ingress with proxy headers (keeping the entrypoint)
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[0].command
+      - equal:
+          path: spec.template.spec.containers[0].args
+          value:
+            - uvicorn
+            - src.gui:app
+            - --host
+            - 0.0.0.0
+            - --port
+            - "8081"
+            - --proxy-headers
+            - --forwarded-allow-ips
+            - "*"
+
+  - it: uses gui.port for uvicorn, the container port and the probes
+    set:
+      gui.port: 9000
+      gui.forwardedAllowIps: 10.42.0.0/16
+      gui.extraArgs:
+        - --log-level
+        - warning
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].args
+          value:
+            - uvicorn
+            - src.gui:app
+            - --host
+            - 0.0.0.0
+            - --port
+            - "9000"
+            - --proxy-headers
+            - --forwarded-allow-ips
+            - 10.42.0.0/16
+            - --log-level
+            - warning
+      - equal:
+          path: spec.template.spec.containers[0].ports[0].containerPort
+          value: 9000
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.httpGet
+          value:
+            path: /health
+            port: http
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet.port
+          value: http
+
+  - it: keeps a legacy command override as strings
+    set:
+      gui.command:
+        - uvicorn
+        - src.gui:app
+        - --port
+        - 8081
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].command
+          value:
+            - uvicorn
+            - src.gui:app
+            - --port
+            - "8081"
+      - notExists:
+          path: spec.template.spec.containers[0].args
+
+  - it: loads the credentials from the chart Secret with envFrom
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].envFrom
+          value:
+            - secretRef:
+                name: smr-social-media-reuploader-gui-secret
+
+  - it: loads the credentials from an existing Secret
+    set:
+      gui.existingSecret: gui-creds
+      gui.extraEnvFrom:
+        - configMapRef:
+            name: gui-settings
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].envFrom
+          value:
+            - secretRef:
+                name: gui-creds
+            - configMapRef:
+                name: gui-settings
+
+  - it: accepts the legacy secretName
+    set:
+      gui.useSecret: true
+      gui.secretName: legacy-gui-secret
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].envFrom[0].secretRef.name
+          value: legacy-gui-secret
+
+  - it: never puts the GUI credentials in the pod spec
+    set:
+      gui.secrets.adminToken: admin-token-value
+      gui.secrets.secretKey: secret-key-value
+      gui.secrets.oauthClientId: client-id
+      gui.secrets.oauthClientSecret: client-secret-value
+      gui.secrets.oauthAdminGroups: admins
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[0].env[?(@.name == "ADMIN_TOKEN")]
+      - notExists:
+          path: spec.template.spec.containers[0].env[?(@.name == "SECRET_KEY")]
+      - notExists:
+          path: spec.template.spec.containers[0].env[?(@.name == "OAUTH_CLIENT_SECRET")]
+      - notExists:
+          path: spec.template.spec.containers[0].env[?(@.name == "OAUTH_ADMIN_GROUPS")]
+
+  - it: shares the bot's DB file and volume
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: REQUESTS_DB
+            value: /app/data/requests.db
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: data
+            persistentVolumeClaim:
+              claimName: smr-social-media-reuploader-data
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: data
+            mountPath: /app/data
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: tmp
+            emptyDir:
+              sizeLimit: 256Mi
+
+  - it: runs on the bot's node (required podAffinity on the hostname)
+    asserts:
+      - equal:
+          path: spec.template.spec.affinity.podAffinity.requiredDuringSchedulingIgnoredDuringExecution
+          value:
+            - labelSelector:
+                matchLabels:
+                  app.kubernetes.io/instance: smr
+                  app.kubernetes.io/component: bot
+              topologyKey: kubernetes.io/hostname
+
+  - it: can drop the co-location
+    set:
+      gui.colocateWithBot: false
+    asserts:
+      - notExists:
+          path: spec.template.spec.affinity
+
+  - it: uses a custom affinity verbatim
+    set:
+      gui.affinity:
+        podAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 1
+              podAffinityTerm:
+                labelSelector:
+                  matchLabels:
+                    app: other
+                topologyKey: kubernetes.io/hostname
+    asserts:
+      - notExists:
+          path: spec.template.spec.affinity.podAffinity.requiredDuringSchedulingIgnoredDuringExecution
+      - equal:
+          path: spec.template.spec.affinity.podAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].weight
+          value: 1
+
+  - it: inherits the bot tolerations
+    set:
+      tolerations:
+        - key: dedicated
+          operator: Exists
+    asserts:
+      - equal:
+          path: spec.template.spec.tolerations
+          value:
+            - key: dedicated
+              operator: Exists
+
+  - it: gets the shared application settings
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: TELEGRAM_MAX_FILE_SIZE
+            value: "52428800"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: MODE
+            value: polling
+      - notExists:
+          path: spec.template.spec.containers[0].env[?(@.name == "PORT")]
+      - notExists:
+          path: spec.template.spec.containers[0].env[?(@.name == "BOT_TOKEN")]
+
+  - it: lets gui.env override a shared setting
+    set:
+      gui.env.LOG_LEVEL: DEBUG
+      gui.env.SESSION_COOKIE_SECURE: true
+      gui.env.OAUTH_REDIRECT_URI: https://admin.example.com/auth
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: LOG_LEVEL
+            value: DEBUG
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: LOG_LEVEL
+            value: INFO
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: SESSION_COOKIE_SECURE
+            value: "true"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OAUTH_REDIRECT_URI
+            value: https://admin.example.com/auth
+
+  - it: passes legacy GUI settings of env, but not empty ones
+    set:
+      env.OAUTH_ADMIN_GROUPS: admins
+      env.OAUTH_SCOPE: ""
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: OAUTH_ADMIN_GROUPS
+            value: admins
+      - notExists:
+          path: spec.template.spec.containers[0].env[?(@.name == "OAUTH_SCOPE")]
+
+  - it: refuses secrets in gui.env
+    set:
+      gui.env.SECRET_KEY: plain-text
+    asserts:
+      - failedTemplate:
+          errorPattern: "gui.env.SECRET_KEY would put a secret in plain text"
+
+  - it: refuses chart-managed settings in gui.env
+    set:
+      gui.env.REQUESTS_DB: /tmp/other.db
+    asserts:
+      - failedTemplate:
+          errorPattern: "gui.env.REQUESTS_DB is set by the chart"
+
+  - it: adds extra env, volumes and mounts
+    set:
+      gui.extraEnv:
+        - name: GUI_FLAG
+          value: "1"
+      gui.extraVolumes:
+        - name: ca
+          configMap:
+            name: corporate-ca
+      gui.extraVolumeMounts:
+        - name: ca
+          mountPath: /etc/ssl/corporate
+          readOnly: true
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: GUI_FLAG
+            value: "1"
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: ca
+            configMap:
+              name: corporate-ca
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: ca
+            mountPath: /etc/ssl/corporate
+            readOnly: true
+
+  - it: runs unprivileged with a read-only root filesystem
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].securityContext.readOnlyRootFilesystem
+          value: true
+      - equal:
+          path: spec.template.spec.automountServiceAccountToken
+          value: false
+      - equal:
+          path: spec.template.spec.securityContext.runAsUser
+          value: 1000
+
+  - it: uses the bot image unless overridden
+    set:
+      image.repository: registry.example.com/smr
+      image.tag: "2.0.0"
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: registry.example.com/smr:2.0.0
+
+  - it: uses a GUI image override
+    set:
+      gui.image.repository: registry.example.com/smr-gui
+      gui.image.tag: "2.0.1"
+      gui.image.pullPolicy: Always
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: registry.example.com/smr-gui:2.0.1
+      - equal:
+          path: spec.template.spec.containers[0].imagePullPolicy
+          value: Always
+
+  - it: applies the GUI resources
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources
+          value:
+            requests:
+              cpu: 50m
+              memory: 128Mi
+            limits:
+              cpu: 200m
+              memory: 256Mi

@@ -2,15 +2,17 @@
 apiVersion: v1
 kind: Service
 metadata:
-  name: {{ include "social-media-reuploader.fullname" . }}-gui
+  name: {{ include "social-media-reuploader.guiFullname" . }}
   labels:
-{{ include "social-media-reuploader.labels" . | nindent 4 }}
+    {{- include "social-media-reuploader.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gui
 spec:
   type: ClusterIP
   ports:
-    - port: {{ .Values.gui.port | default 8081 }}
-      targetPort: {{ .Values.gui.port | default 8081 }}
+    - name: http
+      port: {{ .Values.gui.port | default 8081 | int64 }}
+      targetPort: http
+      protocol: TCP
   selector:
-    app.kubernetes.io/instance: {{ .Release.Name }}
-    app.kubernetes.io/component: gui
-{{- end -}}
+    {{- include "social-media-reuploader.selectorLabels" (list . "gui") | nindent 4 }}
+{{- end }}

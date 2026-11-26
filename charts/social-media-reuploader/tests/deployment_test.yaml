@@ -1,17 +1,680 @@
-suite: GUI deployment
+suite: bot Deployment
 templates:
-  - templates/gui-deployment.yaml
+  - templates/deployment.yaml
+release:
+  name: smr
+  namespace: bots
 tests:
-  - it: should render deployment when gui.enabled true
-    set:
-      gui.enabled: true
-      gui.port: 8081
+  - it: runs a single replica with the Recreate strategy
     asserts:
       - isKind:
           of: Deployment
       - equal:
-          path: spec.template.spec.containers[0].name
-          value: social-media-reuploader-gui
+          path: metadata.name
+          value: smr-social-media-reuploader
       - equal:
-          path: spec.template.spec.containers[0].ports[0].containerPort
-          value: 8081
+          path: spec.replicas
+          value: 1
+      - equal:
+          path: spec.strategy
+          value:
+            type: Recreate
+      - equal:
+          path: spec.selector.matchLabels
+          value:
+            app.kubernetes.io/instance: smr
+            app.kubernetes.io/component: bot
+      - isSubset:
+          path: spec.template.metadata.labels
+          content:
+            app.kubernetes.io/instance: smr
+            app.kubernetes.io/component: bot
+
+  - it: can be scaled to zero
+    set:
+      replicaCount: 0
+    asserts:
+      - equal:
+          path: spec.replicas
+          value: 0
+
+  - it: refuses more than one replica
+    set:
+      replicaCount: 2
+    asserts:
+      - failedTemplate:
+          errorPattern: "replicaCount must be 0 or 1"
+
+  - it: renders numbers from values.yaml as plain integers (no 5.24288e+07)
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: TELEGRAM_MAX_FILE_SIZE
+            value: "52428800"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: WORKERS
+            value: "2"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: MAX_PENDING_PER_CHAT
+            value: "3"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: DUPLICATE_WINDOW_SECONDS
+            value: "5400"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RATE_LIMIT_MAX_DEFER_SECONDS
+            value: "120"
+
+  - it: renders the default settings
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: MODE
+            value: polling
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PORT
+            value: "8080"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: REQUESTS_DB
+            value: /app/data/requests.db
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RATE_LIMITS
+            value: 1/10,3/60,5/3600,20/30d
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: UNSUPPORTED_LINK_REPLY
+            value: private
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: WORKER_REHYDRATE_ON_START
+            value: "true"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: HEALTH_DEBUG
+            value: "false"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: TMP_DIR
+            value: /tmp/telegram_downloader
+
+  - it: leaves null settings to the application defaults
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[0].env[?(@.name == "WEBHOOK_URL")]
+      - notExists:
+          path: spec.template.spec.containers[0].env[?(@.name == "YTDLP_PROXY")]
+      - notExists:
+          path: spec.template.spec.containers[0].env[?(@.name == "ALLOWED_PROVIDERS")]
+
+  - it: renders big integers, fractions, booleans and lists as strings
+    set:
+      env.TELEGRAM_MAX_FILE_SIZE: 2097152000
+      env.MAX_DOWNLOAD_BYTES: 1048576000
+      env.WORKER_POLL_SECONDS: 0.5
+      env.KEEP_DOWNLOADED_FILES: true
+      env.ALLOWED_PROVIDERS:
+        - youtube
+        - tiktok
+        - vimeo.com
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: TELEGRAM_MAX_FILE_SIZE
+            value: "2097152000"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: MAX_DOWNLOAD_BYTES
+            value: "1048576000"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: WORKER_POLL_SECONDS
+            value: "0.5"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: KEEP_DOWNLOADED_FILES
+            value: "true"
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: ALLOWED_PROVIDERS
+            value: youtube,tiktok,vimeo.com
+
+  - it: disables rate limiting with an empty RATE_LIMITS
+    set:
+      env.RATE_LIMITS: ""
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: RATE_LIMITS
+            value: ""
+
+  - it: derives WORKER_SHUTDOWN_TIMEOUT from the grace period (single quoting)
+    asserts:
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 180
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: WORKER_SHUTDOWN_TIMEOUT
+            value: "165"
+
+  - it: follows the grace period of the profile or of the override
+    set:
+      resourceProfile: small
+    asserts:
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 60
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: WORKER_SHUTDOWN_TIMEOUT
+            value: "45"
+
+  - it: honours an explicit grace period and WORKER_SHUTDOWN_TIMEOUT
+    set:
+      terminationGracePeriodSeconds: 600
+      env.WORKER_SHUTDOWN_TIMEOUT: 500
+    asserts:
+      - equal:
+          path: spec.template.spec.terminationGracePeriodSeconds
+          value: 600
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: WORKER_SHUTDOWN_TIMEOUT
+            value: "500"
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: WORKER_SHUTDOWN_TIMEOUT
+            value: "585"
+
+  - it: validates MODE
+    set:
+      env.MODE: push
+    asserts:
+      - failedTemplate:
+          errorPattern: "env.MODE must be polling or webhook"
+
+  - it: needs WEBHOOK_URL in webhook mode
+    set:
+      env.MODE: webhook
+    asserts:
+      - failedTemplate:
+          errorPattern: "env.MODE=webhook needs env.WEBHOOK_URL"
+
+  - it: renders webhook mode
+    set:
+      env.MODE: webhook
+      env.WEBHOOK_URL: https://bot.example.com/webhook
+      env.WEBHOOK_PATH: /webhook
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: MODE
+            value: webhook
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: WEBHOOK_URL
+            value: https://bot.example.com/webhook
+
+  - it: has no BOT_TOKEN without a Secret
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[0].env[?(@.name == "BOT_TOKEN")]
+
+  - it: reads BOT_TOKEN and WEBHOOK_SECRET from an existing Secret
+    set:
+      secret.name: smr-bot
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: BOT_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: smr-bot
+                key: BOT_TOKEN
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: WEBHOOK_SECRET
+            valueFrom:
+              secretKeyRef:
+                name: smr-bot
+                key: WEBHOOK_SECRET
+                optional: true
+
+  - it: uses custom Secret keys
+    set:
+      secret.name: smr-bot
+      secret.botTokenKey: token
+      secret.webhookSecretKey: hook
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: BOT_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: smr-bot
+                key: token
+      - equal:
+          path: spec.template.spec.containers[0].env[?(@.name == "WEBHOOK_SECRET")].valueFrom.secretKeyRef.key
+          value: hook
+
+  - it: never renders a token given as a value in plain text
+    set:
+      env.BOT_TOKEN: "123456:SUPERSECRET"
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: BOT_TOKEN
+            valueFrom:
+              secretKeyRef:
+                name: smr-social-media-reuploader-secret
+                key: BOT_TOKEN
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: BOT_TOKEN
+            value: "123456:SUPERSECRET"
+
+  - it: reads the token from the Secret created from secret.botToken
+    set:
+      secret.botToken: "123456:SUPERSECRET"
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].env[?(@.name == "BOT_TOKEN")].valueFrom.secretKeyRef.name
+          value: smr-social-media-reuploader-secret
+
+  - it: refuses settings managed by the chart
+    set:
+      env.PORT: 9000
+    asserts:
+      - failedTemplate:
+          errorPattern: "env.PORT is set by the chart"
+
+  - it: refuses plain-text GUI secrets in env
+    set:
+      env.ADMIN_TOKEN: not-here
+    asserts:
+      - failedTemplate:
+          errorPattern: "env.ADMIN_TOKEN would put a secret in plain text"
+
+  - it: ignores empty legacy secret keys (old example values)
+    set:
+      env.ADMIN_TOKEN: ""
+      env.SECRET_KEY: ""
+    asserts:
+      - isKind:
+          of: Deployment
+      - notExists:
+          path: spec.template.spec.containers[0].env[?(@.name == "SECRET_KEY")]
+
+  - it: does not pass GUI-only settings to the bot
+    set:
+      env.OAUTH_ADMIN_GROUPS: admins
+    asserts:
+      - notExists:
+          path: spec.template.spec.containers[0].env[?(@.name == "OAUTH_ADMIN_GROUPS")]
+
+  - it: uses a custom container port everywhere
+    set:
+      containerPort: 9090
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].ports[0]
+          value:
+            name: http
+            containerPort: 9090
+            protocol: TCP
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: PORT
+            value: "9090"
+
+  - it: probes /health on the named port
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].startupProbe.httpGet
+          value:
+            path: /health
+            port: http
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.httpGet
+          value:
+            path: /health
+            port: http
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.httpGet
+          value:
+            path: /health
+            port: http
+      - equal:
+          path: spec.template.spec.containers[0].livenessProbe.failureThreshold
+          value: 3
+
+  - it: mounts the DB volume and a size-limited emptyDir on /tmp
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: data
+            mountPath: /app/data
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: tmp
+            mountPath: /tmp
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: data
+            persistentVolumeClaim:
+              claimName: smr-social-media-reuploader-data
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: tmp
+            emptyDir:
+              sizeLimit: 4Gi
+
+  - it: sizes the /tmp emptyDir from the profile or tmpVolume
+    set:
+      resourceProfile: large
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: tmp
+            emptyDir:
+              sizeLimit: 8Gi
+
+  - it: accepts an explicit /tmp size and medium
+    set:
+      tmpVolume.sizeLimit: 10Gi
+      tmpVolume.medium: Memory
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: tmp
+            emptyDir:
+              sizeLimit: 10Gi
+              medium: Memory
+
+  - it: keeps the DB in an emptyDir without persistence (bot only)
+    set:
+      db.pvc.enabled: false
+      gui.enabled: false
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: data
+            emptyDir: {}
+
+  - it: mounts an existing claim and custom DB location
+    set:
+      db.pvc.existingClaim: old-data
+      db.pvc.mountPath: /data
+      db.fileName: bot.sqlite
+    asserts:
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: data
+            persistentVolumeClaim:
+              claimName: old-data
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: data
+            mountPath: /data
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: REQUESTS_DB
+            value: /data/bot.sqlite
+
+  - it: refuses a TMP_DIR outside the writable /tmp
+    set:
+      env.TMP_DIR: /scratch
+    asserts:
+      - failedTemplate:
+          errorPattern: "env.TMP_DIR \\(/scratch\\) must be under /tmp/"
+
+  - it: mounts the cookies Secret read-only and points yt-dlp at it
+    set:
+      ytdlpCookies.existingSecret: smr-cookies
+      env.YTDLP_COOKIES_PATH: /ignored/cookies.txt
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: YTDLP_COOKIES_PATH
+            value: /etc/social-media-reuploader/cookies/cookies.txt
+      - notContains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: YTDLP_COOKIES_PATH
+            value: /ignored/cookies.txt
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: ytdlp-cookies
+            mountPath: /etc/social-media-reuploader/cookies
+            readOnly: true
+      - equal:
+          path: spec.template.spec.volumes[?(@.name == "ytdlp-cookies")].secret.secretName
+          value: smr-cookies
+      - equal:
+          path: spec.template.spec.volumes[?(@.name == "ytdlp-cookies")].secret.items
+          value:
+            - key: cookies.txt
+              path: cookies.txt
+
+  - it: adds extra env, envFrom, volumes and mounts
+    set:
+      extraEnv:
+        - name: YTDLP_PROXY
+          valueFrom:
+            secretKeyRef:
+              name: proxy
+              key: url
+      extraEnvFrom:
+        - secretRef:
+            name: more-settings
+      extraVolumes:
+        - name: cache
+          emptyDir: {}
+      extraVolumeMounts:
+        - name: cache
+          mountPath: /cache
+    asserts:
+      - contains:
+          path: spec.template.spec.containers[0].env
+          content:
+            name: YTDLP_PROXY
+            valueFrom:
+              secretKeyRef:
+                name: proxy
+                key: url
+      - equal:
+          path: spec.template.spec.containers[0].envFrom
+          value:
+            - secretRef:
+                name: more-settings
+      - contains:
+          path: spec.template.spec.volumes
+          content:
+            name: cache
+            emptyDir: {}
+      - contains:
+          path: spec.template.spec.containers[0].volumeMounts
+          content:
+            name: cache
+            mountPath: /cache
+
+  - it: runs unprivileged with a read-only root filesystem
+    asserts:
+      - equal:
+          path: spec.template.spec.securityContext.runAsNonRoot
+          value: true
+      - equal:
+          path: spec.template.spec.securityContext.runAsUser
+          value: 1000
+      - equal:
+          path: spec.template.spec.securityContext.fsGroup
+          value: 1000
+      - equal:
+          path: spec.template.spec.containers[0].securityContext
+          value:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+      - equal:
+          path: spec.template.spec.automountServiceAccountToken
+          value: false
+      - equal:
+          path: spec.template.spec.serviceAccountName
+          value: smr-social-media-reuploader-sa
+
+  - it: prefers the node of the GUI (shared ReadWriteOnce volume)
+    asserts:
+      - equal:
+          path: spec.template.spec.affinity.podAffinity.preferredDuringSchedulingIgnoredDuringExecution[0].podAffinityTerm
+          value:
+            labelSelector:
+              matchLabels:
+                app.kubernetes.io/instance: smr
+                app.kubernetes.io/component: gui
+            topologyKey: kubernetes.io/hostname
+
+  - it: has no affinity without the GUI
+    set:
+      gui.enabled: false
+    asserts:
+      - notExists:
+          path: spec.template.spec.affinity
+
+  - it: uses a custom affinity verbatim
+    set:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+              - matchExpressions:
+                  - key: kubernetes.io/arch
+                    operator: In
+                    values:
+                      - amd64
+    asserts:
+      - notExists:
+          path: spec.template.spec.affinity.podAffinity
+      - equal:
+          path: spec.template.spec.affinity.nodeAffinity.requiredDuringSchedulingIgnoredDuringExecution.nodeSelectorTerms[0].matchExpressions[0].key
+          value: kubernetes.io/arch
+
+  - it: applies the resource profile
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources
+          value:
+            requests:
+              cpu: 200m
+              memory: 512Mi
+              ephemeral-storage: 1Gi
+            limits:
+              cpu: 1000m
+              memory: 1Gi
+              ephemeral-storage: 5Gi
+
+  - it: prefers explicit resources over the profile
+    set:
+      resources:
+        requests:
+          cpu: 1
+        limits:
+          memory: 3Gi
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].resources
+          value:
+            requests:
+              cpu: 1
+            limits:
+              memory: 3Gi
+
+  - it: refuses an unknown resource profile
+    set:
+      resourceProfile: huge
+    asserts:
+      - failedTemplate:
+          errorPattern: "unknown resourceProfile \"huge\""
+
+  - it: uses the image of the chart
+    asserts:
+      - matchRegex:
+          path: spec.template.spec.containers[0].image
+          pattern: ^ghcr\.io/lucaam/social-media-reuploader:\d+\.\d+\.\d+$
+
+  - it: uses an image override
+    set:
+      image.repository: registry.example.com/smr
+      image.tag: "1.2.3"
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: registry.example.com/smr:1.2.3
+
+  - it: renders scheduling settings
+    set:
+      nodeSelector:
+        disk: ssd
+      tolerations:
+        - key: dedicated
+          operator: Equal
+          value: media
+          effect: NoSchedule
+    asserts:
+      - equal:
+          path: spec.template.spec.nodeSelector
+          value:
+            disk: ssd
+      - equal:
+          path: spec.template.spec.tolerations[0].key
+          value: dedicated

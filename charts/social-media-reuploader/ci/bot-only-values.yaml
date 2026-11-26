@@ -1,0 +1,11 @@
+# Bot only, no persistence (the DB lives in an emptyDir), small profile.
+secret:
+  name: smr-bot
+gui:
+  enabled: false
+db:
+  pvc:
+    enabled: false
+resourceProfile: small
+env:
+  RATE_LIMITS: ""

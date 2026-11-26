@@ -1,17 +1,23 @@
-{{- if .Values.db.pvc.enabled -}}
+{{- if and .Values.db.pvc.enabled (not .Values.db.pvc.existingClaim) -}}
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
-  name: {{ include "social-media-reuploader.fullname" . }}-data
+  name: {{ include "social-media-reuploader.dbClaimName" . }}
   labels:
-{{ include "social-media-reuploader.labels" . | nindent 4 }}
+    {{- include "social-media-reuploader.labels" . | nindent 4 }}
+  {{- with .Values.db.pvc.annotations }}
+  annotations:
+    {{- toYaml . | nindent 4 }}
+  {{- end }}
 spec:
+  # SQLite (WAL) needs a local block volume shared by pods on ONE node: the
+  # GUI is scheduled next to the bot, so ReadWriteOnce is enough.
   accessModes:
-    - ReadWriteOnce
+    {{- toYaml (.Values.db.pvc.accessModes | default (list "ReadWriteOnce")) | nindent 4 }}
   resources:
     requests:
-      storage: {{ .Values.db.pvc.size | quote }}
-  {{- if .Values.db.pvc.storageClass }}
-  storageClassName: {{ .Values.db.pvc.storageClass }}
+      storage: {{ .Values.db.pvc.size | default "1Gi" | quote }}
+  {{- with .Values.db.pvc.storageClass }}
+  storageClassName: {{ ternary "" . (eq . "-") | quote }}
   {{- end }}
-{{- end -}}
+{{- end }}

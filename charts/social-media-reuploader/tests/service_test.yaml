@@ -1,14 +1,48 @@
-suite: GUI service
+suite: bot Service
 templates:
-  - templates/gui-service.yaml
+  - templates/service.yaml
+release:
+  name: smr
+  namespace: bots
 tests:
-  - it: should render GUI service when enabled
-    set:
-      gui.enabled: true
-      gui.port: 8081
+  - it: exposes the bot HTTP port (health, metrics, webhook)
     asserts:
       - isKind:
           of: Service
       - equal:
+          path: metadata.name
+          value: smr-social-media-reuploader
+      - equal:
+          path: spec.ports
+          value:
+            - name: http
+              port: 80
+              targetPort: http
+              protocol: TCP
+      - equal:
+          path: spec.selector
+          value:
+            app.kubernetes.io/instance: smr
+            app.kubernetes.io/component: bot
+      - isSubset:
+          path: metadata.labels
+          content:
+            app.kubernetes.io/component: bot
+
+  - it: accepts a custom type, port and annotations
+    set:
+      service.type: NodePort
+      service.port: 8080
+      service.annotations:
+        prometheus.io/scrape: "true"
+    asserts:
+      - equal:
+          path: spec.type
+          value: NodePort
+      - equal:
           path: spec.ports[0].port
-          value: 8081
+          value: 8080
+      - isSubset:
+          path: metadata.annotations
+          content:
+            prometheus.io/scrape: "true"

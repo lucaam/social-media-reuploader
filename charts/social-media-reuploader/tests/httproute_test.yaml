@@ -1,18 +1,97 @@
 suite: HTTPRoute
 templates:
   - templates/httproute.yaml
+release:
+  name: smr
+  namespace: bots
 tests:
-  - it: renders HTTPRoute when gatewayApi.enabled true
+  - it: is disabled by default
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: renders a Gateway API v1 HTTPRoute to the GUI
     set:
       gatewayApi.enabled: true
       gatewayApi.gatewayName: test-gateway
       gatewayApi.hosts:
         - example.com
-      gatewayApi.path: /
-      gatewayApi.servicePort: 80
     asserts:
       - isKind:
           of: HTTPRoute
+      - isAPIVersion:
+          of: gateway.networking.k8s.io/v1
       - equal:
-          path: spec.parentRefs[0].name
-          value: test-gateway
+          path: spec.parentRefs
+          value:
+            - name: test-gateway
+      - equal:
+          path: spec.hostnames
+          value:
+            - example.com
+      - equal:
+          path: spec.rules
+          value:
+            - matches:
+                - path:
+                    type: PathPrefix
+                    value: /
+              backendRefs:
+                - name: smr-social-media-reuploader-gui
+                  port: 8081
+
+  - it: references the Gateway namespace and listener
+    set:
+      gatewayApi.enabled: true
+      gatewayApi.gatewayName: shared
+      gatewayApi.gatewayNamespace: infra
+      gatewayApi.sectionName: https
+    asserts:
+      - equal:
+          path: spec.parentRefs[0]
+          value:
+            name: shared
+            namespace: infra
+            sectionName: https
+      - notExists:
+          path: spec.hostnames
+
+  - it: routes the webhook path to the bot Service
+    set:
+      gatewayApi.enabled: true
+      gatewayApi.gatewayName: test-gateway
+      gatewayApi.paths:
+        - path: /
+          service: gui
+        - path: /webhook
+          service: bot
+    asserts:
+      - equal:
+          path: spec.rules[1].backendRefs
+          value:
+            - name: smr-social-media-reuploader
+              port: 80
+      - equal:
+          path: spec.rules[1].matches[0].path.value
+          value: /webhook
+
+  - it: keeps the legacy single path
+    set:
+      gatewayApi.enabled: true
+      gatewayApi.gatewayName: test-gateway
+      gatewayApi.paths: []
+      gatewayApi.path: /admin
+    asserts:
+      - equal:
+          path: spec.rules[0].matches[0].path.value
+          value: /admin
+      - equal:
+          path: spec.rules[0].backendRefs[0].name
+          value: smr-social-media-reuploader-gui
+
+  - it: needs the Gateway name
+    set:
+      gatewayApi.enabled: true
+    asserts:
+      - failedTemplate:
+          errorPattern: "needs gatewayApi.gatewayName"

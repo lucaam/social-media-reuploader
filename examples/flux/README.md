@@ -1,16 +1,26 @@
-Flux examples for deploying the Helm chart in this repository
+Esempi Flux per il chart Helm di questo repository
 
-This folder contains example Flux manifests you can adapt to deploy the bundled
-Helm chart `charts/social-media-reuploader` using Flux (v2).
+Questa cartella contiene manifest Flux (v2) di esempio per installare il chart
+`charts/social-media-reuploader` direttamente da questo repository.
 
-Important: do NOT store real secrets in the repository. Use SealedSecrets,
-ExternalSecrets, SOPS-encrypted files or Kubernetes Secret objects managed
-outside of this repo.
+Importante: NON salvare segreti nel repository. Usa SealedSecrets,
+External Secrets, file cifrati con SOPS oppure Secret creati fuori da Git.
 
-Files:
-- `gitrepository.yaml` - example `GitRepository` source (replace `url`).
-- `helmrelease.yaml` - example `HelmRelease` referencing the chart path in this repo.
+File:
+- `gitrepository.yaml`: sorgente `GitRepository` (`source.toolkit.fluxcd.io/v1`)
+  che segue `main` (per deploy riproducibili fissa un tag di release); sostituisci
+  `url` con il tuo repository.
+- `helmrelease.yaml`: `HelmRelease` (`helm.toolkit.fluxcd.io/v2`) che usa il chart
+  dal percorso del repository, con il token del bot nel Secret `smr-bot` e le
+  credenziali della GUI nel Secret `smr-gui`.
 
-Usage:
-1. Copy these manifests to the cluster or add them to a Flux-controlled repo.
-2. Replace placeholders (repo URL, namespace, secret names) with your real values.
+Uso:
+1. Crea il namespace `smr` e i Secret `smr-bot` (chiave `BOT_TOKEN`) e `smr-gui`
+   (chiavi `SECRET_KEY` e `ADMIN_TOKEN`, oppure le impostazioni `OAUTH_*`).
+2. Applica i manifest (o aggiungili a un repository gestito da Flux):
+   `kubectl apply -f examples/flux/`.
+3. Controlla con `flux get helmreleases -n smr`.
+
+Il chart di ogni release usa l'immagine della stessa versione: non serve
+impostare `image.tag` nella `HelmRelease`, a meno di voler installare un'altra
+versione.
