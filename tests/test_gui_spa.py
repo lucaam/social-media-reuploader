@@ -623,6 +623,50 @@ def test_the_open_detail_follows_live_changes_with_its_actions(tmp_path, api):
 
 
 # ---------------------------------------------------------------------------
+# Italian labels
+# ---------------------------------------------------------------------------
+def test_worker_codes_stages_and_history_entries_are_translated(tmp_path, api):
+    failed_request(3, "https://example.com/v/1", code="forbidden")
+    failed_request(3, "https://example.com/v/2", code="send_failed")
+    failed_request(3, "https://example.com/v/3", code="invalid_request")
+    again = failed_request(5, "https://example.com/v/4")
+    assert db.requeue_requests([again], actor="gui:bearer") == [again]
+    running = db.create_request(4, "https://example.com/v/5")
+    assert db.claim_request(running)
+    job = {"request_id": running, "chat_id": 4, "stage": "downloading"}
+    db.set_worker_status({"pid": 1, "running": [job]})
+    routes = snapshot(api, *DEFAULT_GETS, f"api/requests/{again}")
+    run_spa(
+        tmp_path,
+        f"""
+        const table = h.text('requestsBody')
+        for (const label of ['Il bot non può scrivere nella chat', 'Invio a Telegram non riuscito',
+          'Richiesta non valida (chat o link mancante)']) {{
+          h.ok(table.includes(label), label + ' in ' + table)
+        }}
+        for (const code of ['forbidden', 'send_failed', 'invalid_request']) {{
+          h.ok(!table.includes(code), 'raw code ' + code)
+        }}
+        const row = h.find('requestsBody', (node) => node.tagName === 'TR' &&
+          node.children[0].textContent === '{again}')
+        h.button(row, 'Dettagli').click()
+        await h.settle()
+        const events = h.el('modalBody').descendants()
+          .filter((node) => node.tagName === 'TR')
+          .map((tr) => tr.children[1].textContent)
+        h.eq(events, ['Evento', 'Rimessa in coda', 'Fallita', 'In elaborazione'], 'history')
+        h.el('modalClose').click()
+        h.goto('#queue')
+        await h.settle()
+        const jobs = h.text('runningList')
+        h.ok(jobs.includes('fase: download · iniziata'), jobs)
+        """,
+        routes=routes,
+        hash="#requests",
+    )
+
+
+# ---------------------------------------------------------------------------
 # System tab
 # ---------------------------------------------------------------------------
 def test_clearing_the_history_says_which_requests_are_kept(tmp_path, api):

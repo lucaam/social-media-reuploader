@@ -56,7 +56,25 @@
     pending_cap: 'Troppe richieste in attesa',
     duplicate: 'Link già inviato di recente',
     interrupted: 'Interrotta da un riavvio',
-    interrupted_while_sending: 'Interrotta durante l\'invio'
+    interrupted_while_sending: 'Interrotta durante l\'invio',
+    send_failed: 'Invio a Telegram non riuscito',
+    forbidden: 'Il bot non può scrivere nella chat',
+    invalid_request: 'Richiesta non valida (chat o link mancante)'
+  }
+  // What a running job is doing (pipeline stages in the worker heartbeat).
+  const STAGE_LABELS = {
+    starting: 'avvio',
+    extracting: 'analisi del link',
+    server_fetch: 'download da parte di Telegram',
+    downloading: 'download',
+    converting: 'conversione',
+    sending: 'invio a Telegram',
+    finishing: 'completamento'
+  }
+  // Request history entries that are not statuses (the others use STATUS_META).
+  const HISTORY_LABELS = {
+    requeued: 'Rimessa in coda',
+    interrupted: 'Interrotta da un riavvio'
   }
   const EVENT_LABELS = {
     request_created: 'Richiesta creata',
@@ -247,6 +265,14 @@
   function errorLabel (code) {
     if (!code) return ''
     return ERROR_LABELS[code] || code
+  }
+
+  function stageLabel (stage) {
+    return STAGE_LABELS[stage] || stage
+  }
+
+  function historyLabel (type) {
+    return HISTORY_LABELS[type] || (STATUS_META[type] && STATUS_META[type].label) || type || ''
   }
 
   function chatLabel (chatId, chatType) {
@@ -1100,7 +1126,7 @@
     for (const e of r.events || []) {
       tbody.append(el('tr', null,
         el('td', { text: fmtDate(e.created_at) }),
-        el('td', { text: (STATUS_META[e.type] && STATUS_META[e.type].label) || e.type }),
+        el('td', { text: historyLabel(e.type) }),
         el('td', { className: 'wrap', text: e.details || '' }),
         el('td', { text: e.duration_seconds === null ? '' : fmtSeconds(e.duration_seconds) })))
     }
@@ -1166,7 +1192,7 @@
     if (!d.running.length) running.append(emptyItem('Nessun job in esecuzione.'))
     for (const r of d.running) {
       const meta = ['chat ' + chatLabel(r.chat_id, r.chat_type) + ' · ', statusMeta(r.status).label]
-      if (r.stage) meta.push(' · fase: ' + r.stage)
+      if (r.stage) meta.push(' · fase: ' + stageLabel(r.stage))
       meta.push(' · iniziata ', timeAgo(r.processing_started_at))
       if (r.stale) meta.push(el('span', { className: 'badge text-bg-warning ms-2', text: 'worker non attivo' }))
       running.append(queueItem(r, meta, [button('Dettagli', 'btn-outline-secondary', () => openDetail(r.id))]))
@@ -1374,7 +1400,7 @@
         return fields.length ? 'Aggiornati: ' + fields.join(', ') : 'Aggiornata'
       }
       case 'request_event':
-        return (e.event_type || '') + (e.duration_seconds ? ' (' + fmtSeconds(e.duration_seconds) + ')' : '')
+        return historyLabel(e.event_type) + (e.duration_seconds ? ' (' + fmtSeconds(e.duration_seconds) + ')' : '')
       case 'queue_cleared':
         return fmtNumber(e.count) + ' richieste annullate' + (e.chat_id ? ' della chat ' + e.chat_id : '') + (e.actor ? ' da ' + e.actor : '')
       case 'rate_limit_changed':
