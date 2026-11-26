@@ -209,6 +209,7 @@ class WorkerPool:
         self._maintenance: asyncio.Task[None] | None = None
         self._stop_task: asyncio.Task[None] | None = None
         self._wake_event: asyncio.Event | None = None
+        self._halt_event: asyncio.Event | None = None  # stops the heartbeat
         self._loop: asyncio.AbstractEventLoop | None = None
         self._started = False
         self._closing = False
@@ -241,6 +242,7 @@ class WorkerPool:
         self._started = True
         self._loop = asyncio.get_running_loop()
         self._wake_event = asyncio.Event()
+        self._halt_event = asyncio.Event()
         self._started_at = db.now_iso()
         try:
             await self._prepare_start()
@@ -309,13 +311,20 @@ class WorkerPool:
         if self._dispatcher is not None:
             await self._finish(self._dispatcher, max(timeout, 1.0))
         await self._drain_jobs(timeout)
-        for task in (self._heartbeat, self._maintenance):
-            if task is not None:
-                task.cancel()
+        if self._maintenance is not None:
+            self._maintenance.cancel()
+        if self._halt_event is not None:
+            # Let the heartbeat finish its current write: a cancelled task
+            # would leave the write running in its thread, racing "stopped".
+            self._halt_event.set()
         await self._finish_notices()
         background = [t for t in (self._heartbeat, self._maintenance) if t is not None]
         if background:
-            await asyncio.wait(background, timeout=CANCEL_GRACE_SECONDS)
+            _done, pending = await asyncio.wait(
+                background, timeout=CANCEL_GRACE_SECONDS
+            )
+            for task in pending:
+                task.cancel()
         if self._started:
             await self._publish_status(state="stopped")
         self._stopped = True
@@ -808,12 +817,17 @@ class WorkerPool:
         )
 
     async def _heartbeat_loop(self) -> None:
-        while True:
+        halt = self._halt_event
+        if halt is None:
+            raise RuntimeError("the heartbeat runs only after start()")
+        while not halt.is_set():
             try:
                 await self._publish_status()
             except Exception:  # task boundary: keep publishing
                 logger.exception("Heartbeat error")
-            await asyncio.sleep(_float_setting("WORKER_HEARTBEAT_SECONDS"))
+            with contextlib.suppress(TimeoutError):
+                async with asyncio.timeout(_float_setting("WORKER_HEARTBEAT_SECONDS")):
+                    await halt.wait()
 
     # ------------------------------------------------------------------
     # Maintenance

@@ -9,9 +9,11 @@
 Every attempt ends with exactly one outcome (:class:`Outcome`):
 
 * ``done``: delivered, ``mark_done`` (sizes, sent message id, media type).
-* ``retry``: a retryable error (``DownloadError.retryable``, a long Telegram
-  flood wait on the URL fetch) before the upload started and attempts left:
-  ``defer_request`` with exponential backoff.
+* ``retry``: a retryable error (``DownloadError.retryable``, or a Telegram
+  flood wait seen before anything was uploaded: at start or on the URL
+  fetch) with attempts left: ``defer_request`` with exponential backoff (at
+  least the flood wait). A flood wait during a claimed upload is waited out
+  in place (bounded), because a ``sending`` row cannot go back to the queue.
 * ``failed``: ``mark_failed(error_code)``; the user gets 🍌 plus, in private
   chats, the Italian explanation (groups only get a text for ``too_large``,
   which carries the original link).
@@ -21,10 +23,12 @@ Every attempt ends with exactly one outcome (:class:`Outcome`):
   queue, or to ``failed``/``interrupted_while_sending`` when an upload may
   already have reached Telegram; the ``CancelledError`` propagates.
 
-Nothing is ever posted twice on purpose: uploads are claimed with
-``mark_sending`` first, ambiguous upload failures (timeouts, disconnects,
-5xx: Telegram may have posted) are never retried, and once something was
-delivered no error can send the request back to the queue.
+Nothing is ever posted twice on purpose: local uploads are claimed with
+``mark_sending`` first (a refusal means: do not send); the Telegram URL fetch
+runs while the row is still ``processing`` (so a refusal can fall back to a
+download or be retried) but counts as in flight; ambiguous failures
+(timeouts, disconnects, 5xx: Telegram may have posted) are never retried; and
+once something was delivered no error can send the request back to the queue.
 """
 
 from __future__ import annotations
@@ -420,29 +424,43 @@ class Feedback:
         )
         return bool(result.get("ok"))
 
-    async def reply(self, text: str, reply_to: int | None = None) -> int | None:
+    async def _send_reply(self, text: str) -> dict[str, Any]:
         result = await telegram_api.send_message(
             self._token,
             self._request.chat_id,
             text,
-            reply_to_message_id=(
-                reply_to if reply_to is not None else self._request.original_message_id
-            ),
+            reply_to_message_id=self._request.original_message_id,
         )
         if not result.get("ok"):
             logger.info(
                 "Request %s: cannot send a message to chat %s: %s",
                 self._request.id,
                 self._request.chat_id,
-                result.get("description"),
+                telegram_api.redact(result.get("description"), self._token),
             )
-            return None
-        return _first_message_id(result)
+        return result
 
-    async def working(self) -> None:
+    async def reply(self, text: str) -> int | None:
+        """Reply to the user's message (sent even if it was deleted); its id."""
+        result = await self._send_reply(text)
+        return _first_message_id(result) if result.get("ok") else None
+
+    async def working(self) -> float | None:
+        """👀, or the status message when reactions fail.
+
+        Returns Telegram's flood wait (seconds) when both were refused with
+        429: nothing can be posted in this chat for a while.
+        """
         if await self.react(REACTION_WORKING):
-            return
-        self.status_message_id = await self.reply(messages.PROCESSING)
+            return None
+        result = await self._send_reply(messages.PROCESSING)
+        if result.get("ok"):
+            self.status_message_id = _first_message_id(result)
+            return None
+        failure = send_failure(result)
+        if failure.retryable and getattr(failure, "not_sent", False):
+            return getattr(failure, "retry_after", None)
+        return None
 
     async def say(self, text: str) -> None:
         """Final text: turn the status message into it, or send a reply."""
@@ -512,7 +530,14 @@ class RequestProcessor:
             request.attempts,
         )
         try:
-            await self.feedback.working()
+            flood_wait = await self.feedback.working()
+            if flood_wait:
+                raise SendFailed(
+                    f"Telegram flood control: retry after {flood_wait:.0f}s",
+                    retryable=True,
+                    retry_after=flood_wait,
+                    error_code=429,
+                )
             return await self._process()
         except asyncio.CancelledError:
             await self._interrupted()

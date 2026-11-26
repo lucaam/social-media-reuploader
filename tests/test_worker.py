@@ -749,6 +749,25 @@ def test_row_without_url_is_failed_as_invalid(env):
     assert env.tg.calls == []
 
 
+def test_flood_wait_at_start_defers_before_downloading(env):
+    flood = {
+        "ok": False,
+        "error_code": 429,
+        "description": "Too Many Requests: retry after 900",
+        "parameters": {"retry_after": 900},
+    }
+    env.tg.respond("set_message_reaction", flood)
+    env.tg.respond("send_message", flood)
+    before = time.time()
+    result, row = process_new()
+    assert result.outcome == pipeline.Outcome.RETRY
+    assert result.error_phase == pipeline.Phase.SEND
+    assert row["status"] == "queued"
+    assert db.ts_from_iso(row["not_before"]) >= before + 899
+    assert env.site.fetches == []
+    assert env.tg.uploads() == []
+
+
 def test_upload_flood_wait_is_retried_in_place(env):
     env.tg.respond(
         "send_video",
