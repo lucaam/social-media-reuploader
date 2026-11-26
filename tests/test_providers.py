@@ -1284,6 +1284,7 @@ def test_resolve_fb_watch(fake_session):
     assert kwargs["allow_redirects"] is False
     assert isinstance(kwargs["timeout"], aiohttp.ClientTimeout)
     assert kwargs["timeout"].total == 5.0
+    assert kwargs["timeout"].sock_connect == 5.0  # not dropped by the override
     assert "Mozilla" in kwargs["headers"]["User-Agent"]
     assert kwargs["proxy"] is None
 

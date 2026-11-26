@@ -2,8 +2,10 @@
 
 One session per event loop (a session cannot be used from another loop, e.g.
 after ``asyncio.run()`` is called again in tests). The session has a default
-timeout (callers pass stricter per-request timeouts), keeps no cookies and
-caches DNS answers.
+timeout, keeps no cookies and caches DNS answers. Requests that need another
+total timeout pass :func:`request_timeout` (a bare
+``ClientTimeout(total=...)`` replaces the session default entirely and drops
+its connect timeout).
 """
 
 from __future__ import annotations
@@ -21,6 +23,19 @@ _CONNECTION_LIMIT = 50
 
 _session: aiohttp.ClientSession | None = None
 _session_loop: asyncio.AbstractEventLoop | None = None
+
+
+def request_timeout(total: float) -> aiohttp.ClientTimeout:
+    """Per-request timeout of ``total`` seconds that keeps the connect timeout.
+
+    Without ``sock_connect`` a hung TCP connect only ends when ``total``
+    expires, as a plain ``TimeoutError`` (the request may have been sent)
+    instead of ``aiohttp.ConnectionTimeoutError`` (it was not).
+    """
+    connect = DEFAULT_TIMEOUT.sock_connect
+    return aiohttp.ClientTimeout(
+        total=total, sock_connect=total if connect is None else min(total, connect)
+    )
 
 
 def _new_session() -> aiohttp.ClientSession:

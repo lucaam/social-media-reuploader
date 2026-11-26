@@ -270,7 +270,9 @@ async def _post(
 ) -> dict[str, Any]:
     url = f"{api_base()}/bot{token}/{method}"
     session = await http_client.get_session()
-    client_timeout = aiohttp.ClientTimeout(total=timeout)
+    # Keeps the connect timeout: a hung connect must end as a (retried for
+    # every method) ConnectionTimeoutError, not as an ambiguous TimeoutError.
+    client_timeout = http_client.request_timeout(timeout)
     if form is None:
         async with session.post(url, json=dict(params), timeout=client_timeout) as resp:
             return await _read_response(resp)

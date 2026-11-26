@@ -1317,7 +1317,7 @@ async def _fetch_location(
         async with session.get(
             url,
             allow_redirects=False,
-            timeout=aiohttp.ClientTimeout(total=timeout),
+            timeout=http_client.request_timeout(timeout),
             headers=_resolve_headers(rule),
             proxy=_resolve_proxy(),
         ) as resp:

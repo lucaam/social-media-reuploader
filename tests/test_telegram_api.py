@@ -6,6 +6,8 @@ The shared aiohttp session is replaced by a fake: no network, no Telegram.
 import asyncio
 import json
 import logging
+import socket
+import time
 
 import aiohttp
 import pytest
@@ -295,6 +297,83 @@ def test_connection_errors_are_retried_for_every_method(session, sleeps):
     assert run(telegram_api.send_message(TOKEN, 1, "x"))["ok"] is True
     assert len(fake.calls) == 3
     assert sleeps == [1.0, 2.0]
+
+
+def test_per_request_timeouts_keep_the_connect_timeout(session, tmp_path):
+    fake = session(ok())
+    run(telegram_api.send_message(TOKEN, 1, "x"))
+    video = tmp_path / "v.mp4"
+    video.write_bytes(b"\x00" * 10)
+    run(telegram_api.send_video(TOKEN, 1, str(video)))
+    run(telegram_api.call(TOKEN, "getMe", timeout=2.0))
+    timeouts = [(c["timeout"].total, c["timeout"].sock_connect) for c in fake.calls]
+    assert timeouts == [(20.0, 15), (200.0, 15), (2.0, 2.0)]
+
+
+@pytest.fixture
+def hung_connect_port():
+    """A loopback port whose new TCP connects hang (full accept queue).
+
+    The kernel drops SYNs to a listener whose accept queue is full, like a
+    firewall black-holing a data centre. Skipped where connects do not hang.
+    """
+    listener = socket.socket()
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(0)
+    port = listener.getsockname()[1]
+    fillers = []
+    for _ in range(8):
+        filler = socket.socket()
+        filler.setblocking(False)
+        filler.connect_ex(("127.0.0.1", port))
+        fillers.append(filler)
+    probe = socket.socket()
+    probe.settimeout(0.3)
+    try:
+        probe.connect(("127.0.0.1", port))
+    except TimeoutError:
+        pass  # hangs: what the test needs
+    except OSError as exc:
+        pytest.skip(f"cannot simulate a hung connect here: {exc!r}")
+    else:
+        pytest.skip("connects to a full accept queue do not hang here")
+    finally:
+        probe.close()
+    try:
+        yield port
+    finally:
+        for sock in (*fillers, listener):
+            sock.close()
+
+
+def test_hung_connect_is_a_connection_timeout_retried_for_sends(
+    hung_connect_port, sleeps, monkeypatch
+):
+    """The request never left this host: retried even for sendMessage."""
+    monkeypatch.setattr(
+        config, "TELEGRAM_API_BASE", f"http://127.0.0.1:{hung_connect_port}"
+    )
+    monkeypatch.setattr(config, "TELEGRAM_MAX_RETRIES", 1)
+    monkeypatch.setattr(
+        http_client,
+        "DEFAULT_TIMEOUT",
+        aiohttp.ClientTimeout(total=60, sock_connect=0.2),
+    )
+
+    async def scenario():
+        try:
+            return await telegram_api.call(
+                TOKEN, "sendMessage", {"chat_id": 1, "text": "x"}, timeout=3.0
+            )
+        finally:
+            await http_client.close_session()
+
+    started = time.monotonic()
+    result = run(scenario())
+    assert result["ok"] is False
+    assert result["description"].startswith("network error: ConnectionTimeoutError")
+    assert sleeps == [1.0]  # retried once
+    assert time.monotonic() - started < 2.5  # did not wait for the 3 s total
 
 
 def test_ambiguous_failures_not_retried_for_sends(session, sleeps, tmp_path):
