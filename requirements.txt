@@ -8,4 +8,10 @@ itsdangerous==2.2.0
 prometheus-client==0.26.0
 uvicorn==0.51.0
 websockets==16.1.1
-yt-dlp==2026.7.4
+# yt-dlp with the runtime pieces it needs to work well:
+# - default:   yt-dlp-ejs (YouTube JS challenge solver), brotli, mutagen,
+#              pycryptodomex, requests, certifi, websockets
+# - curl-cffi: browser impersonation (TikTok, Instagram, Vimeo, ...)
+# - deno:      the JavaScript runtime yt-dlp uses to solve YouTube challenges
+#              (installed as a wheel: the `deno` binary lands next to python)
+yt-dlp[default,curl-cffi,deno]==2026.11.23
