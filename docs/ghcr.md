@@ -17,8 +17,11 @@ numero di versione più alto.
    la versione successiva dai Conventional Commits dall'ultimo tag (`feat` →
    minor, `fix` e altri → patch, `!`/`BREAKING CHANGE` → major), aggiorna
    `src/__init__.py`, `Chart.yaml` (`version`, `appVersion`) e i tag immagine in
-   `values.yaml`, apre la PR `chore(release): bump versions to vX.Y.Z` e avvia
-   la CI su quel branch.
+   `values.yaml` e apre la PR `chore(release): bump versions to vX.Y.Z`. Con
+   il secret `RELEASE_TOKEN` branch e PR vengono creati con quel token e
+   partono tutti i check della PR. Senza, vengono creati con `GITHUB_TOKEN`,
+   che non avvia workflow: il workflow lancia la CI sul branch e gli altri
+   check obbligatori partono solo chiudendo e riaprendo la PR.
 2. Si rivede e si fa il merge della PR.
 3. **Publish Release on Bump PR Merge** (`publish-bump-release.yml`) crea il tag
    e la release GitHub sul commit di merge e chiama **Docker publish**
@@ -42,6 +45,9 @@ Altri workflow:
 ## Permessi e segreti
 
 - Il push su GHCR usa `GITHUB_TOKEN` con `packages: write` (già nei workflow).
+- `RELEASE_TOKEN` (consigliato): fine-grained personal access token limitato a
+  questo repository, con *Contents* e *Pull requests* in lettura e scrittura,
+  usato da *Manual Version Bump* per il branch e la PR di bump (vedi sopra).
 - `GHCR_PAT` (facoltativo): token personale con permessi di amministrazione del
   package, usato solo per rendere pubblico il package dopo il push. Senza, il
   passaggio viene saltato.

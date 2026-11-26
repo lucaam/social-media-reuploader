@@ -6,7 +6,7 @@ on:
 permissions:
   contents: write
   pull-requests: write
-  # to dispatch CI on the bump branch
+  # to dispatch CI on the bump branch (without RELEASE_TOKEN)
   actions: write
 
 defaults:
@@ -18,11 +18,21 @@ jobs:
   bump:
     name: Bump versions and open PR
     runs-on: ubuntu-latest
+    env:
+      # A branch pushed and a pull request opened with GITHUB_TOKEN start no
+      # workflows, so the required checks of the bump PR (lint, commitlint,
+      # Docker build) would never report. With the RELEASE_TOKEN secret (a
+      # fine-grained personal access token with read/write "Contents" and
+      # "Pull requests" on this repository) the branch is pushed and the PR
+      # opened with it instead, and every pull_request workflow runs.
+      HAS_RELEASE_TOKEN: ${{ secrets.RELEASE_TOKEN != '' }}
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+          # The bump script pushes the branch with these credentials.
+          token: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
 
       - name: Set git user
         run: |
@@ -49,7 +59,7 @@ jobs:
       - name: Create Pull Request
         if: steps.bump.outputs.branch != ''
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_TOKEN: ${{ secrets.RELEASE_TOKEN || secrets.GITHUB_TOKEN }}
           BRANCH: ${{ steps.bump.outputs.branch }}
           VERSION: ${{ steps.bump.outputs.version }}
         run: |
@@ -58,6 +68,11 @@ jobs:
             echo "Automated version bump to v${VERSION}."
             echo
             echo "Merging this PR creates the release v${VERSION} and publishes the Docker image."
+            if [ "$HAS_RELEASE_TOKEN" != "true" ]; then
+              echo
+              echo "Opened with GITHUB_TOKEN (no RELEASE_TOKEN secret): only CI was started on the branch."
+              echo "Close and reopen this PR to run the other required checks (see RELEASE.md)."
+            fi
             echo
             echo "Commits:"
             if [ -n "$last_tag" ]; then
@@ -69,11 +84,14 @@ jobs:
           gh pr create --title "chore(release): bump versions to v${VERSION}" \
             --body-file pr-body.md --head "$BRANCH" --base main
 
-      - name: Run CI on the bump branch
-        if: steps.bump.outputs.branch != ''
+      - name: Run CI on the bump branch (no RELEASE_TOKEN)
+        if: steps.bump.outputs.branch != '' && env.HAS_RELEASE_TOKEN != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BRANCH: ${{ steps.bump.outputs.branch }}
-        # Pull requests opened with GITHUB_TOKEN start no workflows, but
-        # workflow_dispatch does: run the tests on the bump commit.
-        run: gh workflow run ci.yml --ref "$BRANCH"
+        # The PR was opened with GITHUB_TOKEN, which starts no workflows, but
+        # workflow_dispatch does: run the tests on the bump commit. The other
+        # required checks only run when someone closes and reopens the PR.
+        run: |
+          gh workflow run ci.yml --ref "$BRANCH"
+          echo "::warning::Bump PR opened with GITHUB_TOKEN: only CI runs. Close and reopen the PR to run lint, commitlint and the Docker build, or set the RELEASE_TOKEN secret (RELEASE.md)."
