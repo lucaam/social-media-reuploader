@@ -13,9 +13,10 @@ Routes on ``config.HOST:config.PORT``:
 
 Webhook mode also serves (see :func:`add_webhook_routes`):
 
-* ``POST config.WEBHOOK_PATH`` - aiogram ``SimpleRequestHandler``. Requests
-  must carry the ``X-Telegram-Bot-Api-Secret-Token`` header registered with
-  setWebhook (401 otherwise).
+* ``POST config.WEBHOOK_PATH`` (with or without a trailing slash) - aiogram
+  ``SimpleRequestHandler``. Requests must carry the
+  ``X-Telegram-Bot-Api-Secret-Token`` header registered with setWebhook (401
+  otherwise).
 * ``POST /webhook/{token}`` - DEPRECATED, kept only for the transition from
   setups whose webhook URL contains the bot token. The token is compared in
   constant time. It will be removed in a future release.
@@ -457,16 +458,28 @@ def add_webhook_routes(
     secret_token: str,
     token: str,
 ) -> None:
-    """Register ``POST path`` (secret header) and the legacy token route."""
+    """Register ``POST path`` (secret header) and the legacy token route.
+
+    Both are served with and without a trailing slash: aiohttp matches paths
+    exactly, and the webhook URL registered with Telegram may differ from
+    WEBHOOK_PATH by a trailing slash (``bot.webhook_settings`` accepts it).
+    """
     handler = SimpleRequestHandler(
         dispatcher=dispatcher, bot=bot, secret_token=secret_token
     )
-    app.router.add_post(path, _webhook_view(handler, state, secret_token))
+    view = _webhook_view(handler, state, secret_token)
+    for route in _with_and_without_slash(path):
+        app.router.add_post(route, view)
     # The path token authenticates the legacy route (no secret header check).
     legacy = SimpleRequestHandler(dispatcher=dispatcher, bot=bot)
-    app.router.add_post(
-        LEGACY_WEBHOOK_ROUTE, _legacy_webhook_view(legacy, state, token)
-    )
+    legacy_view = _legacy_webhook_view(legacy, state, token)
+    for route in _with_and_without_slash(LEGACY_WEBHOOK_ROUTE):
+        app.router.add_post(route, legacy_view)
+
+
+def _with_and_without_slash(path: str) -> tuple[str, ...]:
+    base = path.rstrip("/")
+    return (base, base + "/") if base else ("/",)
 
 
 # ---------------------------------------------------------------------------
@@ -491,7 +504,10 @@ class QuietAccessLogger(AbstractAccessLogger):
         if path in PROBE_PATHS:
             return logging.INFO if _debug() else logging.DEBUG
         webhook_path = str(getattr(config, "WEBHOOK_PATH", "") or "/webhook")
-        is_webhook = path in ("/" + webhook_path.lstrip("/"), "/webhook/<redacted>")
+        # Served with and without a trailing slash (see add_webhook_routes).
+        is_webhook = path == "/webhook/<redacted>" or (
+            path.rstrip("/") == ("/" + webhook_path.strip("/")).rstrip("/")
+        )
         if is_webhook and status < 400:
             return logging.DEBUG
         return logging.INFO

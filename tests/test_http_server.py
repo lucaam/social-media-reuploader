@@ -496,6 +496,39 @@ def test_webhook_non_ascii_secret_is_unauthorized_not_a_crash(
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
 
+def test_webhook_is_served_with_and_without_a_trailing_slash(telegram):
+    pool, state = FakePool(), ready_state("webhook")
+
+    def app_for(path):
+        app = http_server.create_app(state)
+        http_server.add_webhook_routes(
+            app,
+            dispatcher=create_dispatcher(pool),
+            bot=Bot(TOKEN),
+            state=state,
+            path=path,
+            secret_token=SECRET,
+            token=TOKEN,
+        )
+        return app
+
+    async def scenario(client):
+        statuses = [
+            (await post_json(client, "/webhook", raw_update(1), SECRET)).status,
+            (await post_json(client, "/webhook/", raw_update(2), SECRET)).status,
+            (await post_json(client, "/webhook/", raw_update(3), "wrong")).status,
+            (await post_json(client, f"/webhook/{TOKEN}/", raw_update(4))).status,
+        ]
+        await wait_for(lambda: len(pool.calls) == 3)
+        return statuses
+
+    # WEBHOOK_URL=https://host/webhook/ with WEBHOOK_PATH=/webhook, and back.
+    for path in ("/webhook", "/webhook/"):
+        pool.calls.clear()
+        assert serve(state, scenario, app=app_for(path)) == [200, 200, 401, 200]
+        assert sorted(c[2]["original_message_id"] for c in pool.calls) == [11, 12, 14]
+
+
 @pytest.mark.parametrize(
     ("body", "status"),
     [("{not json", 400), ("[1, 2]", 400), ('{"message": {}}', 400)],
@@ -673,6 +706,7 @@ def test_access_log_levels_follow_the_webhook_path(monkeypatch):
     monkeypatch.setattr(config, "WEBHOOK_PATH", "tg/hook")  # normalized to /tg/hook
     access = QuietAccessLogger(logging.getLogger("aiohttp.access"), "")
     assert access._level("/tg/hook", 200) == logging.DEBUG
+    assert access._level("/tg/hook/", 200) == logging.DEBUG
     assert access._level("/tg/hook", 401) == logging.INFO
     assert access._level("/webhook/<redacted>", 200) == logging.DEBUG
     assert access._level("/other", 200) == logging.INFO
