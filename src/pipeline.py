@@ -121,6 +121,8 @@ class Phase(StrEnum):
     SEND = "send"
 
 
+# Stages whose errors happen on Telegram's side (Phase.SEND).
+_SEND_STAGES = frozenset({Stage.SERVER_FETCH, Stage.SENDING, Stage.FINISHING})
 # messages.failure(step=...): where a too_large refusal happened, by stage.
 _FAILURE_STEPS: Mapping[Stage, str] = {
     Stage.CONVERTING: "convert",
@@ -997,7 +999,12 @@ class RequestProcessor:
         return JobResult(Outcome.SKIPPED)
 
     def _phase(self, err: DownloadError) -> Phase:
-        return Phase.SEND if isinstance(err, SendFailed) else Phase.DOWNLOAD
+        """Where the attempt failed: on Telegram (the URL fetch, the upload, or
+        a flood wait before any work) or while getting the media. By stage,
+        not by error type: a Telegram 413 is a TooLarge raised by the upload."""
+        if isinstance(err, SendFailed) or self.state.stage in _SEND_STAGES:
+            return Phase.SEND
+        return Phase.DOWNLOAD
 
     async def _failed(self, err: DownloadError) -> JobResult:
         request = self.request

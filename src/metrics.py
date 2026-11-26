@@ -42,6 +42,7 @@ DOWNLOAD_METHODS = ("local", "server_fetch")
 MEDIA_TYPES = ("video", "audio", "document")
 QUEUE_STATES = ("queued", "deferred", "running")
 # Error phases: "download" (extract/download/convert) or "send" (Telegram).
+DOWNLOAD_PHASE = "download"
 SEND_PHASE = "send"
 
 links_received_total = Counter(
@@ -74,7 +75,8 @@ downloads_failed_total = Counter(
 )
 uploads_failed_total = Counter(
     f"{_PREFIX}_uploads_failed_total",
-    "Attempts whose Telegram upload failed, by error code",
+    "Attempts that failed on Telegram's side (URL fetch, upload, or a flood "
+    "wait before them), by error code",
     ["code"],
 )
 files_sent_total = Counter(
@@ -140,8 +142,10 @@ def record_job(
     """One processing attempt finished.
 
     ``done`` counts the delivery (method, files by media type, bytes);
-    ``failed``/``retry`` count the error code as a download or an upload
-    failure (``error_phase == "send"``).
+    ``failed``/``retry`` count the error code as a download
+    (``error_phase == "download"``) or an upload (``"send"``) failure.
+    Attempts without a phase (rows that cannot be processed at all) are
+    only counted as processed.
     """
     processed_links_total.labels(outcome=outcome).inc()
     processing_duration_seconds.labels(outcome=outcome).observe(
@@ -159,7 +163,7 @@ def record_job(
         return
     if error_phase == SEND_PHASE:
         uploads_failed_total.labels(code=error_code).inc()
-    else:
+    elif error_phase == DOWNLOAD_PHASE:
         downloads_failed_total.labels(code=error_code).inc()
     if error_code == "too_large" and outcome == "failed":
         files_too_large_total.inc()

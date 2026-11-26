@@ -59,6 +59,18 @@ def test_record_job_failures_by_phase_and_code():
     assert value("downloads_failed_total", code="timeout") == before[3] + 1
 
 
+def test_record_job_without_a_phase_is_neither_a_download_nor_an_upload():
+    before = (
+        value("downloads_failed_total", code="invalid_request"),
+        value("uploads_failed_total", code="invalid_request"),
+        value("processed_links_total", outcome="failed"),
+    )
+    metrics.record_job("failed", 0.0, error_code="invalid_request")
+    assert value("downloads_failed_total", code="invalid_request") == before[0]
+    assert value("uploads_failed_total", code="invalid_request") == before[1]
+    assert value("processed_links_total", outcome="failed") == before[2] + 1
+
+
 def test_queue_depth_and_render():
     metrics.set_queue_depth(queued=4, deferred=2, running=1)
     assert value("queue_depth", state="queued") == 4

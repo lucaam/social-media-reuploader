@@ -792,6 +792,7 @@ def test_row_without_url_is_failed_as_invalid(env):
     row["url"] = None
     result = run(process(row))
     assert result.error_code == "invalid_request"
+    assert result.error_phase is None  # neither a download nor an upload
     assert db.get_request(request_id)["status"] == "failed"
     assert env.tg.calls == []
 
@@ -899,6 +900,30 @@ def test_telegram_413_is_reported_as_too_large(env):
     _, row = process_new()
     assert row["error_code"] == "too_large"
     assert URL in env.tg.texts()[0]
+
+
+def test_telegram_413_counts_as_an_upload_failure(env):
+    env.tg.respond(
+        "send_video",
+        {"ok": False, "error_code": 413, "description": "Request Entity Too Large"},
+    )
+    uploads = metric("uploads_failed_total", code="too_large")
+    downloads = metric("downloads_failed_total", code="too_large")
+    too_large = metric("files_too_large_total")
+
+    async def scenario():
+        pool = await started_pool()
+        try:
+            result = await pool.submit(42, URL, provider=match(), original_message_id=1)
+            await wait_until(lambda: status(result.request_id) == "failed")
+            await wait_until(lambda: pool.running == 0)
+        finally:
+            await pool.stop()
+
+    run(scenario())
+    assert metric("uploads_failed_total", code="too_large") == uploads + 1
+    assert metric("downloads_failed_total", code="too_large") == downloads
+    assert metric("files_too_large_total") == too_large + 1
 
 
 @pytest.mark.parametrize(
