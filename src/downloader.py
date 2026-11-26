@@ -202,6 +202,14 @@ def _clip(text: str, limit: int) -> str:
 
 _MAX_FILESIZE_RE = re.compile(r"File is larger than max-filesize[^\n]*", re.IGNORECASE)
 _LOG_PREFIXES = ("WARNING:", "ERROR:", "[", "DEBUG:", "Traceback", "Deleting ")
+# A missing or broken JavaScript runtime (YouTube's signature/n challenges).
+# yt-dlp reports it with WARNINGs only and drops the formats that needed it.
+_JS_RUNTIME_NEEDLES = ("javascript runtime", "js runtime", "challenge solving failed")
+_MISSING_FORMATS_NEEDLES = (
+    "requested format is not available",
+    "no video formats found",
+    "no formats found",
+)
 
 # (error class, retryable, needles). Order matters: the first match wins.
 # ``DownloadError`` rows stop the search with a generic (non-content) error.
@@ -217,8 +225,7 @@ _RULES: tuple[tuple[type[DownloadError], bool, tuple[str, ...]], ...] = (
         False,
         (
             "impersonat",
-            "javascript runtime",
-            "js runtime",
+            *_JS_RUNTIME_NEEDLES,
             "cookies database",
             "failed to load cookies",
             "cookieloaderror",
@@ -415,6 +422,16 @@ def classify_message(message: str) -> tuple[type[DownloadError], bool]:
     return DownloadError, False
 
 
+def _js_runtime_warning(stderr: str) -> str | None:
+    """yt-dlp's warning about a missing or broken JavaScript runtime, if any."""
+    for line in _stderr_lines(stderr):
+        if line.startswith("WARNING:"):
+            text = _normalize(line)
+            if any(needle in text for needle in _JS_RUNTIME_NEEDLES):
+                return line[len("WARNING:") :].strip()
+    return None
+
+
 def classify_ytdlp_error(
     stderr: str,
     *,
@@ -424,8 +441,10 @@ def classify_ytdlp_error(
     """Build the typed error for a failed yt-dlp run.
 
     The *last* ``ERROR:`` line decides; earlier ones are only used when the
-    last one is generic. ``stdout`` is checked for yt-dlp's (non-error)
-    "File is larger than max-filesize" notice.
+    last one is generic. ``WARNING:`` lines never decide, except that missing
+    formats after a JavaScript runtime warning are a (local) configuration
+    error, not :class:`NoMedia`. ``stdout`` is checked for yt-dlp's
+    (non-error) "File is larger than max-filesize" notice.
     """
     tail = (stderr or "")[-STDERR_TAIL_CHARS:]
     if stdout:
@@ -435,11 +454,23 @@ def classify_ytdlp_error(
     messages = error_messages(stderr)
     for message in reversed(messages):
         cls, retryable = classify_message(message)
+        if cls is NoMedia and any(
+            needle in _normalize(message) for needle in _MISSING_FORMATS_NEEDLES
+        ):
+            warning = _js_runtime_warning(stderr)
+            if warning:
+                return DownloadError(
+                    f"{message} (yt-dlp warned: {warning})", stderr_tail=tail
+                )
         if cls is not DownloadError or retryable:
             return cls(message, retryable=retryable, stderr_tail=tail)
     if messages:
         return DownloadError(messages[-1], stderr_tail=tail)
-    lines = [line for line in _stderr_lines(stderr) if line]
+    lines = [
+        line
+        for line in _stderr_lines(stderr)
+        if line and not line.startswith("WARNING:")
+    ]
     if lines:
         cls, retryable = classify_message(lines[-1])
         return cls(lines[-1], retryable=retryable, stderr_tail=tail)
@@ -804,10 +835,12 @@ def _configured_headers() -> dict[str, str]:
 
 def common_args(*, cookies_path: str | None = None) -> list[str]:
     """Options shared by every yt-dlp run (auth/impersonation included, always)."""
+    # No --no-warnings: yt-dlp reports some local problems (e.g. a missing
+    # JavaScript runtime) only as warnings. They end up in the (bounded)
+    # stderr capture and stderr_tail; the classification ignores them.
     args = [
         "--ignore-config",
         "--no-playlist",
-        "--no-warnings",
         "--no-progress",
         "--no-update",
         "--no-mtime",

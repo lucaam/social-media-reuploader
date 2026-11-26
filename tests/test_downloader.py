@@ -243,6 +243,56 @@ def test_max_filesize_notice_on_stdout_is_too_large():
     assert "31965 bytes > 1000 bytes" in err.detail
 
 
+# What yt-dlp 2026.11 prints when it cannot solve YouTube's JavaScript
+# challenges (no deno, or an outdated yt-dlp-ejs): warnings only, then the
+# formats that needed the solution are missing.
+JS_RUNTIME_WARNINGS = (
+    "WARNING: [youtube] No supported JavaScript runtime could be found. Only deno "
+    "is enabled by default; to use another runtime add  --js-runtimes "
+    "RUNTIME[:PATH]  to your command/config. YouTube extraction without a JS "
+    "runtime has been deprecated, and some formats may be missing. See  "
+    "https://github.com/yt-dlp/yt-dlp/wiki/EJS  for details on installing one\n"
+    "WARNING: [youtube] dQw4w9WgXcQ: n challenge solving failed: Some formats may "
+    "be missing. Ensure you have a supported JavaScript runtime and challenge "
+    "solver script distribution installed. Review any warnings presented before "
+    "this message. For more details, refer to  "
+    "https://github.com/yt-dlp/yt-dlp/wiki/EJS\n"
+)
+FORMAT_NOT_AVAILABLE = (
+    "ERROR: [youtube] dQw4w9WgXcQ: Requested format is not available. "
+    "Use --list-formats for a list of available formats\n"
+)
+
+
+def test_missing_javascript_runtime_is_a_configuration_error():
+    # not "no video in this link": the bot cannot run YouTube's JavaScript
+    err = classify_ytdlp_error(JS_RUNTIME_WARNINGS + FORMAT_NOT_AVAILABLE)
+    assert type(err) is DownloadError
+    assert (err.code, err.retryable) == ("failed", False)
+    assert "Requested format is not available" in err.detail
+    assert "JavaScript runtime" in err.detail
+    # without those warnings the same error still means "nothing to download"
+    assert isinstance(classify_ytdlp_error(FORMAT_NOT_AVAILABLE), NoMedia)
+    # and the warnings never hide a specific error
+    removed = "ERROR: [youtube] dQw4w9WgXcQ: Video unavailable\n"
+    assert isinstance(
+        classify_ytdlp_error(JS_RUNTIME_WARNINGS + removed), ContentUnavailable
+    )
+    drm = "ERROR: [youtube] dQw4w9WgXcQ: This video is DRM protected\n"
+    assert isinstance(classify_ytdlp_error(JS_RUNTIME_WARNINGS + drm), NoMedia)
+
+
+def test_warnings_are_not_a_fallback_error_message():
+    # yt-dlp killed (no ERROR line) after a warning that mentions cookies
+    stderr = (
+        "WARNING: [youtube] The provided YouTube account cookies are no longer "
+        "valid. They have likely been rotated in the browser as a security measure\n"
+    )
+    err = classify_ytdlp_error(stderr, returncode=-9)
+    assert type(err) is DownloadError
+    assert err.detail == "yt-dlp exited with status -9"
+
+
 def test_classify_without_error_line():
     err = classify_ytdlp_error(
         "Traceback (most recent call last):\nKeyboardInterrupt\n", returncode=1
@@ -326,12 +376,14 @@ def test_fetch_argv_always_has_auth_options(monkeypatch):
     for flag in (
         "--ignore-config",
         "--no-playlist",
-        "--no-warnings",
         "--no-progress",
         "--no-update",
         "--dump-single-json",
     ):
         assert flag in argv
+    # warnings stay in stderr: diagnostics (e.g. a missing JavaScript runtime)
+    # for logs and stderr_tail; the classification ignores them
+    assert "--no-warnings" not in argv
     assert argv[argv.index("--ies") + 1] == "default,-generic"
     assert argv[argv.index("--playlist-items") + 1] == "1:10"
     assert argv[argv.index("--cookies") + 1] == "/work/.cookies-1.txt"
