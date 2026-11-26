@@ -328,6 +328,18 @@ _RULES: tuple[tuple[type[DownloadError], bool, tuple[str, ...]], ...] = (
         ),
     ),
     (
+        # consequences printed after the real reason (e.g. "Got error: HTTP
+        # Error 503 ... Giving up after 10 retries"): generic, so that the
+        # scan goes back to that reason; "fragment 1 not found" is not a 404
+        DownloadError,
+        False,
+        (
+            "unable to continue",
+            "the downloaded file is empty",
+            "did not get any data blocks",
+        ),
+    ),
+    (
         ContentUnavailable,
         False,
         (
@@ -361,6 +373,16 @@ def _normalize(text: str) -> str:
     return " ".join(text.lower().split())
 
 
+def _stderr_lines(stderr: str) -> list[str]:
+    """The stripped lines of yt-dlp's stderr.
+
+    Only ``\\n`` ends a line: yt-dlp prints download failures as
+    ``ERROR: \\r[download] Got error: ...``, and ``str.splitlines()`` would
+    cut that message away from its ``ERROR:`` prefix.
+    """
+    return [line.replace("\r", " ").strip() for line in (stderr or "").split("\n")]
+
+
 def error_messages(stderr: str) -> list[str]:
     """Return the ``ERROR:`` messages printed by yt-dlp, in order.
 
@@ -369,8 +391,7 @@ def error_messages(stderr: str) -> list[str]:
     """
     messages: list[list[str]] = []
     current: list[str] | None = None
-    for raw_line in (stderr or "").splitlines():
-        line = raw_line.strip()
+    for line in _stderr_lines(stderr):
         if line.startswith("ERROR:"):
             current = [line[len("ERROR:") :].strip()]
             messages.append(current)
@@ -415,7 +436,7 @@ def classify_ytdlp_error(
             return cls(message, retryable=retryable, stderr_tail=tail)
     if messages:
         return DownloadError(messages[-1], stderr_tail=tail)
-    lines = [line.strip() for line in (stderr or "").splitlines() if line.strip()]
+    lines = [line for line in _stderr_lines(stderr) if line]
     if lines:
         cls, retryable = classify_message(lines[-1])
         return cls(lines[-1], retryable=retryable, stderr_tail=tail)

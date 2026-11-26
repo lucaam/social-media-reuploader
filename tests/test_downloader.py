@@ -154,6 +154,57 @@ def test_classify_realistic_stderr(name, code, retryable):
     assert "ERROR:" in err.stderr_tail  # the (redacted) tail is kept for logs
 
 
+# stderr of real yt-dlp downloads (--load-info-json) that gave up. yt-dlp
+# prints the cause as "ERROR: \r[download] Got error: ...", often followed
+# by a generic consequence ("fragment 1 not found, unable to continue").
+DOWNLOAD_STDERR_FIXTURES = FIXTURES / "ytdlp_stderr_download"
+EXPECTED_DOWNLOAD_CLASSIFICATION = {
+    "dash_first_fragment_503": ("failed", True, "HTTP Error 503"),
+    "dash_first_fragment_404": ("unavailable", False, "HTTP Error 404"),
+    "hls_all_fragments_503": ("failed", True, "HTTP Error 503"),
+    "http_503_after_retries": ("failed", True, "HTTP Error 503"),
+}
+
+
+def test_every_download_stderr_fixture_has_an_expectation():
+    names = {path.stem for path in DOWNLOAD_STDERR_FIXTURES.glob("*.txt")}
+    assert names == set(EXPECTED_DOWNLOAD_CLASSIFICATION)
+
+
+@pytest.mark.parametrize(
+    ("name", "code", "retryable", "cause"),
+    sorted(
+        (name, *expected) for name, expected in EXPECTED_DOWNLOAD_CLASSIFICATION.items()
+    ),
+)
+def test_classify_download_stage_stderr(name, code, retryable, cause):
+    # bytes: text mode would turn the carriage returns into newlines
+    stderr = (DOWNLOAD_STDERR_FIXTURES / f"{name}.txt").read_bytes().decode()
+    assert "ERROR: \r[download] Got error:" in stderr
+    err = classify_ytdlp_error(stderr, returncode=1)
+    assert (err.code, err.retryable) == (code, retryable)
+    assert cause in err.detail  # the cause, not "fragment 1 not found ..."
+
+
+@pytest.mark.parametrize(
+    ("cause", "expected"),
+    [
+        ("The read operation timed out", DownloadTimeout),
+        ("[Errno 104] Connection reset by peer", DownloadError),
+        ("HTTP Error 429: Too Many Requests", DownloadError),
+    ],
+)
+def test_download_error_cause_survives_the_carriage_return(cause, expected):
+    stderr = (
+        f"ERROR: \r[download] Got error: {cause}. Giving up after 10 retries\n"
+        "ERROR: fragment 1 not found, unable to continue\n"
+    )
+    err = classify_ytdlp_error(stderr, returncode=1)
+    assert type(err) is expected
+    assert err.retryable is True
+    assert err.detail == f"[download] Got error: {cause}. Giving up after 10 retries"
+
+
 def test_long_warning_prefix_does_not_hide_the_error():
     stderr = "WARNING: " + "x" * 5000 + "\n" + "WARNING: use --cookies\n"
     stderr += "ERROR: [youtube] abc: Video unavailable"
@@ -1393,9 +1444,15 @@ class _QuietHandler(http.server.SimpleHTTPRequestHandler):
 
 
 class _StreamingHandler(_QuietHandler):
-    """Streams /stream without Content-Length (like chunked CDN responses)."""
+    """Streams /stream without Content-Length (like chunked CDN responses);
+    /status/<code>/... answers with that HTTP status (e.g. a CDN 503)."""
 
     def do_GET(self):
+        if self.path.startswith("/status/"):
+            self.send_response(int(self.path.split("/")[2]))
+            self.send_header("Content-Length", "0")
+            self.end_headers()
+            return None
         if not self.path.startswith("/stream"):
             return super().do_GET()
         self.send_response(200)
@@ -1663,6 +1720,42 @@ def test_streaming_without_content_length_is_capped(
     with pytest.raises(TooLarge, match="download exceeded 1 MiB"):
         run(downloader.download(info, str(workdir)))
     assert time.monotonic() - started < 20
+
+
+def _dash_format(base, fragments, *, fid="dash-240"):
+    """A segmented DASH format (yt-dlp's http_dash_segments downloader)."""
+    return {
+        "format_id": fid,
+        "ext": "mp4",
+        "vcodec": "avc1.64000d",
+        "acodec": "mp4a.40.2",
+        "width": 320,
+        "height": 240,
+        "tbr": 300,
+        "protocol": "http_dash_segments",
+        "url": f"{base}/manifest.mpd",
+        "manifest_url": f"{base}/manifest.mpd",
+        "fragment_base_url": f"{base}/",
+        "fragments": [{"path": path, "duration": 2} for path in fragments],
+    }
+
+
+def test_server_error_on_a_fragment_is_retryable(real_ytdlp, media_server, tmp_path):
+    # the CDN answers 503 to the first DASH fragment until yt-dlp gives up:
+    # a transient failure, not "the content was removed"
+    root, base = media_server
+    (root / "seg1.m4s").write_bytes(b"\0" * 1000)
+    raw = _raw_video(
+        [_dash_format(base, ["status/503/seg0.m4s", "seg1.m4s"])], duration=4
+    )
+    real_ytdlp(raw)
+    workdir = tmp_path / "work"
+    info = run(downloader.fetch_info("https://example.invalid/vid1", str(workdir)))
+    with pytest.raises(DownloadError) as excinfo:
+        run(downloader.download(info, str(workdir)))
+    err = excinfo.value
+    assert (err.code, err.retryable) == ("failed", True)
+    assert "HTTP Error 503" in err.detail
 
 
 def test_download_multi_item_post_in_order(real_ytdlp, media_server, tmp_path):
