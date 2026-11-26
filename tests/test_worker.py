@@ -981,6 +981,31 @@ def test_group_with_reactions_shows_only_the_banana(env):
     assert env.tg.of("send_message", "edit_message_text") == []
 
 
+REACTION_INVALID = {
+    "ok": False,
+    "error_code": 400,
+    "description": "Bad Request: REACTION_INVALID",
+}
+
+
+def test_group_that_refuses_the_banana_gets_the_text_and_loses_the_eyes(env):
+    # The admins allow 👀 but not 🍌: no stale 👀, and the failure is explained.
+    env.tg.respond("set_message_reaction", DEFAULT, REACTION_INVALID)
+    env.site.fetch_errors.append(downloader.AuthRequired("private post"))
+    _, row = process_new(chat_id=-1001, chat_type="supergroup")
+    assert row["status"] == "failed"
+    assert env.tg.reactions() == ["👀", "🍌", None]
+    assert env.tg.texts() == [messages.failure("auth_required")]
+
+
+def test_refused_trophy_removes_the_eyes(env):
+    env.tg.respond("set_message_reaction", DEFAULT, REACTION_INVALID)
+    _, row = process_new(chat_id=-1001, chat_type="supergroup")
+    assert row["status"] == "done"
+    assert env.tg.reactions() == ["👀", "🏆", None]
+    assert env.tg.texts() == []
+
+
 def test_row_taken_away_before_the_upload_is_not_sent(env):
     request_id = new_request()
     row = claim(request_id)

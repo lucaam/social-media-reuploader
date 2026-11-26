@@ -16,7 +16,7 @@ Every attempt ends with exactly one outcome (:class:`Outcome`):
   in place (bounded), because a ``sending`` row cannot go back to the queue.
 * ``failed``: ``mark_failed(error_code)``; the user gets 🍌 plus, in private
   chats, the Italian explanation (groups only get a text for ``too_large``,
-  which carries the original link).
+  which carries the original link, or when the chat refuses the 🍌).
 * ``skipped``: ``mark_sending`` refused (the row was cancelled, deleted or
   already handled): nothing is sent.
 * interrupted (the task is cancelled by a shutdown): the row goes back to the
@@ -433,13 +433,15 @@ class Feedback:
     """Reactions on the user's message, or a status message when they fail.
 
     👀 while working (fallback: an "In lavorazione 👀" reply), 🏆 on success,
-    🍌 on failure. Every call is best effort: telegram_api never raises.
+    🍌 on failure; when the chat refuses the final emoji the 👀 is removed.
+    Every call is best effort: telegram_api never raises.
     """
 
     def __init__(self, token: str, request: Request) -> None:
         self._token = token
         self._request = request
         self.status_message_id: int | None = None
+        self._reacted = False  # our reaction is on the user's message
 
     async def react(self, emoji: str | None) -> bool:
         message_id = self._request.original_message_id
@@ -448,7 +450,24 @@ class Feedback:
         result = await telegram_api.set_message_reaction(
             self._token, self._request.chat_id, message_id, emoji
         )
-        return bool(result.get("ok"))
+        ok = bool(result.get("ok"))
+        if ok:
+            self._reacted = emoji is not None
+        return ok
+
+    async def clear_reaction(self) -> None:
+        """Remove our reaction (👀), if we set one."""
+        if self._reacted:
+            await self.react(None)
+
+    async def finish(self, emoji: str) -> bool:
+        """The final reaction (🏆/🍌). When the chat refuses that emoji (groups
+        can restrict reactions to a set without it), our 👀 is removed so the
+        message does not look in progress forever."""
+        if await self.react(emoji):
+            return True
+        await self.clear_reaction()
+        return False
 
     async def _send_reply(self, text: str) -> dict[str, Any]:
         result = await telegram_api.send_message(
@@ -953,7 +972,7 @@ class RequestProcessor:
                 "Request %s: delivered, but the row was no longer active",
                 self.request.id,
             )
-        await self.feedback.react(REACTION_DONE)
+        await self.feedback.finish(REACTION_DONE)
         await self.feedback.clear_status()
         logger.info(
             "Request %s: delivered %s (%s, %s, message %s)",
@@ -992,7 +1011,7 @@ class RequestProcessor:
                 err.code,
                 err.detail,
             )
-            await self.feedback.react(REACTION_DONE)
+            await self.feedback.finish(REACTION_DONE)
             await self.feedback.clear_status()
             return JobResult(Outcome.DONE, method=self._method)
         max_attempts = int(setting("WORKER_MAX_ATTEMPTS"))
@@ -1040,7 +1059,8 @@ class RequestProcessor:
         return JobResult(Outcome.FAILED, error_code=err.code, error_phase=phase)
 
     async def _report_failure(self, err: DownloadError) -> None:
-        """🍌 always; the explanation in private chats (groups: too_large only)."""
+        """🍌, plus the explanation in private chats (groups: too_large only,
+        or when the chat refuses the 🍌)."""
         if isinstance(err, SendForbidden):
             return  # the bot cannot post in this chat at all
         text = messages.failure(
@@ -1051,11 +1071,12 @@ class RequestProcessor:
             kind=self._kind,
             step=_FAILURE_STEPS.get(self.state.stage, "download"),
         )
-        reacted = await self.feedback.react(REACTION_FAILED)
+        reacted = await self.feedback.finish(REACTION_FAILED)
         explain = self.request.is_private or err.code == downloader.TooLarge.code
-        if explain or (not reacted and self.feedback.status_message_id is not None):
-            # In groups that refuse reactions the status message is the only
-            # trace: it becomes the explanation instead of disappearing.
+        if explain or not reacted:
+            # Without the 🍌 (reactions refused, or restricted to a set
+            # without it) the text is the only trace of the failure; a status
+            # message becomes the explanation instead of disappearing.
             await self.feedback.say(text)
         else:
             await self.feedback.clear_status()
