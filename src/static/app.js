@@ -1520,6 +1520,7 @@
       ['Token amministratore', yes(cfg.auth.token)],
       ['OAuth/OIDC', yes(cfg.auth.oauth)],
       ['Gruppi amministratore', (cfg.auth.oauth_admin_groups || []).join(', ') || null],
+      ['E-mail senza verifica dichiarata usate per il ruolo', yes(cfg.auth.oauth_assume_email_verified)],
       ['Redirect OAuth', cfg.auth.oauth_redirect_uri],
       ['Cookie solo HTTPS', yes(cfg.auth.session_cookie_secure)],
       ['Durata della sessione', fmtWindow(cfg.auth.session_max_age_seconds)]

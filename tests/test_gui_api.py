@@ -700,7 +700,11 @@ def test_the_last_admin_cannot_be_removed_without_another_way_in():
         async def authorize_access_token(self, request):
             return {
                 "access_token": "t",
-                "userinfo": {"sub": "b", "email": "boss@example.com"},
+                "userinfo": {
+                    "sub": "b",
+                    "email": "boss@example.com",
+                    "email_verified": True,
+                },
             }
 
     app = gui.create_app(
@@ -782,7 +786,11 @@ def test_db_failure_during_the_admin_check_is_503_not_forbidden(monkeypatch):
         async def authorize_access_token(self, request):
             return {
                 "access_token": "t",
-                "userinfo": {"sub": "b", "email": "b@example.com"},
+                "userinfo": {
+                    "sub": "b",
+                    "email": "b@example.com",
+                    "email_verified": True,
+                },
             }
 
     app = gui.create_app(

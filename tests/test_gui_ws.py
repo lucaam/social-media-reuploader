@@ -65,7 +65,8 @@ class OAuthProvider:
         return RedirectResponse("/auth")
 
     async def authorize_access_token(self, request):
-        return {"access_token": "t", "userinfo": {"sub": "u", "email": self.email}}
+        userinfo = {"sub": "u", "email": self.email, "email_verified": True}
+        return {"access_token": "t", "userinfo": userinfo}
 
 
 # ---------------------------------------------------------------------------

@@ -260,7 +260,9 @@ def test_other_authorization_schemes_are_ignored():
 
 
 def test_bearer_header_is_ignored_when_token_auth_is_disabled():
-    provider = FakeProvider({"sub": "u", "email": "a@example.com"})
+    provider = FakeProvider(
+        {"sub": "u", "email": "a@example.com", "email_verified": True}
+    )
     db.add_user(email="a@example.com", role="admin")
     app = oauth_app(provider, admin_token=None)
     client, _ = oauth_login(app)
@@ -599,7 +601,9 @@ def test_oauth_group_mapping():
 
 
 def test_oauth_db_role_mapping_is_rechecked_on_every_request():
-    provider = FakeProvider({"sub": "a", "email": "Carol@Example.com"})
+    provider = FakeProvider(
+        {"sub": "a", "email": "Carol@Example.com", "email_verified": True}
+    )
     client, _ = oauth_login(oauth_app(provider))
     assert client.get("/api/requests").status_code == 403
     uid = db.add_user(email="carol@example.com", role="admin")
@@ -613,22 +617,47 @@ def test_oauth_db_role_mapping_is_rechecked_on_every_request():
     assert client.get("/api/requests").status_code == 403
 
 
-@pytest.mark.parametrize("verified", [False, "false", 0])
-def test_unverified_email_never_maps_to_a_db_role(verified):
+@pytest.mark.parametrize("assume", [False, True])
+@pytest.mark.parametrize(
+    "claim", [{"email_verified": False}, {"email_verified": "false"}, {"verified": 0}]
+)
+def test_unverified_email_never_maps_to_a_db_role(claim, assume):
     db.add_user(email="root@example.com", role="admin")
-    claims = {"sub": "evil", "email": "root@example.com", "email_verified": verified}
-    client, _ = oauth_login(oauth_app(FakeProvider(claims)))
+    claims = {"sub": "evil", "email": "root@example.com", **claim}
+    app = oauth_app(FakeProvider(claims), assume_email_verified=assume)
+    client, _ = oauth_login(app)
     assert client.get("/api/requests").status_code == 403
 
 
-def test_verified_or_absent_email_verified_maps_to_a_db_role():
+@pytest.mark.parametrize(
+    "claim",
+    [{"email_verified": True}, {"email_verified": "true"}, {"verified": True}],
+)
+def test_verified_email_maps_to_a_db_role(claim):
     db.add_user(email="root@example.com", role="admin")
-    for verified in (True, "true", None):
-        claims = {"sub": "ok", "email": "root@example.com"}
-        if verified is not None:
-            claims["email_verified"] = verified
-        client, _ = oauth_login(oauth_app(FakeProvider(claims)))
-        assert client.get("/api/requests").status_code == 200
+    claims = {"sub": "ok", "email": "root@example.com", **claim}
+    client, _ = oauth_login(oauth_app(FakeProvider(claims)))
+    assert client.get("/api/requests").status_code == 200
+
+
+def test_email_without_a_verification_claim_needs_the_opt_in(caplog):
+    # e.g. a plain OAuth2 userinfo whose e-mail the user typed in unverified
+    db.add_user(email="boss@example.com", role="admin")
+    claims = {"id": 1, "email": "boss@example.com"}
+    client, _ = oauth_login(oauth_app(FakeProvider(claims), admin_token=None))
+    me = client.get("/api/me").json()
+    assert me["authenticated"] is True
+    assert me["is_admin"] is False
+    assert me["role"] is None
+    assert client.get("/api/users").status_code == 403
+    assert "OAUTH_ASSUME_EMAIL_VERIFIED" in caplog.text
+    opted_in = oauth_app(FakeProvider(claims), assume_email_verified=True)
+    client, _ = oauth_login(opted_in)
+    assert client.get("/api/me").json()["role"] == "admin"
+    assert client.get("/api/users").status_code == 200
+    loaded = AuthSettings.from_env({"OAUTH_ASSUME_EMAIL_VERIFIED": "true"})
+    assert loaded.assume_email_verified is True
+    assert AuthSettings.from_env({}).assume_email_verified is False
 
 
 def test_username_or_subject_never_maps_to_a_db_role():
@@ -670,6 +699,12 @@ def test_userinfo_is_fetched_without_an_id_token_github_style():
     me = client.get("/api/me").json()
     assert me["user"]["sub"] == "42"
     assert me["user"]["username"] == "octo"
+    # GitHub only returns verified addresses but does not say so: opt in.
+    db.add_user(email="octo@example.com", role="admin")
+    assert client.get("/api/me").json()["is_admin"] is False
+    app = oauth_app(provider, oauth=oauth, assume_email_verified=True)
+    client, _ = oauth_login(app)
+    assert client.get("/api/me").json()["is_admin"] is True
 
 
 def test_userinfo_subject_mismatch_is_rejected():
@@ -744,7 +779,7 @@ def test_login_start_failure_renders_an_error_page():
 
 
 def test_oauth_sessions_need_oauth_to_stay_enabled():
-    provider = FakeProvider({"sub": "a", "email": "a@example.com"})
+    provider = FakeProvider({"sub": "a", "email": "a@example.com", "email_verified": 1})
     db.add_user(email="a@example.com", role="admin")
     app = oauth_app(provider)
     client, _ = oauth_login(app)

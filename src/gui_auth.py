@@ -15,6 +15,10 @@ by every HTTP route, by the WebSocket handshake and by ``/api/me``:
   - OAuth sessions are admin when one of their (stored) groups is in
     ``OAUTH_ADMIN_GROUPS`` or when their verified e-mail maps to a DB user
     with role ``admin`` (looked up on every request, so demotion works).
+    Verified means ``email_verified`` (or Discord's ``verified``) is true;
+    an e-mail without any such claim counts only with
+    ``OAUTH_ASSUME_EMAIL_VERIFIED=true`` (providers like GitHub that only
+    return verified addresses), one marked unverified never does.
 
 Settings are read from the environment by :meth:`AuthSettings.from_env`
 (``SECRET_KEY``, ``ADMIN_TOKEN``, ``SESSION_COOKIE_SECURE``,
@@ -155,6 +159,9 @@ class AuthSettings:
     cookie_secure: bool = False
     session_max_age: int = DEFAULT_SESSION_MAX_AGE
     trusted_origins: frozenset[str] = frozenset()  # normalized origins
+    # Use OAuth e-mails that come without any verification claim for the DB
+    # role (GitHub's /user only returns verified addresses but says nothing).
+    assume_email_verified: bool = False
     warnings: tuple[str, ...] = field(default=(), compare=False)
 
     @classmethod
@@ -192,12 +199,19 @@ class AuthSettings:
             cookie_secure=_env_bool(env, "SESSION_COOKIE_SECURE", False, warnings),
             session_max_age=max_age,
             trusted_origins=frozenset(trusted),
+            assume_email_verified=_env_bool(
+                env, "OAUTH_ASSUME_EMAIL_VERIFIED", False, warnings
+            ),
             warnings=tuple(warnings),
         )
 
     @property
     def token_enabled(self) -> bool:
         return bool(self.admin_token)
+
+    def email_trusted(self, verified: bool | None) -> bool:
+        """May an OAuth e-mail with this verification flag get its DB role?"""
+        return verified is True or (verified is None and self.assume_email_verified)
 
 
 def _env(env: Mapping[str, str], name: str) -> str | None:
@@ -523,7 +537,8 @@ def _oauth_principal(
     email = _text(session.get("email"))
     by_group = any(group.casefold() in settings.admin_groups for group in groups)
     role: str | None = None
-    if not by_group and email and session.get("ev") is not False:
+    verified = session.get("ev")
+    if not by_group and email and settings.email_trusted(verified):
         user = lookup_user(email)
         role = str(user["role"]) if user and user.get("role") else None
     return Principal(
@@ -570,8 +585,9 @@ class OAuthIdentity:
     def from_claims(cls, claims: Mapping[str, Any]) -> OAuthIdentity | None:
         """Identity from ID-token/userinfo claims; None without any identifier.
 
-        ``sub`` falls back to ``id`` (GitHub). E-mail is used for the DB role
-        only when ``email_verified`` is not false.
+        ``sub`` falls back to ``id`` (GitHub). ``email_verified`` falls back to
+        ``verified`` (Discord's userinfo); see
+        :meth:`AuthSettings.email_trusted` for when the e-mail gives a DB role.
         """
         subject = _text(claims.get("sub")) or _text(claims.get("id"))
         email = _text(claims.get("email"))
@@ -582,11 +598,14 @@ class OAuthIdentity:
         )
         if not (subject or email or username):
             return None
+        verified = claims.get("email_verified")
+        if verified is None:
+            verified = claims.get("verified")
         return cls(
             subject=subject,
             issuer=_text(claims.get("iss")),
             email=email,
-            email_verified=parse_verified(claims.get("email_verified")),
+            email_verified=parse_verified(verified),
             name=_text(claims.get("name")),
             username=username,
             groups=tuple(claim_groups(claims)),

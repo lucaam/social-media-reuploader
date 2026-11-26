@@ -520,7 +520,29 @@ async def oauth_callback(request: Request) -> Response:
     logger.info(
         "OAuth login: %s", identity.email or identity.username or identity.subject
     )
+    _warn_unusable_email(identity, state.settings)
     return RedirectResponse("./", status_code=302)
+
+
+def _warn_unusable_email(
+    identity: gui_auth.OAuthIdentity, settings: AuthSettings
+) -> None:
+    """Tell the operator why an OAuth e-mail will not map to its DB role."""
+    if not identity.email or settings.email_trusted(identity.email_verified):
+        return
+    if identity.email_verified is False:
+        logger.warning(
+            "OAuth login %s: the provider marks the e-mail as unverified,"
+            " so it does not map to a DB user role",
+            identity.email,
+        )
+        return
+    logger.warning(
+        "OAuth login %s: the provider sent no email_verified claim, so the e-mail"
+        " does not map to a DB user role; set OAUTH_ASSUME_EMAIL_VERIFIED=true if"
+        " the provider only returns verified addresses (e.g. GitHub)",
+        identity.email,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -883,6 +905,7 @@ def runtime_config(request: Request) -> dict[str, Any]:
             "token": settings.token_enabled,
             "oauth": state.oauth_client is not None,
             "oauth_admin_groups": sorted(settings.admin_groups),
+            "oauth_assume_email_verified": settings.assume_email_verified,
             "oauth_redirect_uri": (
                 settings.oauth.redirect_uri if settings.oauth else None
             ),

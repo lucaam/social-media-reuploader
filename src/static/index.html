@@ -318,9 +318,11 @@
           <div class="card mb-3"><div class="card-body">
             <h2 class="h6">Aggiungi utente</h2>
             <p class="small text-body-secondary">
-              Chi accede con OAuth è amministratore se la sua e-mail (verificata dal provider)
+              Chi accede con OAuth è amministratore se la sua e-mail, verificata dal provider,
               corrisponde a un utente con ruolo "Amministratore" oppure se appartiene a un gruppo
-              indicato in OAUTH_ADMIN_GROUPS. I diritti sono ricontrollati a ogni richiesta.
+              indicato in OAUTH_ADMIN_GROUPS. Le e-mail di provider che non dichiarano la verifica
+              (es. GitHub) contano solo con OAUTH_ASSUME_EMAIL_VERIFIED=true.
+              I diritti sono ricontrollati a ogni richiesta.
             </p>
             <form id="userForm" class="row g-2 align-items-end">
               <div class="col-md-5">

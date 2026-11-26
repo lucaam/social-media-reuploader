@@ -79,7 +79,9 @@ def test_login_and_auth_flow_sets_session(monkeypatch):
 
 
 def test_db_role_grants_and_revokes_admin_without_grant_endpoint(monkeypatch):
-    client = _login(monkeypatch, {"sub": "u2", "email": "u2@example.com"})
+    client = _login(
+        monkeypatch, {"sub": "u2", "email": "u2@example.com", "email_verified": True}
+    )
 
     # not an admin yet: the API is forbidden and /api/me agrees
     assert client.get("/requests").status_code == 403
