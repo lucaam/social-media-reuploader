@@ -396,11 +396,29 @@ def _not_accepting() -> web.Response:
     )
 
 
-def _webhook_view(handler: SimpleRequestHandler, state: HealthState) -> Handler:
+def _secret_matches(supplied: str, expected: bytes) -> bool:
+    """Constant-time check of the secret header that never raises.
+
+    Compared as bytes: aiohttp decodes header values with surrogateescape and
+    ``compare_digest`` refuses non-ASCII strings with TypeError, which would
+    turn such requests into HTTP 500s (aiogram's own check compares str).
+    """
+    try:
+        raw = supplied.encode("utf-8", "surrogateescape")
+    except UnicodeEncodeError:
+        return False
+    return hmac.compare_digest(raw, expected)
+
+
+def _webhook_view(
+    handler: SimpleRequestHandler, state: HealthState, secret_token: str
+) -> Handler:
+    expected = secret_token.encode()
+
     async def view(request: web.Request) -> web.StreamResponse:
-        supplied = request.headers.get(SECRET_HEADER, "")
-        if not handler.verify_secret(supplied, handler.bot):
+        if not _secret_matches(request.headers.get(SECRET_HEADER, ""), expected):
             return _invalid("unauthorized", 401)
+        # aiogram checks the header again: it is now the (ASCII) secret.
         return await _feed(handler, state, request)
 
     return view
@@ -443,7 +461,7 @@ def add_webhook_routes(
     handler = SimpleRequestHandler(
         dispatcher=dispatcher, bot=bot, secret_token=secret_token
     )
-    app.router.add_post(path, _webhook_view(handler, state))
+    app.router.add_post(path, _webhook_view(handler, state, secret_token))
     # The path token authenticates the legacy route (no secret header check).
     legacy = SimpleRequestHandler(dispatcher=dispatcher, bot=bot)
     app.router.add_post(

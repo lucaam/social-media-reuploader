@@ -454,6 +454,48 @@ def test_webhook_requires_the_secret(telegram, secret):
     assert pool.calls == []
 
 
+async def raw_post(port, path, header_value: bytes):
+    """POST with a raw secret header value (clients would refuse non-ASCII)."""
+    body = json.dumps(raw_update()).encode()
+    reader, writer = await asyncio.open_connection("127.0.0.1", port)
+    writer.write(
+        b"POST " + path.encode() + b" HTTP/1.1\r\nHost: test\r\n"
+        b"Content-Type: application/json\r\n"
+        + http_server.SECRET_HEADER.encode()
+        + b": "
+        + header_value
+        + b"\r\nContent-Length: "
+        + str(len(body)).encode()
+        + b"\r\nConnection: close\r\n\r\n"
+        + body
+    )
+    await writer.drain()
+    status_line = await reader.readline()
+    writer.close()
+    await writer.wait_closed()
+    return int(status_line.split()[1])
+
+
+@pytest.mark.parametrize(
+    "header_value",
+    ["sécret".encode(), b"s\xe9cret", SECRET.encode() + "é".encode()],
+)
+def test_webhook_non_ascii_secret_is_unauthorized_not_a_crash(
+    telegram, caplog, header_value
+):
+    pool, state = FakePool(), ready_state("webhook")
+
+    async def scenario(client):
+        status = await raw_post(client.port, "/webhook", header_value)
+        await asyncio.sleep(0.05)
+        return status
+
+    with caplog.at_level(logging.ERROR):
+        assert serve(state, scenario, app=webhook_app(state, pool)) == 401
+    assert pool.calls == []
+    assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
+
+
 @pytest.mark.parametrize(
     ("body", "status"),
     [("{not json", 400), ("[1, 2]", 400), ('{"message": {}}', 400)],
