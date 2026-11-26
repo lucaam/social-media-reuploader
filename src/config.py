@@ -237,7 +237,15 @@ TELEGRAM_API_BASE: str | None = env_str("TELEGRAM_API_BASE")
 # ---------------------------------------------------------------------------
 # Logging / health
 # ---------------------------------------------------------------------------
+# A level name (DEBUG, INFO, WARNING, ...): both processes pass it to logging,
+# which raises on unknown names (the GUI would not start).
 LOG_LEVEL: str = (env_str("LOG_LEVEL", "INFO") or "INFO").upper()
+if LOG_LEVEL not in logging.getLevelNamesMapping():
+    CONFIG_WARNINGS.append(
+        f"LOG_LEVEL={LOG_LEVEL!r} is not a log level "
+        "(DEBUG, INFO, WARNING, ERROR, CRITICAL); using INFO"
+    )
+    LOG_LEVEL = "INFO"
 LOG_TO_FILE: bool = env_bool("LOG_TO_FILE", False)
 LOG_FILE: str = env_str("LOG_FILE", os.path.join("data", "telegram_downloader.log"))
 LOG_MAX_BYTES: int = env_int("LOG_MAX_BYTES", 5 * MIB, minimum=1024)
@@ -312,7 +320,26 @@ MAX_LINKS_PER_MESSAGE: int = env_int("MAX_LINKS_PER_MESSAGE", 10, minimum=1, max
 # Media processing (ffmpeg)
 # ---------------------------------------------------------------------------
 WORKER_GENERATE_THUMBNAIL: bool = env_bool("WORKER_GENERATE_THUMBNAIL", True)
-TRANSCODE_PRESET: str = env_str("TRANSCODE_PRESET", "veryfast") or "veryfast"
+# libx264 presets (ffmpeg -preset): any other value makes every re-encode fail.
+X264_PRESETS = (
+    "ultrafast",
+    "superfast",
+    "veryfast",
+    "faster",
+    "fast",
+    "medium",
+    "slow",
+    "slower",
+    "veryslow",
+    "placebo",
+)
+TRANSCODE_PRESET: str = (env_str("TRANSCODE_PRESET", "veryfast") or "veryfast").lower()
+if TRANSCODE_PRESET not in X264_PRESETS:
+    CONFIG_WARNINGS.append(
+        f"TRANSCODE_PRESET={TRANSCODE_PRESET!r} is not an x264 preset "
+        f"({', '.join(X264_PRESETS)}); using veryfast"
+    )
+    TRANSCODE_PRESET = "veryfast"
 TRANSCODE_TIMEOUT: int = env_int("TRANSCODE_TIMEOUT", 900, minimum=30)
 # Max concurrent ffmpeg transcodes (CPU heavy).
 TRANSCODE_CONCURRENCY: int = env_int("TRANSCODE_CONCURRENCY", 1, minimum=1, maximum=8)

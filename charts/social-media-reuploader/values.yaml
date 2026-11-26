@@ -198,6 +198,7 @@ env:
   TELEGRAM_API_BASE: null
 
   # --- Logging / health ------------------------------------------------------
+  # DEBUG, INFO, WARNING, ERROR or CRITICAL.
   LOG_LEVEL: INFO
   # File logging (default false) to LOG_FILE (default data/telegram_downloader.log,
   # i.e. on the data volume), rotated at LOG_MAX_BYTES (5 MB) x LOG_BACKUP_COUNT (5).
@@ -254,8 +255,9 @@ env:
   # --- Media processing (ffmpeg) ----------------------------------------------
   # Thumbnails for videos (default true).
   WORKER_GENERATE_THUMBNAIL: null
-  # x264 preset (veryfast), conversion timeout (900 s), parallel conversions
-  # (1, max 8), longest side when downscaling is needed (1280 px).
+  # x264 preset (veryfast; ultrafast, superfast, faster, fast, medium, slow,
+  # slower, veryslow, placebo), conversion timeout (900 s), parallel
+  # conversions (1, max 8), longest side when downscaling is needed (1280 px).
   TRANSCODE_PRESET: null
   TRANSCODE_TIMEOUT: null
   TRANSCODE_CONCURRENCY: null

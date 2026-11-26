@@ -160,7 +160,7 @@ mappa `env` di `values.yaml` (numeri e booleani vengono resi come stringhe).
 
 | Variabile | Default | Descrizione |
 |---|---|---|
-| `LOG_LEVEL` | `INFO` | Livello dei log (`DEBUG`, `INFO`, `WARNING`, ...). Il token del bot viene oscurato nei log. |
+| `LOG_LEVEL` | `INFO` | Livello dei log: `DEBUG`, `INFO`, `WARNING`, `ERROR` o `CRITICAL`. Il token del bot viene oscurato nei log. |
 | `LOG_TO_FILE` | `false` | Scrive i log anche su `LOG_FILE`. |
 | `LOG_FILE` | `data/telegram_downloader.log` | File di log, relativo alla cartella di lavoro (nel container `/app`, quindi sul volume dati). |
 | `LOG_MAX_BYTES` | `5242880` (5 MB) | Dimensione oltre cui il file di log ruota. |
@@ -203,7 +203,7 @@ mappa `env` di `values.yaml` (numeri e booleani vengono resi come stringhe).
 | Variabile | Default | Descrizione |
 |---|---|---|
 | `WORKER_GENERATE_THUMBNAIL` | `true` | Genera la miniatura dei video. |
-| `TRANSCODE_PRESET` | `veryfast` | Preset di x264. |
+| `TRANSCODE_PRESET` | `veryfast` | Preset di x264: `ultrafast`, `superfast`, `veryfast`, `faster`, `fast`, `medium`, `slow`, `slower`, `veryslow` o `placebo` (più lento = file più piccoli, più CPU). |
 | `TRANSCODE_TIMEOUT` | `900` | Timeout in secondi di una conversione completa (min 30). |
 | `TRANSCODE_CONCURRENCY` | `1` | Conversioni ffmpeg contemporanee (1-8): sono il lavoro più pesante per la CPU. |
 | `TRANSCODE_MAX_SIDE` | `1280` | Lato lungo in pixel quando la compressione richiede di ridurre la risoluzione (min 240). |
