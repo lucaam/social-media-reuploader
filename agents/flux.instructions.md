@@ -15,7 +15,8 @@ Note:
 
 - Non includere mai segreti nei manifest: solo nomi di Secret (`secret.name`, `gui.existingSecret`,
   `ytdlpCookies.existingSecret`).
-- Sorgente `GitRepository` (`source.toolkit.fluxcd.io/v1`) e `HelmRelease` che punta a
+- Sorgente `GitRepository` (`source.toolkit.fluxcd.io/v1`) su un tag di release (`ref.tag` o `ref.semver`, mai
+  `branch: main`: il chart di `main` può richiedere un'immagine non ancora pubblicata) e `HelmRelease` che punta a
   `./charts/social-media-reuploader`; fissa `image.tag` a una versione invece di `latest`.
 - Il chart ammette una sola replica del bot (`replicaCount: 1`) e mette la GUI sullo stesso nodo del bot perché
   condividono un PVC `ReadWriteOnce`.

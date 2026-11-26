@@ -8,9 +8,12 @@ spec:
   # Replace with your Git repository URL (SSH or HTTPS)
   url: https://github.com/lucaam/social-media-reuploader.git
   ref:
-    # For reproducible deploys pin a release instead: `tag: vX.Y.Z`
-    # (the chart of that tag deploys the image of the same version).
-    branch: main
+    # The newest release tag (vX.Y.Z): the chart of a release deploys the image
+    # of the same version. Do not follow `branch: main`, whose chart may need an
+    # image that is not released yet. Releases up to v0.8.1 ship the old chart
+    # (which does not match helmrelease.yaml), hence the range.
+    # For reproducible deploys pin one release instead: `tag: vX.Y.Z`.
+    semver: ">0.8.1"
   # Only the chart is needed
   ignore: |
     /*

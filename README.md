@@ -127,6 +127,11 @@ Il chart crea il PVC del database, la GUI sullo stesso nodo del bot e un Secret
 con `SECRET_KEY` e `ADMIN_TOKEN` generati (vedi le note mostrate da Helm). Tutti
 i dettagli in [docs/deploy.md](docs/deploy.md).
 
+Installa il chart dal tag di una release (`git checkout v<versione>`): il chart
+di ogni release usa l'immagine della stessa versione, mentre quello di `main`
+può richiedere un'immagine non ancora pubblicata (`image.tag` viene aggiornato
+solo al rilascio).
+
 ## Configurazione
 
 Tutte le impostazioni sono variabili d'ambiente. I valori non validi non

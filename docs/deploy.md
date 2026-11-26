@@ -90,7 +90,11 @@ docker compose logs -f bot
 
 ## Kubernetes con Helm
 
-Il chart è in `charts/social-media-reuploader`.
+Il chart è in `charts/social-media-reuploader`. Usa quello del tag di una
+release (`git checkout v<versione>`): il chart di ogni release usa l'immagine
+della stessa versione (`image.tag`), mentre quello di `main` può richiedere
+funzioni di un'immagine non ancora pubblicata (ad esempio la readiness probe su
+`/ready`): con un'immagine più vecchia il pod del bot non diventa mai pronto.
 
 ```bash
 kubectl create namespace smr
@@ -333,9 +337,10 @@ Operator) che legge `/metrics` dal Service del bot.
 ## Flux
 
 `examples/flux/` contiene un `GitRepository` e una `HelmRelease` di esempio:
-il chart viene preso da questo repository, il token dal Secret `smr-bot`, le
-credenziali della GUI dal Secret `smr-gui` (da creare con SealedSecrets,
-External Secrets o SOPS: mai segreti nel repository).
+il chart viene preso dall'ultima release di questo repository (tag `vX.Y.Z`,
+mai `main`), il token dal Secret `smr-bot`, le credenziali della GUI dal Secret
+`smr-gui` (da creare con SealedSecrets, External Secrets o SOPS: mai segreti
+nel repository).
 
 ```bash
 kubectl apply -f examples/flux/gitrepository.yaml

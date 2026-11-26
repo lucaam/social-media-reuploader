@@ -8,8 +8,9 @@ External Secrets, file cifrati con SOPS oppure Secret creati fuori da Git.
 
 File:
 - `gitrepository.yaml`: sorgente `GitRepository` (`source.toolkit.fluxcd.io/v1`)
-  che segue `main` (per deploy riproducibili fissa un tag di release); sostituisci
-  `url` con il tuo repository.
+  che segue l'ultima release (`semver`; per deploy riproducibili fissa un tag di
+  release). Non seguire `main`: il suo chart può richiedere un'immagine non
+  ancora pubblicata. Sostituisci `url` con il tuo repository.
 - `helmrelease.yaml`: `HelmRelease` (`helm.toolkit.fluxcd.io/v2`) che usa il chart
   dal percorso del repository, con il token del bot nel Secret `smr-bot` e le
   credenziali della GUI nel Secret `smr-gui`.
