@@ -486,6 +486,45 @@ def test_a_failing_scenario_fails_the_test(tmp_path, api):
 
 
 # ---------------------------------------------------------------------------
+# Live updates
+# ---------------------------------------------------------------------------
+def test_each_live_connection_resyncs_once_subscribed(tmp_path, api):
+    for number in range(15):
+        db.create_request(1, f"https://example.com/v/{number}")
+    routes = snapshot(api, *DEFAULT_GETS)
+    # The bot adds a request after the first HTTP loads, before the socket
+    # subscribes: its event is published to nobody.
+    db.create_request(1, "https://example.com/v/new")
+    newer = snapshot(api, "api/stats", "api/aggregates?hours=24&top=10")
+    run_spa(
+        tmp_path,
+        """
+        h.eq(h.text('statTotal'), '15', 'first load')
+        let socket = h.socket()
+        socket.open()
+        await h.settle()
+        h.eq(h.text('liveBadge'), 'In tempo reale', 'live badge')
+        Object.entries(h.data).forEach(([key, reply]) => h.route(key, reply))
+        socket.receive({ kind: 'hello', last_event_id: 15 })
+        await h.settle()
+        h.eq(h.text('statTotal'), '16', 'resynced after the first subscription')
+        // a reconnection resyncs as well
+        socket.close()
+        h.eq(h.text('liveBadge'), 'Non in tempo reale', 'offline badge')
+        await h.advance(1000)
+        h.ok(h.sockets.length === 2, 'reconnected')
+        socket = h.socket()
+        socket.open()
+        socket.receive({ kind: 'hello', last_event_id: 16 })
+        await h.settle()
+        h.eq(h.fetched('api/stats'), 3, 'one load per subscription plus the first')
+        """,
+        routes=routes,
+        data=newer,
+    )
+
+
+# ---------------------------------------------------------------------------
 # System tab
 # ---------------------------------------------------------------------------
 def test_clearing_the_history_says_which_requests_are_kept(tmp_path, api):

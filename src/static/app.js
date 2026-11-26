@@ -8,7 +8,10 @@
  *   the login overlay, 403 the "not an administrator" overlay; other errors
  *   are shown as toasts.
  * - Live updates: one WebSocket (event-log batches from the server), with
- *   exponential backoff + jitter on reconnect and a full resync after it.
+ *   exponential backoff + jitter on reconnect. Every connection, the first
+ *   one included, ends with a full resync when the server's "hello" arrives
+ *   (it is sent once the subscription exists), so changes made before the
+ *   subscription are never missed.
  *   Bursts of events are coalesced: each resource is refreshed at most once
  *   per short window, one request in flight per resource, and sequence guards
  *   drop stale responses.
@@ -618,7 +621,6 @@
   let wsWanted = false
   let wsTimer = null
   let wsAttempts = 0
-  let wsEverOpened = false
 
   function wsUrl () {
     const url = new URL('ws/updates', location.href)
@@ -654,11 +656,8 @@
     ws = socket
     socket.addEventListener('open', () => {
       if (ws !== socket) return
-      const reconnected = wsEverOpened
-      wsEverOpened = true
       wsAttempts = 0
       setLive('online')
-      if (reconnected) resyncAll()
     })
     socket.addEventListener('message', (event) => {
       if (ws === socket) handleMessage(event.data)
@@ -698,7 +697,9 @@
     let message
     try { message = JSON.parse(text) } catch (e) { return }
     if (!message || typeof message !== 'object') return
-    if (message.kind === 'events') onEvents(Array.isArray(message.events) ? message.events : [])
+    // Events published before this subscription never reach it: reload.
+    if (message.kind === 'hello') resyncAll()
+    else if (message.kind === 'events') onEvents(Array.isArray(message.events) ? message.events : [])
     else if (message.kind === 'worker' && message.worker) renderWorker(message.worker)
   }
 
