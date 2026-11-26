@@ -2092,8 +2092,10 @@ def prune(
     their events) created more than ``requests_days`` ago; processed_messages
     older than two days; orphan request events. Never deletes ACTIVE requests,
     nor accepted requests still inside the largest rate-limit window
-    (``keep_accepted_seconds``, default: from ``config.RATE_LIMITS``), so
-    retention never weakens rate limiting. Works in short batches.
+    (``keep_accepted_seconds``, default: from ``config.RATE_LIMITS``), nor
+    done ones delivered within ``DUPLICATE_WINDOW_SECONDS``, so retention
+    never weakens rate limiting or duplicate detection. Works in short
+    batches.
     """
     current = time.time()
     counts = {"updates": 0, "requests": 0, "request_events": 0, "processed_messages": 0}
@@ -2112,6 +2114,7 @@ def prune(
         removed, events = _prune_requests(
             iso_from_ts(current - float(requests_days) * 86400),
             iso_from_ts(current - protect),
+            iso_from_ts(current - _duplicate_window_seconds()),
         )
         counts["requests"] = removed
         counts["request_events"] += events
@@ -2131,23 +2134,42 @@ def prune(
     return counts
 
 
-def _prune_requests(cutoff: str, accepted_cutoff: str) -> tuple[int, int]:
+def _expendable_requests(
+    cutoff: str, accepted_cutoff: str, delivered_cutoff: str
+) -> tuple[str, tuple[Any, ...]]:
+    """WHERE clause (+ params): terminal requests created before ``cutoff``
+    that neither the rate limiter nor duplicate detection needs any more.
+
+    Needed: accepted requests whose slot is since ``accepted_cutoff`` (the
+    largest rate-limit window) and done ones delivered since
+    ``delivered_cutoff`` (the duplicate window).
+    """
     active = _marks(len(ACTIVE_STATUSES))
     accepted = _marks(len(ACCEPTED_STATUSES))
     # NULL-safe: legacy rows without a status are terminal and never protected.
-    select_sql = f"""SELECT id FROM requests
-        WHERE created_at < ?
+    where = f"""created_at < ?
           AND (status IS NULL OR status NOT IN ({active}))
           AND NOT (status IS NOT NULL AND status IN ({accepted})
                    AND COALESCE(slot_at, created_at) >= ?)
-        ORDER BY id LIMIT ?"""
+          AND NOT (status IS NOT NULL AND status = ?
+                   AND {_DELIVERED_AT_SQL} >= ?)"""
     params = (
         cutoff,
         *ACTIVE_STATUSES,
         *ACCEPTED_STATUSES,
         accepted_cutoff,
-        _DELETE_BATCH,
+        Status.DONE,
+        delivered_cutoff,
     )
+    return where, params
+
+
+def _prune_requests(
+    cutoff: str, accepted_cutoff: str, delivered_cutoff: str
+) -> tuple[int, int]:
+    where, params = _expendable_requests(cutoff, accepted_cutoff, delivered_cutoff)
+    select_sql = f"SELECT id FROM requests WHERE {where} ORDER BY id LIMIT ?"
+    params = (*params, _DELETE_BATCH)
     removed = events = 0
     while True:
         with write() as conn:
@@ -2160,26 +2182,42 @@ def _prune_requests(cutoff: str, accepted_cutoff: str) -> tuple[int, int]:
 
 
 def clear_history(*, actor: str | None = None) -> dict[str, int]:
-    """Admin wipe: terminal requests (+ their events) and the event log.
+    """Admin wipe: finished requests (+ their events) and the event log.
 
-    Never touches queued/processing/sending requests (nor their events),
-    chat_limits, users, worker_status or processed_messages. One transaction,
-    followed by exactly one ``history_cleared`` event. Ids keep increasing.
+    The rows the bot still relies on are kept, so the chats' rate limits and
+    duplicate detection are unchanged: accepted requests inside the largest
+    rate-limit window, done ones delivered within ``DUPLICATE_WINDOW_SECONDS``
+    and every request created within it (edits of those messages are still
+    honoured and are matched to their request), like :func:`prune`. Their
+    number is returned as ``requests_kept``. Never touches queued/processing/
+    sending requests (nor their events), chat_limits, users, worker_status or
+    processed_messages. One transaction, followed by exactly one
+    ``history_cleared`` event. Ids keep increasing.
     """
-    now = _utc_now()
+    current = time.time()
+    now = iso_from_ts(current)
+    recent = iso_from_ts(current - _duplicate_window_seconds())
+    where, params = _expendable_requests(
+        recent, iso_from_ts(current - _max_rate_window_seconds()), recent
+    )
     active = _marks(len(ACTIVE_STATUSES))
     with write() as conn:
+        requests = conn.execute(f"DELETE FROM requests WHERE {where}", params).rowcount
         events = conn.execute(
-            f"""DELETE FROM request_events
-                WHERE request_id IS NULL OR request_id NOT IN (
-                    SELECT id FROM requests WHERE status IN ({active}))""",
-            ACTIVE_STATUSES,
+            """DELETE FROM request_events WHERE NOT EXISTS (
+                   SELECT 1 FROM requests r WHERE r.id = request_events.request_id)"""
         ).rowcount
-        requests = conn.execute(
-            f"DELETE FROM requests WHERE status IS NULL OR status NOT IN ({active})",
+        kept = conn.execute(
+            f"""SELECT COUNT(*) FROM requests
+                WHERE status IS NULL OR status NOT IN ({active})""",
             ACTIVE_STATUSES,
-        ).rowcount
+        ).fetchone()[0]
         updates = conn.execute("DELETE FROM updates").rowcount
-        counts = {"requests": requests, "request_events": events, "updates": updates}
+        counts = {
+            "requests": requests,
+            "request_events": events,
+            "updates": updates,
+            "requests_kept": int(kept),
+        }
         _append_event(conn, EventType.HISTORY_CLEARED, {"actor": actor, **counts}, now)
     return counts

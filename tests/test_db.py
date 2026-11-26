@@ -14,7 +14,7 @@ from pathlib import Path
 
 import pytest
 
-from src import db
+from src import db, ratelimit
 
 ISO_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{6}\+00:00$")
 REPO_ROOT = Path(__file__).resolve().parents[1]
@@ -1703,8 +1703,15 @@ def test_prune_protects_rows_inside_the_rate_limit_window(db_file, monkeypatch):
     assert db.prune(updates_days=0, requests_days=7)["requests"] == 1  # NULL status
     assert db.get_request(legacy_null) is None
     assert db.get_request(request_id) is not None
+    monkeypatch.setattr(db.config, "DUPLICATE_WINDOW_SECONDS", 5400, raising=False)
+    late = make(1, "https://a.b/late")  # waited 20 days, posted 10 minutes ago
+    force(
+        late, status="done", created_at=ago(20 * 86400), processing_finished_at=ago(600)
+    )
     monkeypatch.setattr(db.config, "RATE_LIMITS", (), raising=False)
     assert db.prune(updates_days=0, requests_days=7)["requests"] == 1
+    assert db.get_request(request_id) is None
+    assert db.get_request(late) is not None  # duplicate detection still needs it
 
 
 def test_prune_deletes_in_batches(db_file, monkeypatch):
@@ -1717,7 +1724,9 @@ def test_prune_deletes_in_batches(db_file, monkeypatch):
     assert db.prune(updates_days=1, requests_days=0)["updates"] == 30
 
 
-def test_clear_history_keeps_active_state(db_file):
+def test_clear_history_keeps_active_state(db_file, monkeypatch):
+    monkeypatch.setattr(db.config, "RATE_LIMITS", ((5, 3600),), raising=False)
+    monkeypatch.setattr(db.config, "DUPLICATE_WINDOW_SECONDS", 5400, raising=False)
     queued = make(1, "https://a.b/q")
     running = processing(1, "https://a.b/p")
     db.add_request_event(running, "download")
@@ -1726,6 +1735,8 @@ def test_clear_history_keeps_active_state(db_file):
     db.add_request_event(done, "compress")
     refused = db.create_request(2, "https://a.b/r", status="duplicate")
     legacy = db.create_request(3, "https://a.b/l", status="pending")  # legacy status
+    for old in (done, refused, legacy):  # outside the rate and duplicate windows
+        force(old, created_at=ago(2 * 86400), processing_finished_at=ago(86400))
     db.add_user(email="admin@example.com", role="admin")
     db.set_chat_blocked_until(1, ago(-60))
     db.set_worker_status({"pid": 1})
@@ -1739,6 +1750,7 @@ def test_clear_history_keeps_active_state(db_file):
 
     counts = db.clear_history(actor="admin")
     assert counts["requests"] == 3  # done, refused, legacy pending
+    assert counts["requests_kept"] == 0
     assert counts["updates"] > 0
     for gone in (done, refused, legacy):
         assert db.get_request(gone) is None
@@ -1755,6 +1767,64 @@ def test_clear_history_keeps_active_state(db_file):
     # in-flight work can still finish normally
     assert db.mark_sending(running) and db.mark_done(running)
     assert db.create_request(2, "https://a.b/new") > legacy
+
+
+def test_clear_history_leaves_rate_limits_and_duplicate_detection_unchanged(
+    db_file, monkeypatch
+):
+    limits = ((1, 10), (3, 60), (5, 3600), (20, 30 * 86400))
+    monkeypatch.setattr(db.config, "RATE_LIMITS", limits, raising=False)
+    monkeypatch.setattr(db.config, "DUPLICATE_WINDOW_SECONDS", 5400, raising=False)
+    limiter = ratelimit.RateLimiter(limits=limits, max_defer=120, max_pending=3)
+
+    def posted(chat_id, url, *, seconds_ago, message_id=None):
+        request_id = processing(chat_id, url, original_message_id=message_id)
+        assert db.mark_done(request_id, sent_message_id=99)
+        at = ago(seconds_ago)
+        force(request_id, created_at=at, processing_finished_at=at)
+        return request_id
+
+    # chat 1 used its monthly quota: 20 links posted in the last 10 days
+    for index in range(20):
+        posted(1, f"https://a.b/month/{index}", seconds_ago=(index + 1) * 12 * 3600)
+    # chat 2: a video posted 10 minutes ago, a refusal 5 minutes ago
+    video = posted(2, "https://a.b/video", seconds_ago=600, message_id=5)
+    refusal = db.create_request(
+        2,
+        "https://a.b/refused",
+        status="rate_limited",
+        normalized_url="https://a.b/refused",
+        original_message_id=6,
+    )
+    force(refusal, created_at=ago(300))
+    # nothing needs these any more
+    old_post = posted(3, "https://a.b/old", seconds_ago=40 * 86400)
+    old_refusal = db.create_request(3, "https://a.b/r", status="duplicate")
+    force(old_refusal, created_at=ago(3 * 86400))
+    now = time.time()
+
+    def ident(row):
+        return None if row is None else row["id"]
+
+    def state():
+        return (
+            limiter.check(1, now=now),
+            limiter.check(2, now=now),
+            ident(db.find_recent_duplicate(2, "https://a.b/video", ago(5400))),
+            ident(db.find_request_for_message(2, 5, "https://a.b/video")),  # edits
+            ident(db.find_request_for_message(2, 6, "https://a.b/refused")),
+        )
+
+    before = state()
+    assert before[0].outcome is ratelimit.Outcome.RATE_LIMITED
+    assert before[0].window == (20, 30 * 86400)
+    assert before[2:] == (video, video, refusal)
+    counts = db.clear_history(actor="admin")
+    assert state() == before
+    assert counts["requests"] == 2 and counts["requests_kept"] == 22
+    assert db.get_request(old_post) is None and db.get_request(old_refusal) is None
+    assert db.get_request_events(video) != []  # kept rows keep their history
+    assert db.get_request_events(old_post) == []
 
 
 # ---------------------------------------------------------------------------
