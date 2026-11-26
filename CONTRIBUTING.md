@@ -100,7 +100,8 @@ Riscrivi la storia solo sui tuoi branch di feature.
 | `commitlint.yml` | PR | messaggi di commit |
 
 I job che non riguardano i file modificati vengono saltati (e contano come
-superati).
+superati), tranne "Python linters" (pre-commit su tutti i file e
+`check_docs.py`), che gira su ogni PR.
 
 ## Release
 

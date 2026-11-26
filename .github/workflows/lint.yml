@@ -33,7 +33,6 @@ jobs:
       contents: read
       pull-requests: read
     outputs:
-      python: ${{ steps.filter.outputs.python }}
       helm: ${{ steps.filter.outputs.helm }}
       workflows: ${{ steps.filter.outputs.workflows }}
       docs: ${{ steps.filter.outputs.docs }}
@@ -45,16 +44,6 @@ jobs:
         uses: dorny/paths-filter@v4.0.2
         with:
           filters: |
-            python:
-              - 'src/**'
-              - 'tests/**'
-              - 'scripts/**'
-              - 'requirements*.txt'
-              - '.pre-commit-config.yaml'
-              - 'pyproject.toml'
-              - '.ruff.toml'
-              - 'README.md'
-              - 'charts/social-media-reuploader/values.yaml'
             helm:
               - 'charts/**'
             workflows:
@@ -66,10 +55,12 @@ jobs:
               - 'scripts/mkdocs_hooks.py'
               - 'requirements-dev.txt'
 
+  # Not filtered: besides ruff/black/isort, pre-commit checks whitespace, end
+  # of file and YAML syntax of every file (docs, workflows, examples, compose),
+  # and check_docs.py ties README.md to the code. A skipped run would let
+  # problems land and fail a later, unrelated pull request.
   python-lint:
     name: Python linters
-    needs: filter
-    if: needs.filter.outputs.python == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 20
     steps:
