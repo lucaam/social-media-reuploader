@@ -93,8 +93,6 @@ MAX_LOGIN_BODY = 4096
 MAX_REQUEUE_IDS = 1000
 FILTER_REQUEUE_LIMIT = 500
 DEFAULT_REQUEUE_MAX_AGE = 86400.0
-# db.prune() deletes rows older than N days: ~0.1 ms means "everything so far".
-CLEAR_UP_TO_NOW_DAYS = 1e-9
 WS_RECHECK_SECONDS = 30.0
 WS_CLOSE_GOING_AWAY = 1001
 WS_CLOSE_POLICY = 1008
@@ -985,20 +983,13 @@ def clear_history(principal: AdminPrincipal) -> dict[str, Any]:
     Active requests are kept, and so are the accepted ones (done, failed)
     still inside the worker's largest rate-limit or duplicate window: the rate
     limiter and the duplicate check read them, so deleting them would reset
-    every chat's quota. ``db.prune`` applies exactly that protection.
+    every chat's quota. ``db.clear_history`` applies that protection in one
+    transaction; the window comes from the worker's heartbeat when available.
     """
     keep = gui_queries.history_keep_seconds(
         gui_queries.effective_limits(gui_queries.load_worker())
     )
-    pruned = db.prune(
-        updates_days=CLEAR_UP_TO_NOW_DAYS,
-        requests_days=CLEAR_UP_TO_NOW_DAYS,
-        keep_accepted_seconds=keep,
-    )
-    counts = {key: pruned[key] for key in ("requests", "request_events", "updates")}
-    db.add_event(
-        db.EventType.HISTORY_CLEARED, actor=principal.actor, kept_seconds=keep, **counts
-    )
+    counts = db.clear_history(actor=principal.actor, keep_accepted_seconds=keep)
     logger.warning(
         "%s cleared the history (accepted requests of the last %.0f s kept): %s",
         principal.actor,

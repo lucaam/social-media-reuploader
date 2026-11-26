@@ -439,17 +439,23 @@ def test_unlimit_requeue_respects_the_configured_max_age(client, monkeypatch):
 # History, stats, aggregates, events
 # ---------------------------------------------------------------------------
 def age(request_id, seconds):
-    """Move a request ``seconds`` into the past (creation and processing)."""
+    """Move a request ``seconds`` into the past: creation, rate-limit slot,
+    processing and delivery (what the history-clear protection reads)."""
     stamp = db.iso_from_ts(time.time() - seconds)
-    set_column(request_id, "created_at", stamp)
-    set_column(request_id, "processing_started_at", stamp)
+    for column in (
+        "created_at",
+        "slot_at",
+        "processing_started_at",
+        "processing_finished_at",
+    ):
+        set_column(request_id, column, stamp)
     return request_id
 
 
 def test_clear_history_keeps_active_requests(client):
     age(make_done(1, "https://example.com/1"), 60 * 86400)
     age(make_failed(1, "https://example.com/2"), 60 * 86400)
-    refused(1, "https://example.com/5")
+    age(refused(1, "https://example.com/5"), 60 * 86400)
     queued = db.create_request(1, "https://example.com/3")
     running = db.create_request(1, "https://example.com/4")
     assert db.claim_request(running)
@@ -460,10 +466,8 @@ def test_clear_history_keeps_active_requests(client):
     assert deleted["updates"] > 0
     assert {row["id"] for row in db.list_requests()} == {queued, running}
     log = client.get("/api/events").json()
-    assert [item["type"] for item in log["items"]] == [
-        "history_cleared",
-        "history_pruned",
-    ]
+    # one transaction, exactly one event
+    assert [item["type"] for item in log["items"]] == ["history_cleared"]
     cleared = log["items"][0]
     assert cleared["actor"] == "gui:bearer"
     assert cleared["requests"] == 3
@@ -480,7 +484,10 @@ def test_clear_history_keeps_what_rate_limits_and_duplicate_checks_read(client):
         age(make_done(chat, url, normalized_url=url), (day + 1) * 86400)
     age(make_failed(chat, "https://example.com/failed"), 3 * 3600)
     age(make_done(chat, latest_url, normalized_url=latest_url), 600)
-    refusal = refused(chat, "https://example.com/refused")
+    # refusals never count for the limits: an old one goes, a recent one stays
+    # (edits of its message must still match it, within the duplicate window)
+    refusal = age(refused(chat, "https://example.com/refused"), 2 * 5400)
+    recent_refusal = refused(chat, "https://example.com/refused-now")
     limiter = ratelimit.RateLimiter(limits=[(20, 30 * 86400)])
     since = db.iso_from_ts(time.time() - 5400)
     assert limiter.check(chat).outcome == ratelimit.Outcome.RATE_LIMITED
@@ -493,6 +500,7 @@ def test_clear_history_keeps_what_rate_limits_and_duplicate_checks_read(client):
     assert body["deleted"]["requests"] == 2
     assert db.get_request(old) is None
     assert db.get_request(refusal) is None
+    assert db.get_request(recent_refusal) is not None
     # quota and duplicate memory survive the clear
     assert limiter.check(chat).outcome == ratelimit.Outcome.RATE_LIMITED
     assert db.find_recent_duplicate(chat, latest_url, since) is not None

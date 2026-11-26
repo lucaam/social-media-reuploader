@@ -2181,25 +2181,32 @@ def _prune_requests(
             return removed, events
 
 
-def clear_history(*, actor: str | None = None) -> dict[str, int]:
+def clear_history(
+    *, actor: str | None = None, keep_accepted_seconds: float | None = None
+) -> dict[str, int]:
     """Admin wipe: finished requests (+ their events) and the event log.
 
     The rows the bot still relies on are kept, so the chats' rate limits and
     duplicate detection are unchanged: accepted requests inside the largest
-    rate-limit window, done ones delivered within ``DUPLICATE_WINDOW_SECONDS``
-    and every request created within it (edits of those messages are still
-    honoured and are matched to their request), like :func:`prune`. Their
-    number is returned as ``requests_kept``. Never touches queued/processing/
-    sending requests (nor their events), chat_limits, users, worker_status or
+    rate-limit window (``keep_accepted_seconds``, default: from
+    ``config.RATE_LIMITS``; the GUI passes the worker's effective limits),
+    done ones delivered within ``DUPLICATE_WINDOW_SECONDS`` and every request
+    created within it (edits of those messages are still honoured and are
+    matched to their request), like :func:`prune`. Their number is returned
+    as ``requests_kept``. Never touches queued/processing/sending requests
+    (nor their events), chat_limits, users, worker_status or
     processed_messages. One transaction, followed by exactly one
     ``history_cleared`` event. Ids keep increasing.
     """
     current = time.time()
     now = iso_from_ts(current)
     recent = iso_from_ts(current - _duplicate_window_seconds())
-    where, params = _expendable_requests(
-        recent, iso_from_ts(current - _max_rate_window_seconds()), recent
+    keep = (
+        _max_rate_window_seconds()
+        if keep_accepted_seconds is None
+        else max(0.0, float(keep_accepted_seconds))
     )
+    where, params = _expendable_requests(recent, iso_from_ts(current - keep), recent)
     active = _marks(len(ACTIVE_STATUSES))
     with write() as conn:
         requests = conn.execute(f"DELETE FROM requests WHERE {where}", params).rowcount
@@ -2219,5 +2226,10 @@ def clear_history(*, actor: str | None = None) -> dict[str, int]:
             "updates": updates,
             "requests_kept": int(kept),
         }
-        _append_event(conn, EventType.HISTORY_CLEARED, {"actor": actor, **counts}, now)
+        _append_event(
+            conn,
+            EventType.HISTORY_CLEARED,
+            {"actor": actor, "kept_seconds": keep, **counts},
+            now,
+        )
     return counts
