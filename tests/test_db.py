@@ -826,6 +826,7 @@ def test_hot_queries_use_indexes(db_file, monkeypatch):
     make(1, "https://a.b/x", original_message_id=7)
     refused = db.create_request(1, "https://a.b/y", status="rate_limited")
     status_slot = "idx_requests_chat_status_slot"
+    norm_url = "idx_requests_chat_norm_url_created"
     cases = {
         "pending cap": (
             lambda: db.count_active_for_chat(1),
@@ -838,6 +839,14 @@ def test_hot_queries_use_indexes(db_file, monkeypatch):
         "message dedupe": (
             lambda: db.find_request_for_message(1, 7, "https://a.b/x"),
             ["idx_requests_chat_message (chat_id=? AND original_message_id=?)"],
+        ),
+        "duplicate": (
+            lambda: db.find_recent_duplicate(1, "https://a.b/x", ago(5400)),
+            [
+                f"USING INDEX {status_slot} (chat_id=? AND status=?)",
+                f"USING INDEX {norm_url} (chat_id=? AND normalized_url=?)",
+                f"{norm_url} (chat_id=? AND normalized_url=? AND created_at>?)",
+            ],
         ),
         "claim": (
             db.claim_next_request,
@@ -950,6 +959,48 @@ def test_find_recent_duplicate_window_and_latest_row(db_file):
     assert db.find_recent_duplicate(5, "https://a.b/w", since_naive.isoformat())
     legacy = db.create_request(5, "https://a.b/legacy")  # no normalized_url
     assert db.find_recent_duplicate(5, "https://a.b/legacy", ago(60))["id"] == legacy
+
+
+def test_find_recent_duplicate_sees_active_copies_whatever_their_age(db_file):
+    window = ago(5400)
+    requeued = db.create_request(
+        1, "https://a.b/requeued", normalized_url="https://a.b/requeued"
+    )
+    force(requeued, status="rate_limited", created_at=ago(3 * 3600))
+    db.reset_chat_limit(1, actor="admin")
+    assert db.requeue_requests([requeued]) == [requeued]
+    retried = make(1, "https://a.b/retried")
+    force(retried, created_at=ago(2 * 3600))
+    assert db.claim_request(retried)
+    assert db.defer_request(retried, ago(-3000), reason="flood wait")
+    backlog = make(1, "https://a.b/backlog")
+    force(backlog, created_at=ago(100 * 60))
+    for request_id, url in (
+        (requeued, "https://a.b/requeued"),
+        (retried, "https://a.b/retried"),
+        (backlog, "https://a.b/backlog"),
+    ):
+        found = db.find_recent_duplicate(1, url, window)
+        assert found is not None and found["id"] == request_id, url
+        assert found["status"] == "queued"
+
+
+def test_find_recent_duplicate_anchors_delivered_copies_on_delivery(db_file):
+    window = ago(5400)
+    late = processing(1, "https://a.b/late")
+    force(late, created_at=ago(3 * 3600))  # waited long, posted a minute ago
+    assert db.mark_done(late)
+    assert db.find_recent_duplicate(1, "https://a.b/late", window)["id"] == late
+    old = processing(1, "https://a.b/old")
+    assert db.mark_done(old)
+    force(old, created_at=ago(3 * 3600), processing_finished_at=ago(2 * 3600))
+    assert db.find_recent_duplicate(1, "https://a.b/old", window) is None
+    # legacy rows (no normalized_url) are looked up among recent ones only
+    legacy = db.create_request(1, "https://a.b/legacy")
+    force(legacy, status="done")
+    assert db.find_recent_duplicate(1, "https://a.b/legacy", window)["id"] == legacy
+    force(legacy, created_at=ago(2 * 3600))
+    assert db.find_recent_duplicate(1, "https://a.b/legacy", window) is None
 
 
 # ---------------------------------------------------------------------------

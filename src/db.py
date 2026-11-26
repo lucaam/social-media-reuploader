@@ -97,7 +97,8 @@ ACCEPTED_STATUSES: tuple[str, ...] = (
 )
 # Requests that count for the per-chat pending cap (and are never deleted).
 ACTIVE_STATUSES: tuple[str, ...] = (Status.QUEUED, Status.PROCESSING, Status.SENDING)
-# A new link equal to one of these within the duplicate window is a duplicate.
+# A new link equal to one of these is a duplicate: an active one whatever its
+# age, a done one delivered within the duplicate window.
 DUPLICATE_STATUSES: tuple[str, ...] = (
     Status.QUEUED,
     Status.PROCESSING,
@@ -989,6 +990,13 @@ def _claim_row(
     return _dict(_fetch_request(conn, before["id"])) if claimed else None
 
 
+# When a done request was posted. mark_done() always sets
+# processing_finished_at; legacy rows may lack it.
+_DELIVERED_AT_SQL = (
+    "COALESCE(processing_finished_at, processing_started_at, created_at)"
+)
+
+
 def _has_active_duplicate(conn: sqlite3.Connection, row: Mapping[str, Any]) -> bool:
     found = conn.execute(
         f"""SELECT 1 FROM requests
@@ -1074,21 +1082,42 @@ def find_request_for_message(
 def find_recent_duplicate(
     chat_id: int, normalized_url: str, since_iso: str
 ) -> dict[str, Any] | None:
-    """Latest queued/processing/sending/done request for the same link since then.
+    """Latest request of the chat that makes a new copy of the link a duplicate.
 
-    Refusals (rate_limited, duplicate), failures and cancellations never make
-    a later link a duplicate.
+    That is a queued/processing/sending request whatever its age (it is going
+    to be posted; requeued rows, retries and a backlog keep their old
+    created_at), or a done one delivered (``processing_finished_at``) since
+    ``since_iso``. Refusals (rate_limited, duplicate), failures and
+    cancellations never make a later link a duplicate. Matches
+    ``normalized_url`` or, for legacy rows without it, ``url``.
     """
     since = _canonical_iso(since_iso)
+    active = _marks(len(ACTIVE_STATUSES))
     with connect() as conn:
+        # One index lookup per kind of copy (an OR over all of them would read
+        # the chat's whole history): active copies on (chat_id, status),
+        # delivered ones on (chat_id, normalized_url) - the unary + keeps the
+        # planner off the status index, which would read every done row of
+        # the chat. Legacy rows are only looked up among those created since.
         row = conn.execute(
-            f"""SELECT * FROM requests
-                WHERE chat_id = ?
-                  AND (normalized_url = ? OR (normalized_url IS NULL AND url = ?))
-                  AND status IN ({_marks(len(DUPLICATE_STATUSES))})
-                  AND created_at >= ?
-                ORDER BY created_at DESC, id DESC LIMIT 1""",
-            (chat_id, normalized_url, normalized_url, *DUPLICATE_STATUSES, since),
+            f"""SELECT * FROM (
+                    SELECT * FROM requests
+                    WHERE chat_id = ? AND status IN ({active})
+                      AND (normalized_url = ? OR (normalized_url IS NULL AND url = ?))
+                    UNION ALL
+                    SELECT * FROM requests
+                    WHERE chat_id = ? AND normalized_url = ? AND +status = ?
+                      AND {_DELIVERED_AT_SQL} >= ?
+                    UNION ALL
+                    SELECT * FROM requests
+                    WHERE chat_id = ? AND normalized_url IS NULL AND url = ?
+                      AND created_at >= ? AND +status = ?)
+                ORDER BY id DESC LIMIT 1""",
+            (
+                *(chat_id, *ACTIVE_STATUSES, normalized_url, normalized_url),
+                *(chat_id, normalized_url, Status.DONE, since),
+                *(chat_id, normalized_url, since, Status.DONE),
+            ),
         ).fetchone()
     return _dict(row)
 
