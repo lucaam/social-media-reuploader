@@ -966,16 +966,57 @@ def _valid_role(raw: str) -> str:
     return role
 
 
-def _guard_last_admin(state: GuiState) -> None:
-    """Refuse to remove the last DB admin when nothing else grants admin."""
+class LastAdminError(Exception):
+    """The change would leave no DB user with role admin."""
+
+
+def _write_user_keeping_an_admin(user_id: int, role: str | None) -> bool:
+    """Set the user's ``role`` (None = delete), never removing the last admin.
+
+    False when there is no such user; :class:`LastAdminError` when the user
+    is the only admin. The check and the change run in one ``BEGIN
+    IMMEDIATE`` transaction, so two concurrent demotions cannot both pass the
+    check (``db.set_user_role`` / ``db.delete_user`` have no guarded form).
+    """
+    with db.write() as conn:
+        row = conn.execute("SELECT role FROM users WHERE id = ?", (user_id,)).fetchone()
+        if row is None:
+            return False
+        if row["role"] == "admin" and role != "admin":
+            (others,) = conn.execute(
+                "SELECT COUNT(*) FROM users WHERE role = 'admin' AND id <> ?",
+                (user_id,),
+            ).fetchone()
+            if not others:
+                raise LastAdminError
+        if role is None:
+            conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        else:
+            conn.execute("UPDATE users SET role = ? WHERE id = ?", (role, user_id))
+    return True
+
+
+def _change_user(state: GuiState, user_id: int, role: str | None) -> None:
+    """Set the role of (None: delete) a user; 404 if missing, 409 if last admin.
+
+    Without ADMIN_TOKEN and OAUTH_ADMIN_GROUPS only DB admins can administer
+    the GUI, so the last one is never demoted or deleted.
+    """
     if state.settings.token_enabled or state.settings.admin_groups:
-        return
-    if gui_queries.count_admins() <= 1:
-        raise HTTPException(
-            409,
-            "È l'ultimo amministratore: aggiungine un altro prima di rimuoverlo"
-            " (oppure configura ADMIN_TOKEN o OAUTH_ADMIN_GROUPS)",
+        found = (
+            db.delete_user(user_id) if role is None else db.set_user_role(user_id, role)
         )
+    else:
+        try:
+            found = _write_user_keeping_an_admin(user_id, role)
+        except LastAdminError as exc:
+            raise HTTPException(
+                409,
+                "È l'ultimo amministratore: aggiungine un altro prima di rimuoverlo"
+                " (oppure configura ADMIN_TOKEN o OAUTH_ADMIN_GROUPS)",
+            ) from exc
+    if not found:
+        raise HTTPException(404, "Utente non trovato")
 
 
 @api.get("/api/users")
@@ -1018,28 +1059,19 @@ def set_user_role(
     user_id: int, body: UserRoleBody, request: Request, principal: AdminPrincipal
 ) -> dict[str, Any]:
     role = _valid_role(body.role)
-    user = gui_queries.get_user(user_id)
-    if user is None:
-        raise HTTPException(404, "Utente non trovato")
-    if user["role"] == "admin" and role != "admin":
-        _guard_last_admin(_state(request))
-    if not db.set_user_role(user_id, role):
-        raise HTTPException(404, "Utente non trovato")
+    _change_user(_state(request), user_id, role)
     logger.info("%s set the role of user %s to %s", principal.actor, user_id, role)
-    return gui_queries.get_user(user_id) or {**user, "role": role}
+    user = gui_queries.get_user(user_id)
+    if user is None:  # deleted in the meantime
+        raise HTTPException(404, "Utente non trovato")
+    return user
 
 
 @api.delete("/api/users/{user_id}")
 def delete_user(
     user_id: int, request: Request, principal: AdminPrincipal
 ) -> dict[str, Any]:
-    user = gui_queries.get_user(user_id)
-    if user is None:
-        raise HTTPException(404, "Utente non trovato")
-    if user["role"] == "admin":
-        _guard_last_admin(_state(request))
-    if not db.delete_user(user_id):
-        raise HTTPException(404, "Utente non trovato")
+    _change_user(_state(request), user_id, None)
     logger.info("%s deleted user %s", principal.actor, user_id)
     return {"ok": True, "id": user_id}
 

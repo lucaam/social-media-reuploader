@@ -1,7 +1,9 @@
 """Admin GUI JSON API against a real temporary database."""
 
+import contextlib
 import re
 import sqlite3
+import threading
 import time
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -728,6 +730,72 @@ def test_the_last_admin_cannot_be_removed_without_another_way_in():
     )
     # the demoted user loses access on the very next request
     assert client.get("/api/users").status_code == 403
+
+
+def oauth_admin(email):
+    """A client logged in through OAuth only (no token, no admin groups)."""
+
+    class Provider:
+        async def authorize_redirect(self, request, redirect_uri):
+            return RedirectResponse("/auth")
+
+        async def authorize_access_token(self, request):
+            claims = {"sub": email, "email": email, "email_verified": True}
+            return {"access_token": "t", "userinfo": claims}
+
+    app = gui.create_app(
+        AuthSettings(secret_key="k" * 40),
+        oauth_registry=SimpleNamespace(provider=Provider()),
+    )
+    client = TestClient(app, headers=SAME)
+    client.get("/login")
+    return client
+
+
+@pytest.mark.parametrize("action", ["demote", "delete"])
+def test_concurrent_removals_never_leave_zero_admins(monkeypatch, action):
+    first = db.add_user(email="a@example.com", role="admin")
+    second = db.add_user(email="b@example.com", role="admin")
+    clients = {
+        first: oauth_admin("a@example.com"),
+        second: oauth_admin("b@example.com"),
+    }
+    # FastAPI sets each route up on its first match, silencing a pydantic
+    # warning in a way that is not thread-safe: match every route once first.
+    for client in clients.values():
+        assert client.delete("/api/users/0").status_code == 404
+    # Hold any admin count read outside the change's transaction until both
+    # requests have read it (the window of a check-then-act guard).
+    barrier = threading.Barrier(2, timeout=2)
+    real_count = gui_queries.count_admins
+
+    def count_and_wait():
+        count = real_count()
+        with contextlib.suppress(threading.BrokenBarrierError):
+            barrier.wait()
+        return count
+
+    monkeypatch.setattr(gui_queries, "count_admins", count_and_wait)
+    results = {}
+
+    def remove(client, target):
+        if action == "demote":
+            response = client.put(f"/api/users/{target}/role", json={"role": "user"})
+        else:
+            response = client.delete(f"/api/users/{target}")
+        results[target] = response.status_code
+
+    # each admin removes the other one at the same time
+    threads = [
+        threading.Thread(target=remove, args=(clients[first], second)),
+        threading.Thread(target=remove, args=(clients[second], first)),
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(30)
+    assert sorted(results.values()) in ([200, 403], [200, 409])
+    assert real_count() == 1
 
 
 # ---------------------------------------------------------------------------
