@@ -346,6 +346,18 @@
   // Modal dialogs
   // ---------------------------------------------------------------------
   let modalResolve = null
+  let modalActions = ''
+
+  // Footer buttons: each one closes the modal with its value.
+  function renderModalButtons (buttons) {
+    const footer = $('modalFooter')
+    footer.replaceChildren()
+    for (const spec of buttons) {
+      footer.append(button(spec.label, spec.className || 'btn-secondary', () => closeModal(spec.value)))
+    }
+    modalActions = buttons.map((spec) => spec.value).join('|')
+    return footer
+  }
 
   function openModal (title, body, buttons, onOpen) {
     closeModal(null)
@@ -354,12 +366,8 @@
     bodyEl.replaceChildren()
     if (typeof body === 'string') bodyEl.append(el('p', { className: 'mb-0 pre-wrap', text: body }))
     else if (body) bodyEl.append(body)
-    const footer = $('modalFooter')
-    footer.replaceChildren()
     const promise = new Promise((resolve) => { modalResolve = resolve })
-    for (const spec of buttons) {
-      footer.append(button(spec.label, spec.className || 'btn-secondary', () => closeModal(spec.value)))
-    }
+    const footer = renderModalButtons(buttons)
     $('modal').hidden = false
     const focusTarget = footer.querySelector('button:last-child') || $('modalClose')
     focusTarget.focus()
@@ -1107,9 +1115,16 @@
     else if (value === 'cancel-chat') await cancelChat(r.chat_id)
   }
 
+  // Live refresh of the open detail: the actions follow the new state too.
   function fillDetail (r) {
     if ($('modal').hidden) return
     $('modalBody').replaceChildren(detailBody(r))
+    const buttons = detailButtons(r)
+    if (buttons.map((spec) => spec.value).join('|') === modalActions) return
+    const footer = $('modalFooter')
+    const hadFocus = footer.contains(document.activeElement)
+    renderModalButtons(buttons)
+    if (hadFocus) footer.querySelector('button:last-child').focus()
   }
 
   // ---------------------------------------------------------------------

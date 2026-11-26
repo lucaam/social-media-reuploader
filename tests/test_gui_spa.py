@@ -525,6 +525,48 @@ def test_each_live_connection_resyncs_once_subscribed(tmp_path, api):
 
 
 # ---------------------------------------------------------------------------
+# Request detail
+# ---------------------------------------------------------------------------
+def failed_request(chat_id: int, url: str, code: str = "unavailable") -> int:
+    request_id = db.create_request(chat_id, url)
+    assert db.claim_request(request_id)
+    assert db.mark_failed(request_id, error_code=code, error_message="boom")
+    return request_id
+
+
+def test_the_open_detail_follows_live_changes_with_its_actions(tmp_path, api):
+    request_id = failed_request(7, "https://example.com/v/1")
+    detail = f"api/requests/{request_id}"
+    routes = snapshot(api, *DEFAULT_GETS, detail)
+    assert db.requeue_requests([request_id], actor="gui:oauth:other") == [request_id]
+    requeued = snapshot(api, detail)
+    run_spa(
+        tmp_path,
+        f"""
+        h.button('requestsBody', 'Dettagli').click()
+        await h.settle()
+        h.eq(h.text('modalTitle'), 'Richiesta #{request_id}', 'detail open')
+        h.eq(h.labels('modalFooter'), ['Rimetti in coda', 'Chiudi'], 'failed request')
+        h.socket().open()
+        // another admin requeues the request: its event reaches this console
+        Object.entries(h.data).forEach(([key, reply]) => h.route(key, reply))
+        h.socket().receive({{ kind: 'events', last_id: 99, events: [
+          {{ id: 99, type: 'request_status', request_id: {request_id}, status: 'queued', previous: 'failed' }}
+        ] }})
+        await h.advance(500)
+        h.ok(h.text('modalBody').includes('In coda'), 'the body shows the new state')
+        h.eq(h.labels('modalFooter'), ['Annulla la coda di questa chat…', 'Chiudi'], 'queued request')
+        h.button('modalFooter', 'Annulla la coda di questa chat…').click()
+        await h.settle()
+        h.eq(h.text('modalTitle'), 'Annullare la coda della chat?', 'the action still works')
+        """,
+        routes=routes,
+        hash="#requests",
+        data=requeued,
+    )
+
+
+# ---------------------------------------------------------------------------
 # System tab
 # ---------------------------------------------------------------------------
 def test_clearing_the_history_says_which_requests_are_kept(tmp_path, api):
