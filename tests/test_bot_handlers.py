@@ -799,6 +799,13 @@ def test_help_text_follows_the_configuration(monkeypatch):
     assert "Siti supportati: YouTube." in text
 
 
+def test_help_privacy_lists_what_is_stored_per_link():
+    privacy = handlers.help_text("YouTube").split("Privacy\n", 1)[1]
+    # requests.user_id, original_message_id and chat_id (see src.worker).
+    for stored in ("ID della chat", "del messaggio", "l'ID Telegram di chi"):
+        assert stored in privacy
+
+
 @pytest.mark.parametrize(
     ("policy", "chat_type", "expected"),
     [

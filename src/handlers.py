@@ -236,9 +236,10 @@ def help_text(sites: str) -> str:
         "",
         "Privacy",
         (
-            "Per elaborare un link salvo l'ID della chat, il link e il testo del "
-            "messaggio che lo accompagna (lo uso come didascalia). I messaggi "
-            "senza link vengono ignorati."
+            "Per elaborare un link salvo l'ID della chat e del messaggio, l'ID "
+            "Telegram di chi l'ha mandato, il link e il testo del messaggio che "
+            "lo accompagna (lo uso come didascalia). I messaggi senza link "
+            "vengono ignorati."
         ),
     ]
     if not getattr(config, "KEEP_DOWNLOADED_FILES", False):
