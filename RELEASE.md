@@ -35,10 +35,13 @@ l'immagine con *Build and publish Docker image to GHCR on release*.
 ## Controlli in locale
 
 ```bash
-npm ci
-pip install -r requirements-dev.txt
+npm ci                                                   # commitlint
+pip install -r requirements.txt -r requirements-dev.txt  # i test importano l'app
 ./scripts/prepare_release.sh      # test, pre-commit, commitlint, helm lint, versioni
 ```
+
+Se helm o actionlint non sono installati, lo script salta i relativi hook di
+pre-commit (`helm-lint`, `actionlint`): la CI li esegue comunque.
 
 ## Ricostruire un'immagine
 

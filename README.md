@@ -292,6 +292,7 @@ Altre guide: [utilizzo](docs/usage.md), [deploy](docs/deploy.md),
 
 ```bash
 pip install -r requirements.txt -r requirements-dev.txt
+npm ci                                # facoltativo: commitlint per l'hook commit-msg
 pre-commit install && pre-commit install --hook-type pre-push --hook-type commit-msg
 REQUESTS_DB=/tmp/smr-tests/requests.db python -m pytest -q   # i test dei media richiedono ffmpeg
 ```

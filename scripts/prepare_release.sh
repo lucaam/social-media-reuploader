@@ -37,7 +37,19 @@ fi
 
 echo "Running pre-commit hooks..."
 if command -v pre-commit >/dev/null 2>&1; then
-  pre-commit run --all-files || die "pre-commit checks failed"
+  # The helm-lint and actionlint hooks need helm / actionlint on PATH (both
+  # optional locally; CI runs them in dedicated jobs): skip the ones whose tool
+  # is missing, on top of any SKIP already set.
+  skip="${SKIP:-}"
+  for hook_tool in helm-lint:helm actionlint:actionlint; do
+    hook="${hook_tool%%:*}"
+    tool="${hook_tool#*:}"
+    if ! command -v "$tool" >/dev/null 2>&1; then
+      echo "$tool not found: skipping the $hook hook"
+      skip="${skip:+$skip,}$hook"
+    fi
+  done
+  SKIP="$skip" pre-commit run --all-files || die "pre-commit checks failed"
 else
   echo "pre-commit not found: skipping hook run"
 fi
