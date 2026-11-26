@@ -221,7 +221,7 @@ mappa `env` di `values.yaml` (numeri e booleani vengono resi come stringhe).
 | `WORKER_REHYDRATE_ON_START` | `true` | All'avvio riprende le richieste rimaste in coda; con `false` le segna come `aborted`. |
 | `WORKER_POLL_SECONDS` | `2` | Ogni quanto il worker controlla la coda nel database, ad esempio per le richieste rimesse in coda dalla GUI (min 0.2). Nome legacy: `WORKER_PERIODIC_REHYDRATE_SECONDS`. |
 | `WORKER_HEARTBEAT_SECONDS` | `5` | Ogni quanto il worker pubblica il proprio stato per la GUI. |
-| `WORKER_SHUTDOWN_TIMEOUT` | `30` | Secondi concessi alle richieste in corso allo spegnimento prima di annullarle (il chart usa il grace period del pod meno 15 secondi). |
+| `WORKER_SHUTDOWN_TIMEOUT` | `30` | Secondi concessi alle richieste in corso allo spegnimento prima di annullarle (il chart usa il grace period del pod meno 15 secondi). Docker deve concedere al container almeno questo valore più 45 secondi prima di ucciderlo (`stop_grace_period: 75s` in `docker-compose.yml`, `--stop-timeout` con `docker run`). |
 | `WORKER_MAX_ATTEMPTS` | `3` | Tentativi massimi di una richiesta interrotta da crash o riavvii. |
 | `WORKER_RETRY_BACKOFF_SECONDS` | `30` | Base del backoff esponenziale per gli errori temporanei (30, 60, 120 s, ... fino a 15 minuti, mai meno del `retry_after` di Telegram). |
 

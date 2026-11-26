@@ -26,7 +26,7 @@ Regole valide per ogni deploy:
 
 ```bash
 docker volume create smr-data
-docker run -d --name smr-bot --restart unless-stopped \
+docker run -d --name smr-bot --restart unless-stopped --stop-timeout 75 \
   -e BOT_TOKEN="$BOT_TOKEN" \
   -v smr-data:/app/data \
   -p 127.0.0.1:8080:8080 \
@@ -44,6 +44,14 @@ docker run -d --name smr-gui --restart unless-stopped \
 `PORT=8081` serve solo all'HEALTHCHECK dell'immagine, che controlla `$PORT`.
 Per una versione precisa sostituisci `latest` con il numero di release.
 
+`--stop-timeout 75`: allo stop Docker manda SIGTERM e, dopo 10 secondi se non
+indicato, SIGKILL. Il bot aspetta fino a `WORKER_SHUTDOWN_TIMEOUT` (30 s) le
+richieste in corso e poi concede 15 secondi a quelle annullate per tornare in
+coda; un upload interrotto da SIGKILL viene segnato come fallito e non viene
+più inviato. Tieni il timeout ad almeno `WORKER_SHUTDOWN_TIMEOUT` + 45 secondi.
+Dietro un reverse proxy aggiungi alla GUI `-e FORWARDED_ALLOW_IPS=<indirizzo del
+proxy>` (vedi sotto).
+
 ## Docker Compose
 
 `docker-compose.yml` avvia bot e GUI con il volume `data` condiviso e
@@ -55,10 +63,25 @@ docker compose up -d --build
 docker compose logs -f bot
 ```
 
-- `BOT_TOKEN` e `SECRET_KEY` sono obbligatorie: senza, Compose non parte.
+- `BOT_TOKEN` e `SECRET_KEY` sono obbligatorie: senza, Compose non parte. La
+  GUI si ferma all'avvio anche senza `ADMIN_TOKEN` o una configurazione OAuth
+  completa.
 - Le porte sono pubblicate solo su `127.0.0.1` (`BIND_ADDRESS` per cambiarlo):
   per esporre la GUI usa un reverse proxy con HTTPS e imposta
   `SESSION_COOKIE_SECURE=true`.
+- Dietro il reverse proxy imposta nel file `.env` anche `FORWARDED_ALLOW_IPS`
+  con l'indirizzo da cui il proxy si collega alla GUI (è quello che compare nei
+  log di accesso della GUI; con il proxy sullo stesso host e le porte su
+  `127.0.0.1` è il gateway della rete di Compose:
+  `docker network inspect social-media-reuploader_default --format '{{(index .IPAM.Config 0).Gateway}}'`).
+  Senza, uvicorn ignora gli header `X-Forwarded-*` e tutti i client sembrano il
+  proxy: dieci token sbagliati in 5 minuti, inviati da chiunque, bloccano il
+  login con token per tutti. Evita `*`, che si fida anche di un
+  `X-Forwarded-For` scritto dal client.
+- Il bot ha `stop_grace_period: 75s`: allo stop (`docker compose down`,
+  `restart`, `up -d` dopo una build) le richieste in corso possono finire. Se
+  aggiungi `WORKER_SHUTDOWN_TIMEOUT` all'`environment`, tieni
+  `stop_grace_period` ad almeno quel valore + 45 secondi.
 - Le altre impostazioni (tabella in [Configurazione](configuration.md)) si
   aggiungono nel file `.env`; quelle non elencate in `docker-compose.yml` vanno
   aggiunte anche alla sezione `environment`.
@@ -80,7 +103,8 @@ Cosa viene creato:
 
 - **Deployment del bot**: 1 replica (il chart rifiuta `replicaCount > 1`;
   `0` ferma il bot), strategia `Recreate` (il vecchio pod si ferma prima che
-  parta il nuovo), probe su `/health`, `WORKER_SHUTDOWN_TIMEOUT` pari al grace
+  parta il nuovo), probe di avvio e liveness su `/health` e di readiness su
+  `/ready`, `WORKER_SHUTDOWN_TIMEOUT` pari al grace
   period meno 15 secondi, emptyDir con `sizeLimit` su `/tmp` per download e
   conversioni.
 - **PVC del database** (`<release>-social-media-reuploader-data`,

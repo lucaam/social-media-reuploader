@@ -88,7 +88,8 @@ schema e host pubblici:
 - imposta `OAUTH_REDIRECT_URI` con l'URL pubblico;
 - avvia uvicorn con `--proxy-headers --forwarded-allow-ips=<indirizzi del
   proxy>` (il chart lo fa già, vedi `gui.forwardedAllowIps`; in Docker usa la
-  variabile `FORWARDED_ALLOW_IPS` di uvicorn);
+  variabile `FORWARDED_ALLOW_IPS` di uvicorn, che `docker-compose.yml` prende
+  dal file `.env`: vedi [Deploy](deploy.md#docker-compose));
 - imposta `SESSION_COOKIE_SECURE=true`.
 
 Senza questi accorgimenti il provider riceve un redirect URI `http://...` e

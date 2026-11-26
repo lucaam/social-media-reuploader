@@ -6,7 +6,8 @@
 #   docker compose up -d --build
 #
 # Required: BOT_TOKEN and SECRET_KEY (compose refuses to start without them).
-# The GUI also needs ADMIN_TOKEN or the OAUTH_* settings to let anyone log in.
+# The GUI also needs ADMIN_TOKEN or a complete OAuth configuration (OAUTH_*):
+# without either it exits at startup.
 # Entries without a value are passed through from .env / the shell only when
 # set there; every setting of the configuration table in README.md can be
 # added the same way.
@@ -46,6 +47,12 @@ x-app-env: &app-env
 services:
   bot:
     <<: *app
+    # Docker sends SIGTERM, then SIGKILL after this grace period (default 10 s).
+    # On SIGTERM the bot waits up to WORKER_SHUTDOWN_TIMEOUT (default 30 s) for
+    # running jobs, then gives cancelled jobs 15 s to put their rows back in the
+    # queue; an upload killed midway is marked failed and never resent. Keep it
+    # at least WORKER_SHUTDOWN_TIMEOUT + 45 s (raise both together).
+    stop_grace_period: 75s
     environment:
       <<: *app-env
       BOT_TOKEN: ${BOT_TOKEN:?Set BOT_TOKEN (the token from @BotFather), e.g. in .env}
@@ -79,6 +86,10 @@ services:
       # Plain HTTP here: the session cookie must not be Secure-only. Set it to
       # true when the GUI is served over HTTPS.
       SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
+      # Behind a reverse proxy: the address the proxy connects from (uvicorn
+      # trusts X-Forwarded-* only from it; default 127.0.0.1, i.e. nobody here),
+      # so that client IPs (login throttling, logs) and the scheme are right.
+      FORWARDED_ALLOW_IPS:
       # Optional OAuth2 / OpenID Connect login (docs/oauth.md)
       OAUTH_CLIENT_ID:
       OAUTH_CLIENT_SECRET:

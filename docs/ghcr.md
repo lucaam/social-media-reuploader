@@ -58,6 +58,6 @@ Altri workflow:
 docker build -t ghcr.io/lucaam/social-media-reuploader:dev \
   --build-arg VERSION=dev --build-arg VCS_REF="$(git rev-parse HEAD)" .
 docker run --rm ghcr.io/lucaam/social-media-reuploader:dev deno --version
-docker run --rm -e BOT_TOKEN="$BOT_TOKEN" -p 127.0.0.1:8080:8080 \
+docker run --rm --stop-timeout 75 -e BOT_TOKEN="$BOT_TOKEN" -p 127.0.0.1:8080:8080 \
   ghcr.io/lucaam/social-media-reuploader:dev
 ```
