@@ -295,11 +295,12 @@ def _edit_too_old(message: Message, now: float | None = None) -> bool:
     """Edits are honoured only within ``config.DUPLICATE_WINDOW_SECONDS``.
 
     Older messages may have lost their request rows (history cleared or
-    pruned), so an edit could otherwise post their links again.
+    pruned), so an edit could otherwise post their links again. A window of
+    0 (duplicate detection disabled) sets no limit, like the worker.
     """
     window = float(getattr(config, "DUPLICATE_WINDOW_SECONDS", 0) or 0)
     sent_at = message.date.timestamp() if message.date else None
-    if sent_at is None:
+    if sent_at is None or window <= 0:
         return False
     current = time.time() if now is None else now
     return current - sent_at > window

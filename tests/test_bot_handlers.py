@@ -512,10 +512,18 @@ def test_channel_post_is_submitted_without_user():
 
 
 def test_edited_channel_post_is_handled_like_an_edit(monkeypatch):
-    raw = text_update(VIMEO, VIMEO, kind="edited_channel_post", chat_type="channel")
+    raw = text_update(
+        VIMEO, VIMEO, kind="edited_channel_post", chat_type="channel", age=30
+    )
     assert feed(raw).calls[0]["url"] == VIMEO
-    monkeypatch.setattr(config, "DUPLICATE_WINDOW_SECONDS", 0)
+    monkeypatch.setattr(config, "DUPLICATE_WINDOW_SECONDS", 10)
     assert feed(raw).calls == []
+
+
+def test_without_duplicate_window_edits_have_no_age_limit(monkeypatch):
+    monkeypatch.setattr(config, "DUPLICATE_WINDOW_SECONDS", 0)
+    pool = feed(text_update(YT, YT, kind="edited_message", age=30 * 86400))
+    assert [c["url"] for c in pool.calls] == [YT]
 
 
 # ---------------------------------------------------------------------------

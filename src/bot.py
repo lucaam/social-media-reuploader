@@ -13,9 +13,10 @@ One code path for both ways of receiving updates (``config.MODE``):
 Both modes serve /health, /ready and /metrics on ``config.HOST:config.PORT``
 (see :mod:`src.http_server`) and use the same handlers (:mod:`src.handlers`).
 
-Startup: logging -> configuration problems and summary -> ``db.init_db()`` ->
-HTTP server -> getMe (token check) -> ``providers.warm_up()`` (in a thread)
--> ``WorkerPool.start()`` -> receive updates.
+Startup: logging -> configuration problems and summary -> token format and
+webhook settings checks -> ``db.init_db()`` -> HTTP server -> getMe (token
+check) -> ``providers.warm_up()`` (in a thread) -> ``WorkerPool.start()`` ->
+receive updates.
 
 Shutdown on SIGTERM/SIGINT (a second signal forces it): stop receiving
 updates -> wait for running update handlers -> ``WorkerPool.stop()`` -> close
