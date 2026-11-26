@@ -349,6 +349,38 @@ def test_plan_crf_transcode_caps_the_bitrate_by_budget():
     assert no_duration.video_kbps == 0  # CRF without cap
 
 
+def _kbits_option(argv: list[str], option: str) -> int:
+    return int(argv[argv.index(option) + 1].removesuffix("k"))
+
+
+@pytest.mark.parametrize(
+    ("duration", "max_bytes"),
+    [(0.3, 50 * MIB), (0.1, 50 * MIB), (5.0, 2000 * MIB), (12.0, 2000 * MIB)],
+)
+def test_crf_vbv_cap_of_short_clips_stays_in_range(duration, max_bytes):
+    # the budget-derived cap grows as 1/duration; libavcodec keeps the VBV
+    # buffer size (bits) in a 32-bit int and rejects anything larger
+    p = make_probe(vcodec="vp9", acodec="opus", duration=duration)
+    plan = plan_video_encode(p, max_bytes, size_targeted=False)
+    argv = media.video_encode_argv(
+        "ffmpeg", "/w/in.webm", "/w/out.mp4", p, plan, preset="veryfast"
+    )
+    assert _kbits_option(argv, "-bufsize") * 1000 <= 2**31 - 1
+    assert 0 < plan.video_kbps <= media.MAX_VBV_KBPS
+    assert _kbits_option(argv, "-maxrate") == plan.video_kbps
+    assert (plan.width, plan.height) == (1920, 1080)  # the cap never downscales
+
+
+def test_encode_argv_bufsize_never_overflows():
+    p = make_probe()
+    for crf in (None, media.CRF):
+        plan = VideoPlan(1920, 1080, None, 5_000_000, crf, 128, 2)
+        argv = media.video_encode_argv(
+            "ffmpeg", "/w/in", "/w/out.mp4", p, plan, preset="veryfast"
+        )
+        assert _kbits_option(argv, "-bufsize") * 1000 <= 2**31 - 1
+
+
 def test_plan_audio_only():
     p = make_probe(
         has_video=False,
@@ -749,6 +781,19 @@ def test_vp9_opus_webm_is_transcoded(gen, tmp_path):
     )  # metadata refreshed from the output
     assert prepared.original_size == os.path.getsize(webm)
     assert is_telegram_compatible(q, prepared.path)
+
+
+@needs_ffmpeg
+def test_very_short_clip_is_transcoded(gen, tmp_path):
+    # 0.3 s in 50 MiB: the budget alone would allow a ~1.3 Gbps VBV cap,
+    # whose -bufsize ffmpeg refuses ("Numerical result out of range")
+    clip = gen("short.webm", *LAVFI_VIDEO, "-t", "0.3", *FAST_VP9)
+    assert run(media.probe(clip)).duration < 0.36
+    prepared = run(
+        media.prepare_for_telegram(clip, _workdir(tmp_path), max_bytes=50 * MIB)
+    )
+    assert prepared.action == "transcode"
+    assert is_telegram_compatible(prepared.probe, prepared.path)
 
 
 @needs_ffmpeg

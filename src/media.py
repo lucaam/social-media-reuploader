@@ -76,6 +76,12 @@ SIDE_LADDER = (1280, 960, 854, 640, 480, 426, 320, 256)
 COMPRESS_FPS_CAP = 30.0
 DEFAULT_FPS = 30.0
 CRF = 23
+# VBV ceiling of CRF re-encodes: the cap derived from the budget grows as
+# 1/duration (0.3 s in 50 MiB would allow ~1.3 Gbps), while CRF 23 at
+# <= ENCODE_MAX_SIDE never needs more than this.
+MAX_VBV_KBPS = 60_000
+# libavcodec keeps the VBV buffer size (in bits) in a 32-bit int.
+MAX_BUFSIZE_KBITS = (2**31 - 1) // 1000
 RETRY_SAFETY = 0.92
 # (minimum total kbps, audio kbps, channels) for videos, best first.
 AUDIO_LADDER: tuple[tuple[float, int, int], ...] = (
@@ -599,7 +605,8 @@ def plan_video_encode(
 
     ``size_targeted``: ABR whose bitrate comes from ``max_bytes`` (raises
     :class:`TooLarge` when the video bitrate would drop below
-    ``MIN_VIDEO_KBPS``). Otherwise CRF with a VBV cap derived from the budget.
+    ``MIN_VIDEO_KBPS``). Otherwise CRF with a VBV cap derived from the budget
+    (at most ``MAX_VBV_KBPS``).
     """
     width, height = _display_size(p)
     src_fps = _source_fps(p)
@@ -661,7 +668,7 @@ def plan_video_encode(
             used_audio = source_audio_kbps or float(DEFAULT_AUDIO_KBPS)
         else:
             used_audio = 0.0
-        cap = max(total - used_audio, float(MIN_VIDEO_KBPS))
+        cap = min(max(total - used_audio, float(MIN_VIDEO_KBPS)), float(MAX_VBV_KBPS))
     out_w, out_h = plan_dimensions(
         width,
         height,
@@ -801,10 +808,11 @@ def video_encode_argv(
         "yuv420p",
     ]
     kbps = plan.video_kbps
+    bufsize = min(2 * kbps, MAX_BUFSIZE_KBITS)
     if plan.crf is not None:
         argv += ["-crf", str(plan.crf)]
         if kbps > 0:
-            argv += ["-maxrate", f"{kbps}k", "-bufsize", f"{2 * kbps}k"]
+            argv += ["-maxrate", f"{kbps}k", "-bufsize", f"{bufsize}k"]
     else:
         argv += [
             "-b:v",
@@ -812,7 +820,7 @@ def video_encode_argv(
             "-maxrate",
             f"{int(kbps * 1.5)}k",
             "-bufsize",
-            f"{2 * kbps}k",
+            f"{bufsize}k",
         ]
     if not has_audio:
         argv += ["-an"]
