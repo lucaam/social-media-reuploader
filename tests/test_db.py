@@ -504,9 +504,12 @@ def test_migrates_a_database_created_by_the_old_code(tmp_path, monkeypatch):
             assert ISO_RE.match(row["updated_at"])
             assert row["attempts"] == 0
         assert rows[1]["updated_at"] == rows[1]["processing_finished_at"]
-        for table in ("request_events", "updates", "users", "processed_messages"):
+        for table in ("request_events", "users", "processed_messages"):
             for (value,) in conn.execute(f"SELECT created_at FROM {table}"):
                 assert ISO_RE.match(value), (table, value)
+        # the legacy event log is not rewritten (prune deletes it by age)
+        legacy_log = [row[0] for row in conn.execute("SELECT created_at FROM updates")]
+        assert legacy_log == ["2026-11-20T10:00:00", "2026-11-20T10:00:00.25"]
     finally:
         conn.close()
 
@@ -703,6 +706,59 @@ def test_init_db_concurrently_from_processes(tmp_path):
     for proc, (out, err) in zip(procs, outputs, strict=True):
         assert proc.returncode == 0, err
         assert out.strip() == "2026-11-20T10:00:00.123456+00:00"
+
+
+SLOW_MIGRATION = """
+import time
+from src import db
+
+original = db._migrate_users
+
+def slow(conn):
+    print("migrating", flush=True)
+    time.sleep(1.5)
+    original(conn)
+
+db._migrate_users = slow
+db.init_db()
+print("done", flush=True)
+"""
+
+
+def test_init_db_waits_for_a_migration_running_in_another_process(
+    tmp_path, monkeypatch
+):
+    """A migration longer than the busy timeout must not fail the other process."""
+    path = tmp_path / "requests.db"
+    create_legacy_db(path)
+    env = {**os.environ, "REQUESTS_DB": str(path), "PYTHONPATH": str(REPO_ROOT)}
+    proc = subprocess.Popen(
+        [sys.executable, "-c", SLOW_MIGRATION],
+        env=env,
+        cwd=str(tmp_path),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        # The other process holds the write lock for 1.5 s from now on.
+        assert proc.stdout.readline().strip() == "migrating"
+        monkeypatch.setattr(db, "BUSY_TIMEOUT_SECONDS", 0.2)
+        monkeypatch.setattr(db, "MIGRATION_TIMEOUT_SECONDS", 30.0, raising=False)
+        monkeypatch.setenv("REQUESTS_DB", str(path))
+        with db.connect() as conn:  # waits for that migration instead of failing
+            version = db._user_version(conn)
+            busy_ms = conn.execute("PRAGMA busy_timeout").fetchone()[0]
+        out, err = proc.communicate(timeout=60)
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+            proc.communicate()
+    assert proc.returncode == 0, err
+    assert out.strip() == "done"
+    assert version == db.SCHEMA_VERSION
+    assert busy_ms == 200  # the waiting connection is back to the normal timeout
+    assert db.get_request(1)["created_at"] == "2026-11-20T10:00:00.123456+00:00"
 
 
 def test_hot_queries_use_indexes(db_file):

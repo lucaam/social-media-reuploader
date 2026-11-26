@@ -22,7 +22,9 @@ Rules followed by every function in this module:
 * Everything is synchronous: async code must call these functions through
   :func:`aio` so the event loop is never blocked.
 * Timestamps are fixed-width UTC ISO-8601 strings with an explicit ``+00:00``
-  offset (:func:`now_iso`), so string order is chronological order.
+  offset (:func:`now_iso`), so string order is chronological order. (Event-log
+  rows written by the old code keep their naive UTC timestamps until
+  :func:`prune` deletes them: the migration does not rewrite that table.)
 
 Never call another function of this module while holding a write transaction
 (``with write() as conn:``): the nested call opens a second connection and
@@ -54,6 +56,9 @@ SCHEMA_VERSION = 2
 # raising ``sqlite3.OperationalError: database is locked``. Read on every
 # connect, so tests may lower it.
 BUSY_TIMEOUT_SECONDS = 10.0
+# Seconds a process waits for a schema migration that another process is
+# running (bot and GUI start together after an upgrade) before giving up.
+MIGRATION_TIMEOUT_SECONDS = 600.0
 MEMORY_PATH = ":memory:"
 MAX_PAGE_SIZE = 1000
 MAX_EVENTS_PAGE = 5000
@@ -441,8 +446,9 @@ def init_db() -> None:
 
     Safe to call concurrently from several threads and processes: migrations
     run in one ``BEGIN IMMEDIATE`` transaction and re-check
-    ``PRAGMA user_version`` under the lock. Raises when the database cannot be
-    opened or migrated.
+    ``PRAGMA user_version`` under the lock; a caller that finds a migration in
+    progress waits for it (up to :data:`MIGRATION_TIMEOUT_SECONDS`). Raises
+    when the database cannot be opened or migrated.
     """
     with connect():
         pass
@@ -553,10 +559,13 @@ _NEW_INDEXES: dict[str, tuple[bool, str, str, str]] = {
     ),
     "idx_users_email_norm": (True, "users", "email_norm", "email_norm IS NOT NULL"),
 }
+# The event log (``updates``) is left out on purpose: it can be the biggest
+# legacy table, prune() deletes it by age soon after start (naive UTC strings
+# still compare correctly enough for that) and the GUI parses naive values as
+# UTC. Rewriting it would only make the migration longer and the WAL bigger.
 _TIMESTAMP_COLUMNS = {
     "requests": ("created_at", "processing_started_at", "processing_finished_at"),
     "request_events": ("created_at",),
-    "updates": ("created_at",),
     "users": ("created_at",),
     "processed_messages": ("created_at",),
 }
@@ -715,20 +724,31 @@ def _ensure_schema(conn: sqlite3.Connection) -> None:
         )
 
 
+def _set_busy_timeout(conn: sqlite3.Connection, seconds: float) -> None:
+    conn.execute(f"PRAGMA busy_timeout = {max(0, int(seconds * 1000))}")
+
+
 def _migrate(conn: sqlite3.Connection) -> None:
     # journal_mode cannot change inside a transaction; it is a no-op (returns
     # "memory") for in-memory databases.
     _enable_wal(conn)
-    with transaction(conn):
-        version = _user_version(conn)  # re-check under the write lock
-        if version >= SCHEMA_VERSION:
-            return
-        for target, migration in _MIGRATIONS:
-            if version < target:
-                logger.info("Migrating database schema to version %d", target)
-                migration(conn)
-                version = target
-        conn.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)}")
+    # Another process may be running this migration right now and a big legacy
+    # database takes longer than the normal busy timeout: wait for its lock
+    # (the re-check below then finds the schema up to date) instead of failing.
+    _set_busy_timeout(conn, MIGRATION_TIMEOUT_SECONDS)
+    try:
+        with transaction(conn):
+            version = _user_version(conn)  # re-check under the write lock
+            if version >= SCHEMA_VERSION:
+                return
+            for target, migration in _MIGRATIONS:
+                if version < target:
+                    logger.info("Migrating database schema to version %d", target)
+                    migration(conn)
+                    version = target
+            conn.execute(f"PRAGMA user_version = {int(SCHEMA_VERSION)}")
+    finally:
+        _set_busy_timeout(conn, BUSY_TIMEOUT_SECONDS)
 
 
 # ---------------------------------------------------------------------------
