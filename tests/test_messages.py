@@ -11,9 +11,13 @@ from src import messages
         (0, "1 secondo"),
         (0.4, "1 secondo"),
         (1, "1 secondo"),
+        (8.4, "9 secondi"),  # rounded up, never down: retrying on time works
+        (8.5, "9 secondi"),
         (9.998, "10 secondi"),
         (59, "59 secondi"),
+        (59.4, "1 minuto"),
         (60, "1 minuto"),
+        (60.4, "2 minuti"),
         (61, "2 minuti"),
         (119, "2 minuti"),
         (120, "2 minuti"),
@@ -78,9 +82,20 @@ def test_rate_limited_mentions_limit_and_wait():
     )
 
 
+def test_rate_limited_wait_is_never_shown_shorter_than_it_is():
+    assert messages.rate_limited(8.4, (1, 10)) == (
+        "Hai inviato troppi link: puoi inviarne al massimo 1 ogni 10 secondi. "
+        "Riprova tra 9 secondi."
+    )
+
+
 def test_pending_cap_deferred_and_duplicate_notices():
-    assert messages.pending_cap(3).startswith("Hai già 3 link in coda")
-    assert messages.pending_cap(1).startswith("Hai già 1 link in coda")
+    assert messages.pending_cap(3) == (
+        "Hai già 3 link in coda: aspetta che li elabori prima di inviarne altri."
+    )
+    assert messages.pending_cap(1) == (
+        "Hai già 1 link in coda: aspetta che lo elabori prima di inviarne un altro."
+    )
     assert messages.deferred(10) == "Link in coda: lo elaboro tra 10 secondi."
     assert messages.deferred(90) == "Link in coda: lo elaboro tra 2 minuti."
     assert messages.duplicate() == "Questo link è già stato condiviso di recente."

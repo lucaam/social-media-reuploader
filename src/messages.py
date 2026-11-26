@@ -41,9 +41,10 @@ def size_mb(size: float | None) -> str:
 
 
 def _seconds(seconds: float) -> int:
+    """Whole seconds, rounded up: a wait shown too short makes users retry early."""
     if not math.isfinite(seconds):
         return 1
-    return max(1, round(seconds))
+    return max(1, math.ceil(seconds))
 
 
 def duration(seconds: float) -> str:
@@ -108,8 +109,13 @@ def rate_limited(delay_seconds: float, window: tuple[int, int] | None = None) ->
 
 def pending_cap(active: int) -> str:
     """Too many links of the chat are still waiting or being processed."""
+    if active == 1:
+        return (
+            "Hai già 1 link in coda: aspetta che lo elabori prima di inviarne "
+            "un altro."
+        )
     return (
-        f"Hai già {plural(active, 'link', 'link')} in coda: aspetta che li elabori "
+        f"Hai già {active} link in coda: aspetta che li elabori "
         "prima di inviarne altri."
     )
 
