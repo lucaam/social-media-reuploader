@@ -303,6 +303,52 @@ def test_failure_limiter_window():
     assert len(limiter._failures) == 2  # bounded memory
 
 
+def test_failure_limiter_has_a_budget_shared_by_all_addresses(caplog):
+    now = [1000.0]
+    limiter = gui_auth.FailureLimiter(
+        max_failures=3, max_total_failures=5, window_seconds=60, clock=lambda: now[0]
+    )
+    for number in range(4):  # one failure per (spoofed) address
+        limiter.record_failure(f"198.51.100.{number}")
+        now[0] += 1
+    assert limiter.retry_after("198.51.100.99") is None
+    limiter.record_failure("198.51.100.4")
+    assert "token logins are paused" in caplog.text
+    assert limiter.retry_after("198.51.100.99") == pytest.approx(56)
+    limiter.reset("198.51.100.4")  # a success does not refill the shared budget
+    assert limiter.retry_after("198.51.100.99") is not None
+    now[0] = 1060.5  # the oldest failure left the window
+    assert limiter.retry_after("198.51.100.99") is None
+
+
+def test_rotating_spoofed_forwarded_addresses_are_throttled():
+    # Behind a proxy that appends to X-Forwarded-For with --forwarded-allow-ips
+    # "*", uvicorn takes the left-most entry: the client chooses its address.
+    from uvicorn.middleware.proxy_headers import ProxyHeadersMiddleware
+
+    app = gui.create_app(settings())
+    app.state.gui.limiter = gui_auth.FailureLimiter(
+        max_failures=3, max_total_failures=6, window_seconds=60
+    )
+    client = TestClient(ProxyHeadersMiddleware(app, trusted_hosts="*"))
+
+    def spoofed(number):
+        return {**SAME, "X-Forwarded-For": f"198.51.100.{number}, 203.0.113.7"}
+
+    codes = [
+        client.post("/login", json={"token": "wrong"}, headers=spoofed(n)).status_code
+        for n in range(10)
+    ]
+    assert codes == [401] * 6 + [429] * 4
+    right = client.post("/login", json={"token": TOKEN}, headers=spoofed(50))
+    assert right.status_code == 429  # paused for everyone until the window moves
+    bearer = client.get(
+        "/api/requests",
+        headers={"Authorization": "Bearer nope", "X-Forwarded-For": "198.51.100.77"},
+    )
+    assert bearer.status_code == 429
+
+
 # ---------------------------------------------------------------------------
 # Token sessions
 # ---------------------------------------------------------------------------

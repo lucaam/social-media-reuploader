@@ -73,6 +73,9 @@ OAUTH_CLIENT_NAME = "provider"
 # Failed admin-token attempts allowed per client address and window.
 LOGIN_MAX_FAILURES = 10
 LOGIN_FAILURE_WINDOW_SECONDS = 300.0
+# ... and from all addresses together: behind a proxy that appends to
+# X-Forwarded-For, the client chooses the address the per-address limit sees.
+LOGIN_MAX_TOTAL_FAILURES = 100
 SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 
 _GROUP_CLAIMS = ("groups", "memberOf", "member_of")
@@ -682,7 +685,13 @@ def _text(value: Any) -> str | None:
 # Failed-attempt throttling
 # ---------------------------------------------------------------------------
 class FailureLimiter:
-    """Sliding-window counter of failed token attempts per client address."""
+    """Sliding-window counter of failed token attempts per client address,
+    plus a budget shared by all addresses (``max_total_failures``).
+
+    The client address can be chosen by the client (proxy headers), so the
+    shared budget is what bounds a guessing attack from rotating addresses.
+    When it is spent, token logins pause for everyone until the window moves.
+    """
 
     def __init__(
         self,
@@ -690,23 +699,31 @@ class FailureLimiter:
         max_failures: int = LOGIN_MAX_FAILURES,
         window_seconds: float = LOGIN_FAILURE_WINDOW_SECONDS,
         max_keys: int = 4096,
+        max_total_failures: int = LOGIN_MAX_TOTAL_FAILURES,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self.max_failures = max_failures
         self.window_seconds = window_seconds
         self.max_keys = max_keys
+        self.max_total_failures = max_total_failures
         self._clock = clock
         self._lock = threading.Lock()
         self._failures: OrderedDict[str, deque[float]] = OrderedDict()
+        self._all_failures: deque[float] = deque()
 
     def retry_after(self, key: str) -> float | None:
         """Seconds until ``key`` may try again, or None when allowed now."""
         now = self._clock()
         with self._lock:
+            waits: list[float] = []
             attempts = self._prune(key, now)
-            if attempts is None or len(attempts) < self.max_failures:
-                return None
-            return max(0.0, attempts[0] + self.window_seconds - now)
+            if attempts is not None and len(attempts) >= self.max_failures:
+                waits.append(attempts[0] + self.window_seconds - now)
+            spent = self._prune_all(now)
+            if spent >= self.max_total_failures:
+                oldest_to_expire = self._all_failures[spent - self.max_total_failures]
+                waits.append(oldest_to_expire + self.window_seconds - now)
+            return max(0.0, *waits) if waits else None
 
     def record_failure(self, key: str) -> None:
         now = self._clock()
@@ -718,6 +735,16 @@ class FailureLimiter:
             self._failures.move_to_end(key)
             while len(self._failures) > self.max_keys:
                 self._failures.popitem(last=False)
+            self._prune_all(now)
+            self._all_failures.append(now)
+            if len(self._all_failures) == self.max_total_failures:
+                logger.warning(
+                    "%d failed admin-token attempts in %.0f s from all client"
+                    " addresses: token logins are paused for everyone (spoofed"
+                    " X-Forwarded-For addresses?)",
+                    self.max_total_failures,
+                    self.window_seconds,
+                )
 
     def reset(self, key: str) -> None:
         with self._lock:
@@ -733,6 +760,12 @@ class FailureLimiter:
             del self._failures[key]
             return None
         return attempts
+
+    def _prune_all(self, now: float) -> int:
+        """Drop expired entries of the shared budget; how many remain."""
+        while self._all_failures and self._all_failures[0] <= now - self.window_seconds:
+            self._all_failures.popleft()
+        return len(self._all_failures)
 
 
 # ---------------------------------------------------------------------------
