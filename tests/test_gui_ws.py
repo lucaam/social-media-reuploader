@@ -383,10 +383,6 @@ def test_tailer_publishes_worker_status_only_on_change():
     asyncio.run(scenario())
 
 
-def test_publish_sync_is_a_deprecated_no_op():
-    assert ws_broadcast.publish_sync({"type": "rate_limit_changed"}) is None
-
-
 # ---------------------------------------------------------------------------
 # Lifespan
 # ---------------------------------------------------------------------------

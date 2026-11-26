@@ -478,48 +478,6 @@ def _first_int(*values: Any) -> int | None:
     return None
 
 
-def _sample_aspect_ratio(value: Any) -> float | None:
-    if not isinstance(value, str) or ":" not in value:
-        return None
-    num, _, den = value.partition(":")
-    try:
-        ratio = float(num) / float(den)
-    except (ValueError, ZeroDivisionError):
-        return None
-    return ratio if ratio > 0 else None
-
-
-def _dims_from_meta(
-    meta: Mapping[str, Any],
-) -> tuple[int | None, int | None, int | None]:
-    """(duration, width, height) from legacy ffprobe/yt-dlp metadata dicts.
-
-    Coded dimensions are turned into display dimensions: swapped for 90/270
-    degree rotations and scaled by a non-square sample aspect ratio.
-    """
-    fmt = meta.get("format")
-    fmt_duration = fmt.get("duration") if isinstance(fmt, Mapping) else None
-    duration = _first_int(meta.get("duration"), fmt_duration)
-    if meta.get("display_width") and meta.get("display_height"):
-        return (
-            duration,
-            _first_int(meta["display_width"]),
-            _first_int(meta["display_height"]),
-        )
-    width = _first_int(meta.get("video_width"), meta.get("width"))
-    height = _first_int(meta.get("video_height"), meta.get("height"))
-    if width and height:
-        sar = _sample_aspect_ratio(meta.get("video_sample_aspect_ratio"))
-        if sar and abs(sar - 1.0) > 0.01:
-            width = max(1, round(width * sar))
-        rotation = _to_int(meta.get("video_rotation"))
-        if rotation is None:
-            rotation = _to_int(meta.get("rotation"))
-        if rotation is not None and abs(rotation) % 180 == 90:
-            width, height = height, width
-    return duration, width, height
-
-
 def _missing_file(path: str) -> dict[str, Any]:
     logger.warning("Cannot send %s: file not found", os.path.basename(path))
     return {"ok": False, "description": f"file not found: {os.path.basename(path)}"}
@@ -637,19 +595,12 @@ async def send_video(
     thumbnail: str | None = None,
     supports_streaming: bool = True,
     parse_mode: str | None = None,
-    meta: Mapping[str, Any] | None = None,
-    thumbnail_path: str | None = None,
 ) -> dict[str, Any]:
     """sendVideo for a local path (upload) or an http(s) URL (server-side fetch).
 
-    ``meta`` and ``thumbnail_path`` are the legacy spellings used by the old
-    worker: dimensions found in ``meta`` are used when not given explicitly.
+    ``width``/``height`` are the display dimensions (rotation and sample
+    aspect ratio already applied, e.g. ``media.ProbeResult.display_width``).
     """
-    if isinstance(meta, Mapping):
-        meta_duration, meta_width, meta_height = _dims_from_meta(meta)
-        duration = duration if duration is not None else meta_duration
-        width = width if width is not None else meta_width
-        height = height if height is not None else meta_height
     params = {
         "caption": _truncate(caption, MAX_CAPTION_LENGTH),
         "parse_mode": parse_mode,
@@ -667,7 +618,7 @@ async def send_video(
         video,
         params,
         default_type="video/mp4",
-        thumbnail=thumbnail or thumbnail_path,
+        thumbnail=thumbnail,
     )
 
 
@@ -714,7 +665,6 @@ async def send_document(
     reply_to_message_id: int | None = None,
     thumbnail: str | None = None,
     parse_mode: str | None = None,
-    thumbnail_path: str | None = None,
 ) -> dict[str, Any]:
     params = {
         "caption": _truncate(caption, MAX_CAPTION_LENGTH),
@@ -729,7 +679,7 @@ async def send_document(
         document,
         params,
         default_type="application/octet-stream",
-        thumbnail=thumbnail or thumbnail_path,
+        thumbnail=thumbnail,
     )
 
 
@@ -915,16 +865,9 @@ _AUDIO_EXTS = frozenset(
 _PHOTO_EXTS = frozenset({".jpg", ".jpeg", ".png", ".webp"})
 
 
-def _media_kind(path: str, meta: Mapping[str, Any] | None) -> str:
+def _media_kind(path: str) -> str:
     ext = os.path.splitext(path)[1].lower()
-    has_video = meta.get("has_video") if isinstance(meta, Mapping) else None
-    has_audio = meta.get("has_audio") if isinstance(meta, Mapping) else None
-    container = (
-        str(meta.get("format") or "").lower() if isinstance(meta, Mapping) else ""
-    )
-    if ext in _VIDEO_EXTS or (has_video and "mp4" in container):
-        if has_video is False:
-            return "audio" if has_audio else "document"
+    if ext in _VIDEO_EXTS:
         return "video"
     if ext in _AUDIO_EXTS:
         return "audio"
@@ -939,10 +882,13 @@ async def send_media(
     file_path: str,
     caption: str | None = None,
     reply_to_message_id: int | None = None,
-    meta: Mapping[str, Any] | None = None,
 ) -> dict[str, Any]:
-    """Send a local file with the best matching method (video/audio/photo/document)."""
-    kind = _media_kind(file_path, meta)
+    """Send a local file with the method matching its extension.
+
+    Video, audio and image extensions use sendVideo/sendAudio/sendPhoto;
+    anything else is sent with sendDocument.
+    """
+    kind = _media_kind(file_path)
     if kind == "video":
         return await send_video(
             token,
@@ -950,17 +896,14 @@ async def send_media(
             file_path,
             caption=caption,
             reply_to_message_id=reply_to_message_id,
-            meta=meta,
         )
     if kind == "audio":
-        duration = _dims_from_meta(meta)[0] if isinstance(meta, Mapping) else None
         return await send_audio(
             token,
             chat_id,
             file_path,
             caption=caption,
             reply_to_message_id=reply_to_message_id,
-            duration=duration,
         )
     if kind == "photo":
         return await send_photo(
@@ -1036,11 +979,10 @@ async def set_message_reaction(
     chat_id: int | str,
     message_id: int,
     emoji: str | None = None,
-    remove: bool = False,
     *,
     is_big: bool = False,
 ) -> dict[str, Any]:
-    """Set the bot's reaction on a message (``None``/``remove`` clears it).
+    """Set the bot's reaction on a message (``None`` clears it).
 
     The emoji must be in :data:`ALLOWED_REACTIONS` (no request otherwise).
     When Telegram refuses reactions in a chat they are not attempted again
@@ -1049,7 +991,7 @@ async def set_message_reaction(
     """
     reaction: list[dict[str, str]] = []
     normalized: str | None = None
-    if emoji is not None and not remove:
+    if emoji is not None:
         normalized = normalize_reaction(emoji)
         if normalized is None:
             logger.warning("Refusing reaction %r: not an allowed reaction emoji", emoji)
@@ -1083,8 +1025,8 @@ async def set_message_reaction(
 async def set_webhook(
     token: str,
     url: str,
-    allowed_updates: Sequence[str] | None = None,
     *,
+    allowed_updates: Sequence[str] | None = None,
     secret_token: str | None = None,
     drop_pending_updates: bool = False,
     max_connections: int | None = None,

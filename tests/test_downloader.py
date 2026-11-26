@@ -21,7 +21,6 @@ import sys
 import textwrap
 import threading
 import time
-import warnings
 
 import pytest
 
@@ -1776,72 +1775,4 @@ def test_download_rejects_unknown_keywords(tmp_path):
             downloader.download(
                 _fake_media_info(tmp_path, 1), str(tmp_path), max_bytes=1
             )
-        )
-
-
-def test_legacy_download_url_api(real_ytdlp, media_server, tmp_path):
-    root, base = media_server
-    (root / "clip.mp4").write_bytes(os.urandom(5_000))
-    real_ytdlp(
-        _raw_video(
-            [
-                _http_format(
-                    base,
-                    root,
-                    "clip.mp4",
-                    "http",
-                    ext="mp4",
-                    vcodec="h264",
-                    acodec="aac",
-                    width=640,
-                    height=360,
-                )
-            ]
-        )
-    )
-    with warnings.catch_warnings(record=True) as caught:
-        warnings.simplefilter("always")
-        path, meta = run(
-            downloader.download(
-                "https://example.invalid/vid1", str(tmp_path / "w"), max_bytes=50 * MIB
-            )
-        )
-    assert any(issubclass(w.category, DeprecationWarning) for w in caught)
-    assert os.path.basename(path) == "item-01.mp4"
-    assert meta["original_size"] == meta["final_size"] == 5_000
-    assert meta["compressed"] is False
-    assert set(meta) >= {
-        "has_video",
-        "has_audio",
-        "video_codec",
-        "audio_codec",
-        "video_width",
-    }
-
-
-def test_legacy_ytdlp_direct_url(fake_ytdlp, monkeypatch, tmp_path):
-    from src import ytdlp
-
-    monkeypatch.setattr(config, "TMP_DIR", str(tmp_path / "tmp"), raising=False)
-    fake_ytdlp.respond(stdout=dump_single_json(site_tiktok(30)))
-    with pytest.warns(DeprecationWarning):
-        direct, meta = run(
-            ytdlp.extract_direct_url_and_meta("https://www.tiktok.com/@u/video/1")
-        )
-    assert direct == "https://cdn.invalid/h264_1080p"
-    assert meta["video_width"] == 1080 and meta["final_size"] == int(
-        3000 * 1000 / 8 * 30
-    )
-    assert os.listdir(tmp_path / "tmp") == []  # temporary workdir removed
-    fake_ytdlp.respond(stdout=dump_single_json(site_youtube(30)))
-    with pytest.warns(DeprecationWarning):
-        assert run(ytdlp.extract_direct_url_and_meta("https://youtu.be/x")) == (
-            None,
-            None,
-        )
-    fake_ytdlp.respond(stdout="", stderr="ERROR: [youtube] x: Video unavailable", rc=1)
-    with pytest.warns(DeprecationWarning):
-        assert run(ytdlp.extract_direct_url_and_meta("https://youtu.be/x")) == (
-            None,
-            None,
         )

@@ -500,72 +500,6 @@ def test_send_video_url_with_local_thumbnail_is_multipart(session, media):
     assert fields["thumbnail"] == "attach://thumbnail_file"
 
 
-def test_send_video_legacy_meta_and_rotation(session, media):
-    fake = session(ok())
-    meta = {
-        "duration": "9.4",
-        "video_width": 1920,
-        "video_height": 1080,
-        "video_rotation": -90,
-        "format": "mov,mp4,m4a,3gp,3g2,mj2",
-    }
-    run(
-        telegram_api.send_video(
-            TOKEN,
-            1,
-            media["video.mp4"],
-            reply_to_message_id=3,
-            thumbnail_path=media["thumb.jpg"],
-            meta=meta,
-        )
-    )
-    fields = form_fields(fake.calls[0]["data"])
-    assert (fields["width"], fields["height"], fields["duration"]) == (
-        "1080",
-        "1920",
-        "9",
-    )
-    assert "thumbnail_file" in fields
-
-
-def test_send_video_legacy_meta_rotation_key_fallback(session, media):
-    fake = session(ok())
-    meta = {
-        "video_width": 1280,
-        "video_height": 720,
-        "video_rotation": None,
-        "rotation": 270,
-        "format": {"duration": "61.5"},
-    }
-    run(telegram_api.send_video(TOKEN, 1, media["video.mp4"], meta=meta))
-    fields = form_fields(fake.calls[0]["data"])
-    assert (fields["width"], fields["height"], fields["duration"]) == (
-        "720",
-        "1280",
-        "62",
-    )
-
-
-def test_send_video_legacy_meta_sample_aspect_ratio(session, media):
-    fake = session(ok())
-    meta = {
-        "video_width": 720,
-        "video_height": 576,
-        "video_sample_aspect_ratio": "16:11",
-    }
-    run(telegram_api.send_video(TOKEN, 1, media["video.mp4"], meta=meta))
-    fields = form_fields(fake.calls[0]["data"])
-    assert (fields["width"], fields["height"]) == ("1047", "576")
-
-
-def test_send_video_display_dimensions_and_explicit_values_win(session, media):
-    fake = session(ok())
-    meta = {"display_width": 1080, "display_height": 1920, "video_rotation": 90}
-    run(telegram_api.send_video(TOKEN, 1, media["video.mp4"], meta=meta, height=1000))
-    fields = form_fields(fake.calls[0]["data"])
-    assert (fields["width"], fields["height"]) == ("1080", "1000")
-
-
 def test_send_video_missing_file_makes_no_request(session):
     fake = session(ok())
     result = run(telegram_api.send_video(TOKEN, 1, "/nonexistent/video.mp4"))
@@ -598,7 +532,7 @@ def test_send_audio(session, media):
 def test_send_photo_and_document(session, media):
     fake = session(ok())
     run(telegram_api.send_photo(TOKEN, 1, media["photo.png"], caption="c"))
-    run(telegram_api.send_document(TOKEN, 1, media["file.txt"], thumbnail_path=None))
+    run(telegram_api.send_document(TOKEN, 1, media["file.txt"], thumbnail=None))
     run(telegram_api.send_photo(TOKEN, 1, "https://cdn.example.com/p.jpg"))
     assert fake.methods == ["sendPhoto", "sendDocument", "sendPhoto"]
     assert form_fields(fake.calls[0]["data"])["photo"][:2] == ("photo.png", "image/png")
@@ -613,20 +547,17 @@ def test_caption_is_truncated(session, media):
 
 
 @pytest.mark.parametrize(
-    ("name", "meta", "method"),
+    ("name", "method"),
     [
-        ("video.mp4", None, "sendVideo"),
-        ("song.mp3", None, "sendAudio"),
-        ("photo.png", None, "sendPhoto"),
-        ("file.txt", None, "sendDocument"),
-        ("video.mp4", {"has_video": False, "has_audio": True}, "sendAudio"),
-        ("video.mp4", {"has_video": False, "has_audio": False}, "sendDocument"),
-        ("file.txt", {"has_video": True, "format": "mov,mp4,m4a"}, "sendVideo"),
+        ("video.mp4", "sendVideo"),
+        ("song.mp3", "sendAudio"),
+        ("photo.png", "sendPhoto"),
+        ("file.txt", "sendDocument"),
     ],
 )
-def test_send_media_dispatch(session, media, name, meta, method):
+def test_send_media_dispatch(session, media, name, method):
     fake = session(ok())
-    assert run(telegram_api.send_media(TOKEN, 1, media[name], meta=meta))["ok"] is True
+    assert run(telegram_api.send_media(TOKEN, 1, media[name]))["ok"] is True
     assert fake.methods == [method]
 
 
@@ -785,8 +716,7 @@ def test_invalid_reaction_emoji_makes_no_request(session):
 def test_remove_reaction(session):
     fake = session(ok(True))
     run(telegram_api.set_message_reaction(TOKEN, 1, 5, None))
-    run(telegram_api.set_message_reaction(TOKEN, 1, 5, EYES, remove=True))
-    assert [call["json"]["reaction"] for call in fake.calls] == [[], []]
+    assert [call["json"]["reaction"] for call in fake.calls] == [[]]
 
 
 def test_reaction_invalid_disables_that_emoji_in_that_chat(session, monkeypatch):
@@ -862,9 +792,13 @@ def test_set_webhook_payload(session):
     }
 
 
-def test_set_webhook_legacy_call_and_delete_webhook(session):
+def test_set_webhook_minimal_call_and_delete_webhook(session):
     fake = session(ok(True))
-    run(telegram_api.set_webhook(TOKEN, "https://bot.example.com/w", ["message"]))
+    run(
+        telegram_api.set_webhook(
+            TOKEN, "https://bot.example.com/w", allowed_updates=["message"]
+        )
+    )
     run(telegram_api.delete_webhook(TOKEN))
     run(telegram_api.delete_webhook(TOKEN, drop_pending_updates=True))
     run(telegram_api.get_webhook_info(TOKEN))

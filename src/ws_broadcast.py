@@ -304,14 +304,3 @@ def _log_task_end(task: asyncio.Task[None]) -> None:
     error = task.exception()
     if error is not None:
         logger.error("The event tailer stopped", exc_info=error)
-
-
-def publish_sync(message: dict[str, Any]) -> None:
-    """Deprecated no-op kept for old callers (the previous worker).
-
-    In-process broadcasts are gone: every change is written to the DB event
-    log, which the GUI tails. Publishing directly would deliver events twice.
-    """
-    logger.debug(
-        "ws_broadcast.publish_sync() is deprecated; ignored %r", message.get("type")
-    )

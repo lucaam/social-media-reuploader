@@ -90,6 +90,17 @@ def processing(chat_id=1, url="https://example.com/v/p", **kwargs):
     return request_id
 
 
+def processed_message_ids(chat_id):
+    """Message ids of the chat in the legacy processed_messages table."""
+    with db.connect() as conn:
+        rows = conn.execute(
+            "SELECT message_id FROM processed_messages WHERE chat_id = ?"
+            " ORDER BY message_id",
+            (chat_id,),
+        ).fetchall()
+    return [row["message_id"] for row in rows]
+
+
 # ---------------------------------------------------------------------------
 # time
 # ---------------------------------------------------------------------------
@@ -189,8 +200,6 @@ def test_no_connection_leaks_even_on_errors(db_file):
             conn.execute("SELECT * FROM no_such_table")
         with pytest.raises(RuntimeError), db.write():
             raise RuntimeError("rollback")
-    legacy = db._connect()
-    legacy.close()
     assert open_db_fds() == []
 
 
@@ -208,7 +217,7 @@ def test_unopenable_database_raises_instead_of_falling_back(tmp_path, monkeypatc
         with pytest.raises(sqlite3.OperationalError):
             db.create_request(1, "https://example.com/x")
         with pytest.raises(sqlite3.OperationalError):
-            db._connect()
+            db.list_requests()
         assert db._memory_conn is None  # no silent in-memory database
     finally:
         locked_dir.chmod(0o755)
@@ -220,7 +229,7 @@ def test_write_commits_or_rolls_back(db_file):
     with pytest.raises(RuntimeError), db.write() as conn:
         conn.execute("INSERT INTO updates (raw, created_at) VALUES ('b', ?)", (ago(0),))
         raise RuntimeError("abort")
-    assert [row["raw"] for row in db.list_updates()] == ["a"]
+    assert [item["raw"] for item in events()] == ["a"]
 
 
 def test_write_takes_the_write_lock_at_begin(db_file):
@@ -242,7 +251,7 @@ def test_transaction_helper_on_an_explicit_connection(db_file):
                 "INSERT INTO updates (raw, created_at) VALUES ('t', ?)", (ago(0),)
             )
         assert not conn.in_transaction
-    assert db.count_updates() == 1
+    assert len(events()) == 1
 
 
 def test_memory_database_is_shared_and_lock_protected(monkeypatch):
@@ -263,10 +272,9 @@ def test_memory_database_is_shared_and_lock_protected(monkeypatch):
         for thread in threads:
             thread.join()
         assert db.count_requests() == 101
-        legacy = db._connect()
-        assert legacy.execute("SELECT COUNT(*) FROM requests").fetchone()[0] == 101
-        legacy.close()  # no-op on the shared connection
-        assert db.count_requests() == 101
+        with db.connect() as conn:
+            assert conn.execute("SELECT COUNT(*) FROM requests").fetchone()[0] == 101
+        assert db.count_requests() == 101  # leaving connect() keeps the shared db
         with pytest.raises(RuntimeError), db.write() as conn:
             conn.execute("DELETE FROM requests")
             raise RuntimeError("rollback")
@@ -509,7 +517,7 @@ def test_migrates_a_database_created_by_the_old_code(tmp_path, monkeypatch):
     assert users["ops"]["role"] == "admin"
     assert users["anon"]["role"] == "user"
     assert db.get_user_by_email("LUCA@example.com")["username"] == "luca2"
-    assert db.get_user_by_email("ops@EXAMPLE.com")[3] == "admin"  # legacy u[3]
+    assert db.get_user_by_email("ops@EXAMPLE.com")["role"] == "admin"
 
     # the new API works on the migrated data
     claimed = db.claim_next_request()
@@ -547,12 +555,16 @@ def test_migrates_the_oldest_schema_with_duplicate_processed_messages(
         assert (
             check.execute("SELECT COUNT(*) FROM processed_messages").fetchone()[0] == 2
         )
+        with pytest.raises(sqlite3.IntegrityError):  # the unique index now exists
+            check.execute(
+                "INSERT INTO processed_messages (chat_id, message_id, created_at)"
+                " VALUES (1, 1, '2025-01-02T00:00:00')"
+            )
         names = {row[1] for row in check.execute("PRAGMA table_info(request_events)")}
         assert {"event_type", "details", "duration_seconds", "created_at"} <= names
     finally:
         check.close()
-    assert db.mark_message_processed(1, 1) is False
-    assert db.mark_message_processed(1, 3) is True
+    assert processed_message_ids(1) == [1, 2]
     assert db.get_request(1)["created_at"] == "2025-01-01T00:00:00.000000+00:00"
 
 
@@ -772,7 +784,9 @@ def test_find_request_for_message(db_file):
     assert found["id"] == first and found["status"] == "done"
     assert db.find_request_for_message(1, 11, "https://a.b/1") is None
     assert db.find_request_for_message(1, None, "https://a.b/1") is None
-    legacy = db.add_request(1, "https://a.b/legacy", original_message_id=12)
+    # legacy rows have no normalized_url: they match by url
+    legacy = db.create_request(1, "https://a.b/legacy", original_message_id=12)
+    assert db.get_request(legacy)["normalized_url"] is None
     assert db.find_request_for_message(1, 12, "https://a.b/legacy")["id"] == legacy
 
 
@@ -807,7 +821,7 @@ def test_find_recent_duplicate_window_and_latest_row(db_file):
     assert db.find_recent_duplicate(5, "https://a.b/w", ago(9000))["id"] == new
     since_naive = (datetime.now(UTC) - timedelta(hours=3)).replace(tzinfo=None)
     assert db.find_recent_duplicate(5, "https://a.b/w", since_naive.isoformat())
-    legacy = db.add_request(5, "https://a.b/legacy", status="queued")
+    legacy = db.create_request(5, "https://a.b/legacy")  # no normalized_url
     assert db.find_recent_duplicate(5, "https://a.b/legacy", ago(60))["id"] == legacy
 
 
@@ -1003,6 +1017,16 @@ def test_cancel_queued_is_one_quick_transaction_with_events(db_file):
     assert db.cancel_queued() == []
 
 
+def test_cancelled_rows_are_never_sent(db_file):
+    """F50: a cancelled row can be neither claimed nor claimed for sending."""
+    request_id = make(url="https://a.b/c")
+    assert db.cancel_queued() == [request_id]
+    assert db.claim_next_request() is None
+    assert db.claim_request(request_id) is None
+    assert db.mark_sending(request_id) is False
+    assert status_of(request_id) == "cancelled"
+
+
 def test_requeue_requests_from_every_requeueable_status(db_file):
     ids = {}
     for status in db.REQUEUEABLE_STATUSES:
@@ -1144,7 +1168,7 @@ def test_queue_snapshot(db_file):
 # ---------------------------------------------------------------------------
 # request events and the event log
 # ---------------------------------------------------------------------------
-def test_request_events_newest_first_with_legacy_positions(db_file):
+def test_request_events_newest_first(db_file):
     request_id = make()
     for index in range(5):
         db.add_request_event(request_id, f"step{index}", details=f"d{index}")
@@ -1153,8 +1177,7 @@ def test_request_events_newest_first_with_legacy_positions(db_file):
     assert [item["event_type"] for item in items] == ["json", "step4", "step3"]
     assert items[0]["details"] == '{"a":1}' and items[0]["duration_seconds"] == 1.5
     assert isinstance(items[0], dict)
-    assert items[0][0] == items[0]["id"] and items[0][1] == "json"  # legacy ev[i]
-    assert items[0][4] == items[0]["created_at"]
+    assert ISO_RE.match(items[0]["created_at"])
     assert [i["event_type"] for i in db.get_request_events(request_id, 2, 4)] == [
         "step1",
         "step0",
@@ -1216,18 +1239,27 @@ def test_transition_events_carry_the_request_id(db_file):
     assert event["status"] == "sending" and event["previous"] == "processing"
 
 
-def test_legacy_update_helpers(db_file):
-    first = db.add_update("not json at all")
-    second = db.add_update({"type": "db_cleared"})
-    rows = db.list_updates(limit=10)
-    assert [row[0] for row in rows] == [second, first]  # legacy r[0]
-    assert rows[1][1] == "not json at all" and rows[1]["raw"] == "not json at all"
-    assert ISO_RE.match(rows[1][2])
-    assert db.count_updates() == 2
+def test_legacy_event_log_rows_are_decoded(db_file):
+    legacy_rows = [
+        "not json at all",
+        '{"update_id": 5, "message": {"text": "hi"}}',  # raw Telegram update
+        '{"type": "db_cleared"}',
+    ]
+    with db.write() as conn:
+        conn.executemany(
+            "INSERT INTO updates (raw, created_at) VALUES (?, ?)",
+            [(raw, db.now_iso()) for raw in legacy_rows],
+        )
     decoded = db.list_events_after(0)
-    assert decoded[0]["type"] == "update_created"
-    assert decoded[0]["raw"] == "not json at all"
-    assert decoded[1]["type"] == "db_cleared"
+    assert [item["type"] for item in decoded] == [
+        "update_created",
+        "update_created",
+        "db_cleared",
+    ]
+    assert [item["raw"] for item in decoded[:2]] == legacy_rows[:2]
+    assert "raw" not in decoded[2]
+    assert all(ISO_RE.match(item["created_at"]) for item in decoded)
+    assert db.latest_event_id() == decoded[-1]["id"]
 
 
 # ---------------------------------------------------------------------------
@@ -1342,12 +1374,12 @@ def test_users_unique_casefolded_email_and_validated_roles(db_file):
     nobody2 = db.add_user(username="svc2", email="   ")  # no email twice is fine
     user = db.get_user_by_email("LUCA@example.com")
     assert user["id"] == admin and user["email"] == "Luca@Example.COM"
-    assert user[3] == "admin" and user["role"] == "admin"  # legacy u[3] works
+    assert user["role"] == "admin"
     assert isinstance(user, dict) and "email_norm" not in user
     assert db.get_user_by_email("nobody@example.com") is None
     assert db.get_user_by_email(None) is None and db.get_user_by_email("") is None
     assert [u["id"] for u in db.list_users()] == [nobody2, nobody1, admin]
-    assert db.list_users(1, 1)[0][0] == nobody1
+    assert db.list_users(1, 1)[0]["id"] == nobody1
 
     assert db.set_user_role(admin, "user") is True
     assert db.get_user_by_email("luca@example.com")["role"] == "user"
@@ -1403,7 +1435,7 @@ def test_prune_respects_retention_and_active_rows(db_file):
     remaining = db.list_events_after(0)
     assert remaining[0]["id"] == fresh_event  # older event rows are gone
     assert remaining[-1]["type"] == "history_pruned"
-    assert db.is_message_processed(1, 2) and not db.is_message_processed(1, 1)
+    assert processed_message_ids(1) == [2]  # only the recent legacy row is kept
 
     assert db.prune(updates_days=0, requests_days=0)["requests"] == 0
     assert db.get_request(in_window) is not None
@@ -1440,11 +1472,16 @@ def test_clear_history_keeps_active_state(db_file):
     db.mark_done(done)
     db.add_request_event(done, "compress")
     refused = db.create_request(2, "https://a.b/r", status="duplicate")
-    legacy = db.add_request(3, "https://a.b/l", status="pending")
+    legacy = db.create_request(3, "https://a.b/l", status="pending")  # legacy status
     db.add_user(email="admin@example.com", role="admin")
     db.set_chat_blocked_until(1, ago(-60))
     db.set_worker_status({"pid": 1})
-    db.mark_message_processed(1, 1)
+    with db.write() as conn:
+        conn.execute(
+            "INSERT INTO processed_messages (chat_id, message_id, created_at)"
+            " VALUES (1, 1, ?)",
+            (ago(0),),
+        )
     last_id = db.latest_event_id()
 
     counts = db.clear_history(actor="admin")
@@ -1461,146 +1498,10 @@ def test_clear_history_keeps_active_state(db_file):
     assert db.get_user_by_email("admin@example.com")["role"] == "admin"
     assert db.get_chat_limit(1)["blocked_until"] is not None
     assert db.get_worker_status()["pid"] == 1
-    assert db.is_message_processed(1, 1)
+    assert processed_message_ids(1) == [1]
     # in-flight work can still finish normally
     assert db.mark_sending(running) and db.mark_done(running)
-    assert db.add_request(2, "https://a.b/new", status="queued") > legacy
-
-
-# ---------------------------------------------------------------------------
-# deprecated wrappers used by the current gui.py / worker.py / bot.py
-# ---------------------------------------------------------------------------
-def test_legacy_add_request_dedupes_by_message_and_url(db_file):
-    first = db.add_request(1, "https://a.b/x", status="queued", original_message_id=5)
-    force(first, status="done")
-    again = db.add_request(1, "https://a.b/x", status="pending", original_message_id=5)
-    assert again == first and status_of(first) == "done"
-    assert db.add_request(1, "https://a.b/y", original_message_id=5) != first
-    assert db.add_request(1, "https://a.b/x", original_message_id=6) != first
-    no_message = db.add_request(1, "https://a.b/x")
-    assert db.add_request(1, "https://a.b/x") != no_message
-    assert status_of(no_message) == "pending"
-    with pytest.raises(ValueError):
-        db.add_request(1, "https://a.b/z", status="nonsense")
-
-
-def test_legacy_flow_never_resends_a_delivered_request(db_file):
-    """F45: re-processing a delivered message cannot reach the send step."""
-    request_id = db.add_request(
-        1, "https://a.b/v", status="queued", original_message_id=9
-    )
-    assert db.mark_request_started(request_id) is True
-    assert db.claim_request_for_sending(request_id) is True
-    assert db.mark_request_finished(request_id, final_size=10, compressed=False)
-    assert db.update_request_status(request_id, "done") is True
-    # a second pass (rehydrate copy, edited message, second pod)
-    again = db.add_request(1, "https://a.b/v", status="pending", original_message_id=9)
-    assert again == request_id
-    assert db.mark_request_started(again) is False
-    assert db.claim_request_for_sending(again) is False
-    assert db.update_request_status(again, "queued") is False  # F46 overwrite
-    assert status_of(request_id) == "done"
-    row = db.get_request(request_id)
-    assert row["final_size"] == 10 and row["compressed"] == 0
-    assert row["processing_duration_seconds"] is not None
-
-
-def test_legacy_cancelled_rows_are_never_sent(db_file):
-    """F50: a cancelled row can be neither started nor claimed for sending."""
-    request_id = db.add_request(1, "https://a.b/c", status="queued")
-    assert db.cancel_queued() == [request_id]
-    assert db.mark_request_started(request_id) is False
-    assert db.claim_request_for_processing(request_id) is False
-    assert db.claim_request_for_sending(request_id) is False
-    assert status_of(request_id) == "cancelled"
-
-
-def test_legacy_update_request_status_transition_table(db_file):
-    request_id = db.add_request(1, "https://a.b/s", status="queued")
-    assert db.update_request_status(request_id, "rate_limited") is True
-    assert db.update_request_status(request_id, "unlimited") is True
-    assert db.update_request_status(request_id, "queued") is True
-    assert db.update_request_status(request_id, "queued") is True  # no-op
-    assert status_changes(request_id) == [
-        ("queued", "rate_limited"),
-        ("rate_limited", "unlimited"),
-        ("unlimited", "queued"),
-    ]
-    assert db.update_request_status(request_id, "sending") is False
-    assert db.update_request_status(request_id, "done") is False
-    assert db.update_request_status(request_id, "aborted") is True
-    assert db.update_request_status(424242, "failed") is False
-    with pytest.raises(ValueError):
-        db.update_request_status(request_id, "finished")
-
-
-def test_legacy_claims_raise_on_lock_instead_of_returning_false(db_file, fast_busy):
-    """F47: a DB error is never mistaken for 'already sent'."""
-    request_id = db.add_request(1, "https://a.b/l", status="queued")
-    db.mark_request_started(request_id)
-    holder = raw_conn(db_file)
-    holder.execute("BEGIN IMMEDIATE")
-    try:
-        with pytest.raises(sqlite3.OperationalError, match="locked"):
-            db.claim_request_for_sending(request_id)
-        with pytest.raises(sqlite3.OperationalError, match="locked"):
-            db.add_request(1, "https://a.b/other")
-        # reads keep working while another process writes (WAL)
-        assert db.find_recent_request_by_chat_url(1, "https://a.b/l")[1] == "processing"
-    finally:
-        holder.execute("ROLLBACK")
-        holder.close()
-    assert status_of(request_id) == "processing"
-    assert db.claim_request_for_sending(request_id) is True
-
-
-def test_legacy_find_recent_request_by_chat_url(db_file):
-    old = db.add_request(1, "https://a.b/u", status="done")
-    force(old, created_at=ago(7200))
-    assert db.find_recent_request_by_chat_url(1, "https://a.b/u", 3600) is None
-    recent = db.find_recent_request_by_chat_url(1, "https://a.b/u")
-    assert recent[0] == old and recent[1] == "done" and len(recent) == 3
-    assert recent["status"] == "done"
-    marker = db.add_request(1, "https://a.b/u", status="rate_limited")
-    assert db.find_recent_request_by_chat_url(1, "https://a.b/u", 3600)[0] == marker
-
-
-def test_legacy_processed_messages(db_file):
-    assert db.is_message_processed(1, 2) is False
-    assert db.mark_message_processed(1, 2) is True
-    assert db.mark_message_processed(1, 2) is False
-    assert db.is_message_processed(1, 2) is True
-
-
-def test_legacy_set_request_original_size(db_file):
-    request_id = db.add_request(1, "https://a.b/o", status="queued")
-    db.set_request_original_size(request_id, 777)
-    assert db.get_request(request_id)["original_size"] == 777
-
-
-def test_legacy_connect_does_not_hold_the_write_lock(db_file, fast_busy):
-    """F49: the old clear-queue loop (raw UPDATE + db.add_request_event) used
-    to lock itself out for busy_timeout seconds per row and lose its events."""
-    ids = [db.add_request(1, f"https://a.b/{i}", status="queued") for i in range(5)]
-    conn = db._connect()
-    started = time.monotonic()
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT id FROM requests WHERE status = 'queued'")
-        rows = cur.fetchall()
-        assert isinstance(rows[0], tuple)
-        for (request_id,) in rows:
-            cur.execute(
-                "UPDATE requests SET status = ? WHERE id = ?", ("cancelled", request_id)
-            )
-            db.add_request_event(request_id, "cancelled", details="by admin")
-        conn.commit()
-    finally:
-        conn.close()
-    assert time.monotonic() - started < 1.0
-    for request_id in ids:
-        assert status_of(request_id) == "cancelled"
-        assert history(request_id) == ["cancelled"]
+    assert db.create_request(2, "https://a.b/new") > legacy
 
 
 # ---------------------------------------------------------------------------
@@ -1608,7 +1509,7 @@ def test_legacy_connect_does_not_hold_the_write_lock(db_file, fast_busy):
 # ---------------------------------------------------------------------------
 def test_a_failing_event_insert_rolls_the_transition_back(db_file):
     request_id = processing()
-    before_events = db.count_updates()
+    before_events = len(events())
     with db.write() as conn:
         conn.execute(
             "CREATE TRIGGER broken_log BEFORE INSERT ON updates"
@@ -1622,7 +1523,7 @@ def test_a_failing_event_insert_rolls_the_transition_back(db_file):
         db.cancel_queued()
     assert status_of(request_id) == "processing"
     assert db.count_requests() == 1
-    assert db.count_updates() == before_events
+    assert len(events()) == before_events
     with db.write() as conn:
         conn.execute("DROP TRIGGER broken_log")
     assert db.mark_sending(request_id) is True
@@ -1675,6 +1576,26 @@ def test_writers_wait_for_the_busy_timeout_then_raise(db_file, fast_busy):
     assert db.mark_failed(request_id, error_code="x") is True
 
 
+def test_sending_claim_raises_on_lock_instead_of_returning_false(db_file, fast_busy):
+    """F47: a DB error is never mistaken for 'already sent'."""
+    request_id = processing(1, "https://a.b/l")
+    holder = raw_conn(db_file)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            db.mark_sending(request_id)
+        with pytest.raises(sqlite3.OperationalError, match="locked"):
+            db.create_request(1, "https://a.b/other")
+        # reads keep working while another process writes (WAL)
+        found = db.find_recent_duplicate(1, "https://a.b/l", ago(60))
+        assert found["status"] == "processing"
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+    assert status_of(request_id) == "processing"
+    assert db.mark_sending(request_id) is True
+
+
 def test_waiting_writer_succeeds_when_the_lock_is_released(db_file):
     holder = raw_conn(db_file)
     holder.execute("BEGIN IMMEDIATE")
@@ -1699,13 +1620,15 @@ def test_waiting_writer_succeeds_when_the_lock_is_released(db_file):
     assert released.is_set()
     assert time.monotonic() - started >= 0.4
     assert db.get_request(request_id) is not None
-    assert [row["raw"] for row in db.list_updates()][-1] == "held"
+    assert events()[0]["raw"] == "held"  # committed before the waiting writer
 
 
-def test_compat_rows_are_plain_dicts(db_file):
+def test_rows_are_plain_dicts(db_file):
     db.add_user(username="u", email="u@example.com")
+    request_id = make()
+    db.add_request_event(request_id, "step")
     user = db.get_user_by_email("u@example.com")
-    assert dict(user) == {
+    assert user == {
         "id": user["id"],
         "username": "u",
         "email": "u@example.com",
@@ -1713,7 +1636,17 @@ def test_compat_rows_are_plain_dicts(db_file):
         "created_at": user["created_at"],
     }
     assert list(user) == ["id", "username", "email", "role", "created_at"]
-    assert json.loads(json.dumps(user))["email"] == "u@example.com"
-    assert user[-1] == user["created_at"]
+    rows = [
+        user,
+        *db.list_users(),
+        db.get_request(request_id),
+        *db.get_request_events(request_id),
+        *db.get_request_events_bulk([request_id])[request_id],
+        *db.list_requests(),
+    ]
+    assert all(type(row) is dict for row in rows)
+    assert json.loads(json.dumps(rows))[0]["email"] == "u@example.com"
+    with pytest.raises(KeyError):
+        user[0]  # no positional access: rows are keyed by column name
     with pytest.raises(KeyError):
         user["missing"]

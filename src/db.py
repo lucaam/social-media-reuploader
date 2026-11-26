@@ -148,21 +148,6 @@ _NOTICE_COLUMNS = {
     "rate": "last_rate_notice_at",
     "duplicate": "last_duplicate_notice_at",
 }
-# Legacy update_request_status(): target status -> statuses it may come from.
-_LEGACY_TRANSITIONS: dict[str, frozenset[str]] = {
-    Status.QUEUED: frozenset(REQUEUEABLE_STATUSES),
-    Status.PROCESSING: frozenset({Status.QUEUED, Status.PENDING}),
-    Status.SENDING: frozenset({Status.PROCESSING}),
-    Status.DONE: frozenset({Status.PROCESSING, Status.SENDING}),
-    Status.FAILED: frozenset(
-        {Status.QUEUED, Status.PENDING, Status.PROCESSING, Status.SENDING}
-    ),
-    Status.RATE_LIMITED: frozenset({Status.QUEUED, Status.PENDING}),
-    Status.DUPLICATE: frozenset({Status.QUEUED, Status.PENDING}),
-    Status.UNLIMITED: frozenset({Status.RATE_LIMITED}),
-    Status.CANCELLED: frozenset({Status.QUEUED, Status.PENDING}),
-    Status.ABORTED: frozenset({Status.QUEUED, Status.PENDING}),
-}
 
 
 # ---------------------------------------------------------------------------
@@ -232,42 +217,6 @@ def _normalize_ts_value(value: Any) -> Any:
 # ---------------------------------------------------------------------------
 # Rows
 # ---------------------------------------------------------------------------
-class _CompatRow(dict):
-    """A plain ``dict`` row that also answers the legacy positional access.
-
-    Deprecated: ``row[0]`` exists only for code written against the old tuple
-    API (current gui.py / worker.py). New code must use the column names.
-    """
-
-    __slots__ = ()
-    _fields: tuple[str, ...] = ()
-
-    def __getitem__(self, key: Any) -> Any:
-        if isinstance(key, int):
-            key = self._fields[key]
-        return super().__getitem__(key)
-
-
-class _UserRow(_CompatRow):
-    __slots__ = ()
-    _fields = ("id", "username", "email", "role", "created_at")
-
-
-class _EventRow(_CompatRow):
-    __slots__ = ()
-    _fields = ("id", "event_type", "details", "duration_seconds", "created_at")
-
-
-class _UpdateRow(_CompatRow):
-    __slots__ = ()
-    _fields = ("id", "raw", "created_at")
-
-
-class _RecentRow(_CompatRow):
-    __slots__ = ()
-    _fields = ("id", "status", "created_at")
-
-
 def _dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     return None if row is None else dict(row)
 
@@ -385,7 +334,7 @@ def _ensure_wal(conn: sqlite3.Connection, path: str) -> None:
         logger.warning("Could not enable WAL for %s (journal_mode=%s)", path, mode)
 
 
-def _open_file(path: str, *, rows: bool = True) -> sqlite3.Connection:
+def _open_file(path: str) -> sqlite3.Connection:
     parent = os.path.dirname(path)
     if parent:
         os.makedirs(parent, exist_ok=True)
@@ -400,8 +349,6 @@ def _open_file(path: str, *, rows: bool = True) -> sqlite3.Connection:
     except BaseException:
         conn.close()
         raise
-    if not rows:
-        conn.row_factory = None
     return conn
 
 
@@ -487,34 +434,6 @@ def _read_snapshot(conn: sqlite3.Connection) -> Iterator[sqlite3.Connection]:
     finally:
         if conn.in_transaction:
             conn.execute("COMMIT")
-
-
-class _NoCloseConn:
-    """Proxy for the shared in-memory connection whose close() is a no-op."""
-
-    def __init__(self, conn: sqlite3.Connection) -> None:
-        self._conn = conn
-
-    def __getattr__(self, name: str) -> Any:
-        return getattr(self._conn, name)
-
-    def close(self) -> None:
-        return None
-
-
-def _connect() -> Any:
-    """Deprecated: raw connection for legacy callers (gui.py / worker.py).
-
-    Nothing new may use it; use :func:`connect` / :func:`write` instead. The
-    connection is in autocommit mode (each legacy statement commits on its
-    own, so a legacy loop never holds the write lock across other calls),
-    returns tuples and must be closed by the caller.
-    """
-    path = _db_path()
-    if path == MEMORY_PATH:
-        with _memory_lock:
-            return _NoCloseConn(_memory_connection())
-    return _open_file(path, rows=False)
 
 
 def init_db() -> None:
@@ -993,11 +912,7 @@ def _duration(before: Mapping[str, Any] | None, now: str) -> float | None:
 
 
 def _claim_row(
-    conn: sqlite3.Connection,
-    before: sqlite3.Row | None,
-    now: str,
-    *,
-    allowed_from: Collection[str] = (Status.QUEUED,),
+    conn: sqlite3.Connection, before: sqlite3.Row | None, now: str
 ) -> dict[str, Any] | None:
     if before is None:
         return None
@@ -1005,7 +920,7 @@ def _claim_row(
     claimed = _apply_transition(
         conn,
         before,
-        allowed_from=allowed_from,
+        allowed_from=(Status.QUEUED,),
         to_status=Status.PROCESSING,
         now=now,
         assignments={
@@ -1690,7 +1605,7 @@ def get_request_events(
                 ORDER BY id DESC LIMIT ? OFFSET ?""",
             (request_id, page, skip),
         ).fetchall()
-    return [_EventRow(row) for row in rows]
+    return _dicts(rows)
 
 
 def get_request_events_bulk(
@@ -1717,7 +1632,7 @@ def get_request_events_bulk(
                 (*chunk, per_request),
             ).fetchall()
             for row in rows:
-                result[int(row["request_id"])].append(_EventRow(row))
+                result[int(row["request_id"])].append(dict(row))
     return result
 
 
@@ -1782,32 +1697,6 @@ def latest_event_id() -> int:
         return int(
             conn.execute("SELECT COALESCE(MAX(id), 0) FROM updates").fetchone()[0]
         )
-
-
-def add_update(raw: str | Mapping[str, Any]) -> int:
-    """Deprecated: append a raw row to the event log (prefer :func:`add_event`)."""
-    text = raw if isinstance(raw, str) else _json(raw)
-    with write() as conn:
-        cur = conn.execute(
-            "INSERT INTO updates (raw, created_at) VALUES (?, ?)", (text, _utc_now())
-        )
-        return int(cur.lastrowid)
-
-
-def list_updates(limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
-    """Event-log rows ``{"id", "raw", "created_at"}``, newest first."""
-    page, skip = _page(limit, offset)
-    with connect() as conn:
-        rows = conn.execute(
-            "SELECT id, raw, created_at FROM updates ORDER BY id DESC LIMIT ? OFFSET ?",
-            (page, skip),
-        ).fetchall()
-    return [_UpdateRow(row) for row in rows]
-
-
-def count_updates() -> int:
-    with connect() as conn:
-        return int(conn.execute("SELECT COUNT(*) FROM updates").fetchone()[0])
 
 
 # ---------------------------------------------------------------------------
@@ -2018,7 +1907,7 @@ def get_user_by_email(email: str | None) -> dict[str, Any] | None:
         row = conn.execute(
             f"SELECT {_USER_COLUMNS} FROM users WHERE email_norm = ?", (email_norm,)
         ).fetchone()
-    return None if row is None else _UserRow(row)
+    return _dict(row)
 
 
 def list_users(limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
@@ -2028,7 +1917,7 @@ def list_users(limit: int = 100, offset: int = 0) -> list[dict[str, Any]]:
             f"SELECT {_USER_COLUMNS} FROM users ORDER BY id DESC LIMIT ? OFFSET ?",
             (page, skip),
         ).fetchall()
-    return [_UserRow(row) for row in rows]
+    return _dicts(rows)
 
 
 def set_user_role(user_id: int, role: str) -> bool:
@@ -2179,166 +2068,3 @@ def clear_history(*, actor: str | None = None) -> dict[str, int]:
         counts = {"requests": requests, "request_events": events, "updates": updates}
         _append_event(conn, EventType.HISTORY_CLEARED, {"actor": actor, **counts}, now)
     return counts
-
-
-# ---------------------------------------------------------------------------
-# Deprecated wrappers kept for the current gui.py / worker.py / bot.py
-# ---------------------------------------------------------------------------
-def add_request(
-    chat_id: int,
-    url: str,
-    status: str = Status.PENDING,
-    description: str | None = None,
-    original_message_id: int | None = None,
-) -> int:
-    """Deprecated (use :func:`create_request`).
-
-    Returns the existing request for the same (chat_id, original_message_id,
-    url) regardless of its status (legacy dedupe), else inserts a new one.
-    The check and the insert are one transaction.
-    """
-    now = _utc_now()
-    with write() as conn:
-        if original_message_id is not None:
-            row = conn.execute(
-                """SELECT id FROM requests
-                   WHERE chat_id = ? AND original_message_id = ? AND url = ?
-                   ORDER BY id LIMIT 1""",
-                (chat_id, original_message_id, url),
-            ).fetchone()
-            if row is not None:
-                return int(row["id"])
-        return _insert_request(
-            conn,
-            now=now,
-            chat_id=chat_id,
-            url=url,
-            status=status,
-            description=description,
-            original_message_id=original_message_id,
-        )
-
-
-def update_request_status(request_id: int, status: str) -> bool:
-    """Deprecated status setter, now guarded by an allowed-transition table.
-
-    Returns True when the status changed or already had that value; False
-    when the request is missing or the transition is not allowed (e.g. a
-    ``done`` request is never moved back to ``queued``).
-    """
-    target = _validate_status(status)
-    now = _utc_now()
-    with write() as conn:
-        before = _fetch_request(conn, request_id)
-        if before is None:
-            return False
-        if before["status"] == target:
-            return True
-        changed = _apply_transition(
-            conn,
-            before,
-            allowed_from=_LEGACY_TRANSITIONS.get(target, frozenset()),
-            to_status=target,
-            now=now,
-        )
-    if not changed:
-        logger.info(
-            "Refused legacy status change of request %s: %s -> %s",
-            request_id,
-            before["status"],
-            target,
-        )
-    return changed
-
-
-def mark_request_started(request_id: int) -> bool:
-    """Deprecated: ``queued``/``pending`` -> ``processing`` (never resets done)."""
-    now = _utc_now()
-    with write() as conn:
-        claimed = _claim_row(
-            conn,
-            _fetch_request(conn, request_id),
-            now,
-            allowed_from=(Status.QUEUED, Status.PENDING),
-        )
-    return claimed is not None
-
-
-def claim_request_for_processing(request_id: int) -> bool:
-    """Deprecated alias of :func:`mark_request_started`."""
-    return mark_request_started(request_id)
-
-
-def claim_request_for_sending(request_id: int) -> bool:
-    """Deprecated alias of :func:`mark_sending` (``processing`` -> ``sending``).
-
-    Database errors propagate (they used to be turned into False, which the
-    worker read as "already sent").
-    """
-    return mark_sending(request_id)
-
-
-def mark_request_finished(
-    request_id: int, final_size: int | None = None, compressed: bool | None = None
-) -> bool:
-    """Deprecated: record finish time/duration and sizes (status unchanged)."""
-    now = _utc_now()
-    with write() as conn:
-        before = _fetch_request(conn, request_id)
-        if before is None:
-            return False
-        return _update_fields(
-            conn,
-            request_id,
-            {
-                "processing_finished_at": now,
-                "processing_duration_seconds": _duration(before, now),
-                "final_size": final_size,
-                "compressed": _bool_int(compressed),
-            },
-            now,
-        )
-
-
-def set_request_original_size(request_id: int, original_size: int) -> None:
-    """Deprecated: ``set_request_fields(request_id, original_size=...)``."""
-    set_request_fields(request_id, original_size=original_size)
-
-
-def find_recent_request_by_chat_url(
-    chat_id: int, url: str, since_seconds: float = 0
-) -> dict[str, Any] | None:
-    """Deprecated: latest ``{"id", "status", "created_at"}`` for chat + raw url
-    (any status) created in the last ``since_seconds`` (0 = ever). Errors
-    propagate instead of disabling the dedupe."""
-    sql = "SELECT id, status, created_at FROM requests WHERE chat_id = ? AND url = ?"
-    params: list[Any] = [chat_id, url]
-    if since_seconds and since_seconds > 0:
-        sql += " AND created_at >= ?"
-        params.append(iso_from_ts(time.time() - float(since_seconds)))
-    with connect() as conn:
-        row = conn.execute(
-            sql + " ORDER BY created_at DESC, id DESC LIMIT 1", params
-        ).fetchone()
-    return None if row is None else _RecentRow(row)
-
-
-def is_message_processed(chat_id: int, message_id: int) -> bool:
-    """Deprecated (legacy processed_messages dedupe)."""
-    with connect() as conn:
-        row = conn.execute(
-            "SELECT 1 FROM processed_messages WHERE chat_id = ? AND message_id = ? LIMIT 1",
-            (chat_id, message_id),
-        ).fetchone()
-    return row is not None
-
-
-def mark_message_processed(chat_id: int, message_id: int) -> bool:
-    """Deprecated. One ``INSERT OR IGNORE``; True when the row is new."""
-    with write() as conn:
-        cur = conn.execute(
-            """INSERT OR IGNORE INTO processed_messages (chat_id, message_id, created_at)
-               VALUES (?, ?, ?)""",
-            (chat_id, message_id, _utc_now()),
-        )
-        return cur.rowcount > 0

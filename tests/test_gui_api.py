@@ -541,8 +541,14 @@ def test_aggregates(client):
 def test_event_log(client):
     first = db.create_request(1, "https://example.com/1")
     db.create_request(2, "https://example.com/2")
-    db.add_update("not json at all")
-    db.add_update('{"update_id": 5, "message": {"text": "hi"}}')
+    with db.write() as conn:  # rows written by the old code are not JSON events
+        conn.executemany(
+            "INSERT INTO updates (raw, created_at) VALUES (?, ?)",
+            [
+                ("not json at all", db.now_iso()),
+                ('{"update_id": 5, "message": {"text": "hi"}}', db.now_iso()),
+            ],
+        )
     db.add_event("custom_event", chat_id=1, note="x" * 5000)
     all_events = client.get("/api/events").json()
     assert all_events["total"] == 5

@@ -40,7 +40,6 @@ import signal
 import sys
 import time
 import uuid
-import warnings
 from collections.abc import AsyncIterator, Callable, Iterable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, ClassVar
@@ -1512,7 +1511,6 @@ async def download(
     *,
     items: Sequence[int] | None = None,
     timeout: float | None = None,  # noqa: ASYNC109, RUF100
-    **legacy: Any,
 ) -> list[DownloadedFile]:
     """Download the selected items of ``info`` from its saved info JSON.
 
@@ -1526,21 +1524,7 @@ async def download(
     nothing was produced. For multi-item posts, failed items are skipped
     (logged) as long as at least one file was produced; otherwise the first
     error is raised.
-
-    Calling ``download(url, dest_dir, ...)`` with a URL string is the
-    deprecated pre-refactor API and delegates to :func:`download_url`.
     """
-    if isinstance(info, str):
-        warnings.warn(
-            "download(url, dest_dir) is deprecated; use fetch_info() + download()",
-            DeprecationWarning,
-            stacklevel=2,
-        )
-        return await download_url(  # type: ignore[return-value]
-            info, workdir, timeout=timeout or 300, **legacy
-        )
-    if legacy:
-        raise TypeError(f"unexpected keyword arguments: {sorted(legacy)}")
     selected = _select_items(info, items)
     if not selected:
         raise NoMedia("no items to download")
@@ -1574,61 +1558,3 @@ async def download(
     if not files:
         raise errors[0] if errors else NoMedia("nothing was downloaded")
     return files
-
-
-# ---------------------------------------------------------------------------
-# Deprecated pre-refactor API
-# ---------------------------------------------------------------------------
-
-
-async def download_url(
-    url: str,
-    dest_dir: str,
-    timeout: float = 300,  # noqa: ASYNC109, RUF100
-    max_bytes: int | None = None,
-    notify: Any = None,
-    **_ignored: Any,
-) -> tuple[str, dict[str, Any]]:
-    """Deprecated tuple API: ``(path, meta)`` of the first item of ``url``.
-
-    Kept for callers that predate :func:`fetch_info`/:func:`download`.
-    ``max_bytes`` is accepted for compatibility only: the format selection
-    already targets ``TELEGRAM_MAX_FILE_SIZE`` and ``MAX_DOWNLOAD_BYTES`` is
-    the hard cap. ``meta`` has the historical keys (``has_video``,
-    ``video_codec``, ``video_width``, ...) computed with ffprobe.
-    """
-    from . import media  # local import: media depends on this module
-
-    del max_bytes, notify
-    info = await fetch_info(url, dest_dir, timeout=min(float(timeout), 120.0))
-    files = await download(info, dest_dir, items=[info.items[0].index], timeout=timeout)
-    downloaded = files[0]
-    probe = await media.probe(downloaded.path)
-    meta: dict[str, Any] = {
-        "compressed": False,
-        "original_size": downloaded.size,
-        "final_size": downloaded.size,
-        "has_video": downloaded.item.kind == "video",
-        "has_audio": None,
-        "duration": downloaded.item.duration,
-        "video_codec": None,
-        "audio_codec": None,
-        "format": None,
-        "video_width": downloaded.item.width,
-        "video_height": downloaded.item.height,
-        "video_rotation": None,
-        "ytdlp_only": True,
-    }
-    if probe is not None:
-        meta.update(
-            has_video=probe.has_video,
-            has_audio=probe.has_audio,
-            duration=probe.duration,
-            video_codec=probe.vcodec,
-            audio_codec=probe.acodec,
-            format=probe.format_name,
-            video_width=probe.display_width,
-            video_height=probe.display_height,
-            video_rotation=probe.rotation,
-        )
-    return downloaded.path, meta

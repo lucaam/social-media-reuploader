@@ -9,6 +9,7 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import json
+import logging
 import os
 import pathlib
 import shutil
@@ -564,6 +565,16 @@ def test_probe_real_files(gen):
     assert p.duration == pytest.approx(2.0, abs=0.2)
     assert p.size == os.path.getsize(webm)
     assert run(media.probe(webm + ".missing")) is None
+
+
+@needs_ffmpeg
+def test_probe_of_a_file_ffprobe_cannot_read_is_none(tmp_path, caplog):
+    # an MP4 header without the moov atom, like a truncated download
+    broken = tmp_path / "truncated.mp4"
+    broken.write_bytes(b"\0\0\0\x18ftypmp42\0\0\0\0mp42isom" + b"\0" * 2000)
+    with caplog.at_level(logging.WARNING, logger="src.media"):
+        assert run(media.probe(str(broken))) is None
+    assert any("ffprobe exited with" in r.getMessage() for r in caplog.records)
 
 
 @needs_ffmpeg

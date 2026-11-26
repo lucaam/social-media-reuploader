@@ -1662,23 +1662,6 @@ def test_stop_without_start_is_harmless(env):
     assert db.get_worker_status() is None
 
 
-def test_legacy_enqueue_starts_the_pool_and_submits(env, monkeypatch):
-    async def lookup(url, **kwargs):
-        return match(url)
-
-    monkeypatch.setattr(providers, "match_provider_async", lookup)
-
-    async def scenario():
-        pool = worker.WorkerPool(TOKEN)
-        assert pool.enqueue(42, URL, "desc", 7, "private") is True
-        await wait_until(lambda: db.count_requests(status="done") == 1)
-        await pool.shutdown()
-        return pool.enqueue(42, URL2)
-
-    assert run(scenario()) is False
-    assert env.tg.of("send_video")[0][3]["caption"] == "desc"
-
-
 def test_workers_default_comes_from_config(env, monkeypatch):
     monkeypatch.setattr(config, "WORKERS", 5)
     assert worker.WorkerPool(TOKEN).workers == 5
