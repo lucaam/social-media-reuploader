@@ -8,9 +8,12 @@ variable it reads must be:
 - a key of the `env` map of the Helm chart (charts/.../values.yaml), except
   the variables the chart sets itself or takes from Secrets.
 
-REQUESTS_DB (src/db.py) must be in README.md as well. Variables read directly
-with os.environ / os.getenv by other modules (e.g. the GUI credentials) are
-reported as warnings when README.md does not mention them.
+README.md must also document REQUESTS_DB (src/db.py) and the settings that
+other modules read from an environment mapping with the `_env` helpers: the
+GUI settings of src/gui_auth.py (`_env(env, "ADMIN_TOKEN")`,
+`_env_int(env, "SESSION_MAX_AGE_SECONDS", ...)`, ...). Other variables read
+directly with os.environ / os.getenv are reported as warnings when README.md
+does not mention them.
 
 Nothing is imported from src/: the sources are scanned as text.
 Exit status: 0 when everything is documented, 1 otherwise.
@@ -35,6 +38,9 @@ CONFIG_READ = re.compile(
 DIRECT_READ = re.compile(
     r"os\.(?:environ\.get|getenv)\(\s*\"([A-Z][A-Z0-9_]*)\"|os\.environ\[\s*\"([A-Z][A-Z0-9_]*)\"\s*\]"
 )
+# `_env(env, "NAME")`, `_env_bool(env, "NAME", ...)`, `_env_int(...)`: settings
+# read from a mapping (src/gui_auth.py), calls possibly split over lines.
+MAPPING_READ = re.compile(r"\b_env(?:_[a-z]+)?\(\s*\w+\s*,\s*\"([A-Z][A-Z0-9_]*)\"")
 
 # Not in the chart `env` map, on purpose.
 CHART_MANAGED = {
@@ -55,14 +61,22 @@ def config_settings(text: str) -> list[str]:
     return sorted(set(CONFIG_READ.findall(text)))
 
 
-def direct_reads(paths: list[Path]) -> dict[str, list[str]]:
+def _reads(paths: list[Path], pattern: re.Pattern[str]) -> dict[str, list[str]]:
     found: dict[str, list[str]] = {}
     for path in paths:
         text = path.read_text(encoding="utf-8")
-        for match in DIRECT_READ.finditer(text):
-            name = match.group(1) or match.group(2)
+        for match in pattern.finditer(text):
+            name = next(group for group in match.groups() if group)
             found.setdefault(name, []).append(str(path.relative_to(ROOT)))
     return found
+
+
+def direct_reads(paths: list[Path]) -> dict[str, list[str]]:
+    return _reads(paths, DIRECT_READ)
+
+
+def mapping_reads(paths: list[Path]) -> dict[str, list[str]]:
+    return _reads(paths, MAPPING_READ)
 
 
 def documented(readme: str, name: str) -> bool:
@@ -81,6 +95,7 @@ def main() -> int:
     env_keys = chart_env_keys(VALUES.read_text(encoding="utf-8"))
     others = [p for p in sorted((ROOT / "src").glob("*.py")) if p != CONFIG]
     direct = direct_reads(others)
+    mapped = mapping_reads(others)
 
     errors: list[str] = []
     for name in settings:
@@ -98,6 +113,11 @@ def main() -> int:
     for name in sorted(REQUIRED_DIRECT):
         if not documented(readme, name):
             errors.append(f"README.md does not document `{name}`")
+    for name, where in sorted(mapped.items()):
+        if name not in settings and not documented(readme, name):
+            errors.append(
+                f"README.md does not document `{name}` ({', '.join(sorted(set(where)))})"
+            )
 
     warnings = [
         f"`{name}` is read by {', '.join(sorted(set(where)))} but README.md "
@@ -114,7 +134,7 @@ def main() -> int:
         return 1
     print(
         f"OK: {len(settings)} settings of src/config.py documented in README.md "
-        "and in the Helm values"
+        f"and in the Helm values, {len(mapped)} GUI settings in README.md"
     )
     return 0
 

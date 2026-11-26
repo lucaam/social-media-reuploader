@@ -56,8 +56,10 @@ helm unittest charts/social-media-reuploader
 - Testi per gli utenti in italiano; log e codice in inglese. Il token del bot
   non va mai nei log.
 - Ogni nuova impostazione va in `src/config.py`, nella tabella del README e
-  nella mappa `env` di `charts/social-media-reuploader/values.yaml`:
-  `python scripts/check_docs.py` (eseguito in CI) lo verifica.
+  nella mappa `env` di `charts/social-media-reuploader/values.yaml`; le
+  impostazioni della GUI (lette in `src/gui_auth.py` con `_env`, `_env_bool`,
+  `_env_int`) vanno nella tabella del README. `python scripts/check_docs.py`
+  (eseguito in CI) lo verifica.
 
 ```bash
 pre-commit run --all-files
