@@ -337,6 +337,16 @@ def test_group_links_are_submitted_with_the_group_chat_type():
     assert pool.calls[0]["chat_type"] == "supergroup"
 
 
+def test_domain_rules_accept_the_short_domain_of_an_allowed_site(monkeypatch):
+    monkeypatch.setattr(config, "ALLOWED_PROVIDERS", ("youtube.com",))
+    pool = feed(text_update(YT, YT))
+    assert [c["provider"].key for c in pool.calls] == ["Youtube"]
+
+    monkeypatch.setattr(config, "ALLOWED_PROVIDERS", ())
+    monkeypatch.setattr(config, "BLOCKED_PROVIDERS", ("youtube.com",))
+    assert feed(text_update(YT, YT)).calls == []
+
+
 def test_max_links_per_message(monkeypatch):
     monkeypatch.setattr(config, "MAX_LINKS_PER_MESSAGE", 2, raising=False)
     urls = [YT, VIMEO, "https://vimeo.com/1084537"]

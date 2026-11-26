@@ -839,6 +839,76 @@ def test_allowed_providers_by_domain_suffix(monkeypatch):
     assert providers.match_provider(YT) is None
 
 
+@pytest.mark.parametrize(
+    ("rule", "urls"),
+    [
+        (
+            "youtube.com",
+            [
+                YT,
+                f"https://yewtu.be/watch?v={YT_ID}",  # Invidious mirror
+                f"https://www.youtube-nocookie.com/embed/{YT_ID}",
+                f"https://music.youtube.com/watch?v={YT_ID}",
+            ],
+        ),
+        ("www.youtube.com", [YT, f"https://m.youtube.com/watch?v={YT_ID}"]),
+        ("youtu.be", [f"https://www.youtube.com/watch?v={YT_ID}", YT]),
+        ("twitter.com", ["https://x.com/someuser/status/1234567890123456789"]),
+        (
+            "x.com",
+            [
+                "https://twitter.com/someuser/status/1234567890123456789",
+                "https://mobile.twitter.com/someuser/status/1234567890123456789",
+            ],
+        ),
+        ("dailymotion.com", ["https://dai.ly/x8abcde"]),
+        ("dai.ly", ["https://www.dailymotion.com/video/x8abcde"]),
+    ],
+)
+def test_domain_rules_cover_every_domain_of_the_site(monkeypatch, rule, urls):
+    vimeo = "https://vimeo.com/123456789"
+    monkeypatch.setattr(config, "BLOCKED_PROVIDERS", (rule,))
+    for url in urls:
+        assert providers.check_link(url).reason is Rejection.BLOCKED, url
+    assert providers.match_provider(vimeo) is not None
+
+    monkeypatch.setattr(config, "BLOCKED_PROVIDERS", ())
+    monkeypatch.setattr(config, "ALLOWED_PROVIDERS", (rule,))
+    for url in urls:
+        assert providers.match_provider(url) is not None, url
+    assert providers.check_link(vimeo).reason is Rejection.BLOCKED
+
+
+def test_subdomain_rules_only_cover_their_hosts(monkeypatch):
+    monkeypatch.setattr(
+        config, "BLOCKED_PROVIDERS", ("vm.tiktok.com", "music.youtube.com")
+    )
+    assert providers.check_link("https://vm.tiktok.com/ZMabcdef/").reason is (
+        Rejection.BLOCKED
+    )
+    music = f"https://music.youtube.com/watch?v={YT_ID}"
+    assert providers.check_link(music).reason is Rejection.BLOCKED
+    assert providers.match_provider(
+        "https://www.tiktok.com/@user/video/7234567890123456789"
+    )
+    assert providers.match_provider(YT)
+    # The list shown to users agrees: TikTok and YouTube links still work.
+    assert providers.supported_sites_text().startswith("YouTube, TikTok, ")
+
+
+def test_supported_sites_text_agrees_with_domain_rules(monkeypatch):
+    monkeypatch.setattr(config, "BLOCKED_PROVIDERS", ("youtu.be", "twitter.com"))
+    text = providers.supported_sites_text()
+    assert "YouTube" not in text and "X (Twitter)" not in text
+    assert providers.check_link(YT).reason is Rejection.BLOCKED
+
+    monkeypatch.setattr(config, "BLOCKED_PROVIDERS", ())
+    monkeypatch.setattr(config, "ALLOWED_PROVIDERS", ("youtube.com", "dai.ly"))
+    assert providers.supported_sites_text() == "YouTube e Dailymotion"
+    assert providers.match_provider(YT)
+    assert providers.match_provider("https://www.dailymotion.com/video/x8abcde")
+
+
 def test_allowed_providers_by_key_and_ie_name(monkeypatch):
     monkeypatch.setattr(config, "ALLOWED_PROVIDERS", ("TwitchClips", "vm.tiktok"))
     assert providers.match_provider("https://clips.twitch.tv/FunnyClipSlug-AbCdEf123")

@@ -941,6 +941,19 @@ _FAMILY_ALIASES: dict[str, tuple[str, ...]] = {
     "archiveorg": ("archive.org", "internetarchive"),
     "afreecatv": ("soop",),
 }
+# Short and alternative domains of a site that are not subdomains of its main
+# domain. Only domains serving that site's media: general-purpose shorteners
+# (t.co, fb.me, lnkd.in) point anywhere and name no site.
+_DOMAIN_FAMILIES: dict[str, str] = {
+    "youtu.be": "youtube",
+    "youtube-nocookie.com": "youtube",
+    "dai.ly": "dailymotion",
+    "redd.it": "reddit",
+    "fb.watch": "facebook",
+    "instagr.am": "instagram",
+    "pin.it": "pinterest",
+    "b23.tv": "bilibili",
+}
 
 
 def _config_list(name: str) -> tuple[str, ...]:
@@ -961,21 +974,59 @@ def _entry_tokens(entry: _Extractor) -> set[str]:
     }
 
 
-def _rule_matches(rule: str, tokens: set[str], host: str) -> bool:
+def _named_family(token: str, families: Iterable[str]) -> str | None:
+    if token in families:
+        return token
+    for family, aliases in _FAMILY_ALIASES.items():
+        if token in aliases:
+            return family
+    return None
+
+
+def _family_of_rule(rule: str, families: Iterable[str]) -> str | None:
+    """Site family that a rule names as a whole site, if any.
+
+    A name ("youtube", "x", "9gag"), the site's own domain ("youtube.com",
+    "twitter.com", also as "www.youtube.com" or "*.youtube.com") or one of
+    its short domains ("youtu.be", "dai.ly"). A subdomain rule
+    ("vm.tiktok.com", "music.youtube.com") names only the hosts under it:
+    ``None``. Shared by the link checks and :func:`supported_sites_text`, so
+    the sites listed to users are the ones the checks accept.
+    """
+    rule = rule.lstrip("*").lstrip(".")
+    if "." not in rule:
+        return _named_family(rule, families)
+    domain = rule.removeprefix("www.")
+    family = _DOMAIN_FAMILIES.get(domain) or _named_family(domain, families)
+    if family is None and domain.count(".") == 1:  # "tiktok.com" -> "tiktok"
+        family = _named_family(domain.split(".", 1)[0], families)
+    return family
+
+
+def _rule_matches(rule: str, tokens: set[str], host: str, family: str) -> bool:
     rule = rule.lstrip("*").lstrip(".")
     if not rule:
         return False
     if rule in tokens:
         return True
-    return "." in rule and _host_in(host, (rule,))
+    if "." not in rule:
+        return False
+    # A domain covers the hosts under it and, when it names a whole site,
+    # every link of that site: "youtube.com" also covers youtu.be,
+    # youtube-nocookie.com and Invidious mirrors, "x.com" covers twitter.com.
+    return _host_in(host, (rule,)) or _family_of_rule(rule, (family,)) == family
 
 
 def _provider_allowed(entry: _Extractor, host: str) -> bool:
     tokens = _entry_tokens(entry)
-    if any(_rule_matches(r, tokens, host) for r in _config_list("BLOCKED_PROVIDERS")):
+
+    def matches(rule: str) -> bool:
+        return _rule_matches(rule, tokens, host, entry.family)
+
+    if any(matches(rule) for rule in _config_list("BLOCKED_PROVIDERS")):
         return False
     allowed = _config_list("ALLOWED_PROVIDERS")
-    return not allowed or any(_rule_matches(r, tokens, host) for r in allowed)
+    return not allowed or any(matches(rule) for rule in allowed)
 
 
 def _collections_allowed() -> bool:
@@ -1042,9 +1093,12 @@ def match_provider(url: str) -> ProviderMatch | None:
     localhost or single-label host) claimed by a working, enabled yt-dlp
     extractor other than "generic", not a collection page, and allowed by
     ``config.ALLOWED_PROVIDERS`` / ``config.BLOCKED_PROVIDERS`` (extractor
-    key, IE name, site family such as "youtube", or a domain suffix such as
-    "vimeo.com"). Lookups are cached. No network access: share links such
-    as ``fb.watch/...`` need :func:`match_provider_async`.
+    key, IE name, site family such as "youtube", or a domain such as
+    "vimeo.com": a site's own domain covers the whole site, e.g.
+    "youtube.com" also covers youtu.be links, a subdomain such as
+    "vm.tiktok.com" only the hosts under it). Lookups are cached. No network
+    access: share links such as ``fb.watch/...`` need
+    :func:`match_provider_async`.
     """
     return check_link(url).match
 
@@ -1416,21 +1470,6 @@ def _family_name(family: str, registry: _Registry) -> str:
         return name
     entry = next((e for e in registry.extractors if e.family == family), None)
     return _fallback_name(entry) if entry else family
-
-
-def _family_of_rule(rule: str, families: set[str]) -> str | None:
-    """Site family named by a rule ("youtube", "x", "tiktok.com"), if any."""
-    rule = rule.lstrip("*").lstrip(".")
-    tokens = [rule]
-    if "." in rule:
-        tokens.append(rule.split(".")[-2])  # "tiktok.com" -> "tiktok"
-    for token in tokens:
-        if token in families:
-            return token
-        for family, aliases in _FAMILY_ALIASES.items():
-            if token in aliases:
-                return family
-    return None
 
 
 def _rule_display_name(rule: str, registry: _Registry, families: set[str]) -> str:
