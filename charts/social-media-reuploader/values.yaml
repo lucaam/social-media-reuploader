@@ -76,9 +76,11 @@ probes:
     periodSeconds: 20
     timeoutSeconds: 5
     failureThreshold: 3
+  # /ready: DB reachable (3 s internal timeout), fresh worker heartbeat and
+  # updates being received.
   readiness:
     periodSeconds: 10
-    timeoutSeconds: 3
+    timeoutSeconds: 5
     failureThreshold: 3
 
 # Resource profile of the bot: small, medium or large (or set `resources`).
@@ -246,6 +248,8 @@ env:
   ALLOW_COLLECTION_LINKS: null
   # Reply to links the bot cannot handle: private (default), always, never.
   UNSUPPORTED_LINK_REPLY: private
+  # Links of one message that are checked and queued (default 10, max 50).
+  MAX_LINKS_PER_MESSAGE: null
 
   # --- Media processing (ffmpeg) ----------------------------------------------
   # Thumbnails for videos (default true).
@@ -282,15 +286,22 @@ env:
   WORKER_SHUTDOWN_TIMEOUT: null
   # Max attempts of a request across crashes/restarts (default 3).
   WORKER_MAX_ATTEMPTS: null
+  # Base of the exponential backoff for retryable failures (default 30 s).
+  WORKER_RETRY_BACKOFF_SECONDS: null
 
   # --- Retention ------------------------------------------------------------
   # Days of event log (default 14) / finished requests (default 0 = keep).
   UPDATES_RETENTION_DAYS: null
   REQUESTS_RETENTION_DAYS: null
+  # With KEEP_DOWNLOADED_FILES, hours after which work directories are still
+  # swept from TMP_DIR (default 24).
+  TMP_RETENTION_HOURS: null
 
   # --- Admin GUI --------------------------------------------------------------
   # How often the GUI tails the DB event log (default 1 s).
   GUI_DB_POLL_SECONDS: null
+  # "Unlimit + requeue" only requeues refusals younger than this (default 86400 s).
+  GUI_REQUEUE_MAX_AGE_SECONDS: null
 
 # Extra bot environment entries (full EnvVar objects, e.g. valueFrom).
 extraEnv: []
@@ -392,6 +403,10 @@ gui:
     oauthAdminGroups: ""
   # Extra GUI environment variables (not secrets), e.g.
   #   SESSION_COOKIE_SECURE: true    # GUI served over HTTPS
+  #   SESSION_MAX_AGE_SECONDS: 43200 # session lifetime (default 12 h)
+  #   GUI_TRUSTED_ORIGINS: https://admin.example.com  # proxy rewrites Host
+  #   OAUTH_ISSUER: https://idp.example.com          # without discovery
+  #   OAUTH_TIMEOUT_SECONDS: 10
   #   OAUTH_ADMIN_GROUPS: admins
   env: {}
   extraEnv: []

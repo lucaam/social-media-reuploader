@@ -196,6 +196,7 @@ mappa `env` di `values.yaml` (numeri e booleani vengono resi come stringhe).
 | `BLOCKED_PROVIDERS` | – | Provider esclusi, stesso formato. |
 | `ALLOW_COLLECTION_LINKS` | `false` | Accetta anche link a profili, canali, playlist e album (vengono pubblicati i primi `MAX_ITEMS_PER_LINK` elementi). |
 | `UNSUPPORTED_LINK_REPLY` | `private` | Quando rispondere ai link che il bot non può gestire: `private` (solo chat private), `always`, `never`. |
+| `MAX_LINKS_PER_MESSAGE` | `10` | Link massimi di un singolo messaggio che vengono controllati e messi in coda (1-50); gli altri vengono ignorati. |
 
 #### Conversione (ffmpeg)
 
@@ -222,6 +223,7 @@ mappa `env` di `values.yaml` (numeri e booleani vengono resi come stringhe).
 | `WORKER_HEARTBEAT_SECONDS` | `5` | Ogni quanto il worker pubblica il proprio stato per la GUI. |
 | `WORKER_SHUTDOWN_TIMEOUT` | `30` | Secondi concessi alle richieste in corso allo spegnimento prima di annullarle (il chart usa il grace period del pod meno 15 secondi). |
 | `WORKER_MAX_ATTEMPTS` | `3` | Tentativi massimi di una richiesta interrotta da crash o riavvii. |
+| `WORKER_RETRY_BACKOFF_SECONDS` | `30` | Base del backoff esponenziale per gli errori temporanei (30, 60, 120 s, ... fino a 15 minuti, mai meno del `retry_after` di Telegram). |
 
 #### Database e retention
 
@@ -230,6 +232,7 @@ mappa `env` di `values.yaml` (numeri e booleani vengono resi come stringhe).
 | `REQUESTS_DB` | `data/requests.db` | File SQLite condiviso da bot e GUI (nel container `/app/data/requests.db`). Deve stare su un filesystem locale, mai su NFS/SMB. `:memory:` solo per i test. |
 | `UPDATES_RETENTION_DAYS` | `14` | Giorni di log degli eventi conservati (0 = per sempre). |
 | `REQUESTS_RETENTION_DAYS` | `0` | Giorni di richieste concluse conservati (0 = per sempre). Le richieste che contano ancora per `RATE_LIMITS` non vengono mai cancellate. |
+| `TMP_RETENTION_HOURS` | `24` | Con `KEEP_DOWNLOADED_FILES` attivo, ore dopo cui le directory di lavoro vengono comunque rimosse dalla pulizia periodica di `TMP_DIR` (senza, le directory orfane vengono rimosse dopo 1 ora). |
 
 #### GUI di amministrazione
 
@@ -238,6 +241,8 @@ mappa `env` di `values.yaml` (numeri e booleani vengono resi come stringhe).
 | `SECRET_KEY` | obbligatorio | Chiave che firma i cookie di sessione: almeno 32 caratteri casuali (`openssl rand -hex 32`). Cambiarla chiude tutte le sessioni. |
 | `ADMIN_TOKEN` | – | Token di accesso amministratore (login con token o header `Authorization: Bearer`). Necessario se OAuth non è configurato. |
 | `SESSION_COOKIE_SECURE` | – | `true` quando la GUI è servita in HTTPS (cookie di sessione `Secure`); `false` per l'HTTP in locale. |
+| `SESSION_MAX_AGE_SECONDS` | `43200` (12 h) | Durata massima di una sessione della GUI (300-604800). |
+| `GUI_TRUSTED_ORIGINS` | – | Origin aggiuntive (separate da virgola, es. `https://admin.example.com`) accettate per le richieste che modificano dati e per il WebSocket, quando un proxy riscrive l'header `Host`. |
 | `OAUTH_CLIENT_ID` | – | Client ID OAuth2 / OpenID Connect. |
 | `OAUTH_CLIENT_SECRET` | – | Client secret OAuth2. |
 | `OAUTH_SERVER_METADATA_URL` | – | URL di discovery OpenID (`.../.well-known/openid-configuration`): consigliato, ricava endpoint e JWKS. |
@@ -248,7 +253,10 @@ mappa `env` di `values.yaml` (numeri e booleani vengono resi come stringhe).
 | `OAUTH_SCOPE` | `openid profile email` | Scope richiesti al provider. |
 | `OAUTH_REDIRECT_URI` | derivato dalla richiesta | URL pubblico di callback, es. `https://admin.example.com/auth`: impostalo quando la GUI è dietro un reverse proxy. |
 | `OAUTH_ADMIN_GROUPS` | – | Gruppi del provider (separati da virgola) i cui membri sono amministratori. |
+| `OAUTH_ISSUER` | – | `iss` atteso nell'id_token quando non si usa la discovery. |
+| `OAUTH_TIMEOUT_SECONDS` | `10` | Timeout delle chiamate HTTP verso il provider OAuth (1-60). |
 | `GUI_DB_POLL_SECONDS` | `1` | Ogni quanto la GUI legge il log degli eventi dal database per gli aggiornamenti live (min 0.2). |
+| `GUI_REQUEUE_MAX_AGE_SECONDS` | `86400` (24 h) | "Sblocca e rimetti in coda" rimette in coda solo i link rifiutati più recenti di così. |
 <!-- section:configurazione:end -->
 
 ## Note di deploy

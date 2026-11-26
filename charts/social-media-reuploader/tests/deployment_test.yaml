@@ -379,8 +379,11 @@ tests:
       - equal:
           path: spec.template.spec.containers[0].readinessProbe.httpGet
           value:
-            path: /health
+            path: /ready
             port: http
+      - equal:
+          path: spec.template.spec.containers[0].readinessProbe.timeoutSeconds
+          value: 5
       - equal:
           path: spec.template.spec.containers[0].livenessProbe.failureThreshold
           value: 3

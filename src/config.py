@@ -305,6 +305,8 @@ if UNSUPPORTED_LINK_REPLY not in ("private", "always", "never"):
         f"UNSUPPORTED_LINK_REPLY={UNSUPPORTED_LINK_REPLY!r} is invalid; using 'private'"
     )
     UNSUPPORTED_LINK_REPLY = "private"
+# At most this many links of a single message are checked and submitted.
+MAX_LINKS_PER_MESSAGE: int = env_int("MAX_LINKS_PER_MESSAGE", 10, minimum=1, maximum=50)
 
 # ---------------------------------------------------------------------------
 # Media processing (ffmpeg)
@@ -363,6 +365,11 @@ WORKER_HEARTBEAT_SECONDS: float = env_float(
 WORKER_SHUTDOWN_TIMEOUT: int = env_int("WORKER_SHUTDOWN_TIMEOUT", 30, minimum=0)
 # A request is retried at most this many times after crashes/restarts.
 WORKER_MAX_ATTEMPTS: int = env_int("WORKER_MAX_ATTEMPTS", 3, minimum=1)
+# Base of the exponential backoff for retryable failures (30, 60, 120 s ...,
+# capped at 15 minutes and never shorter than Telegram's retry_after).
+WORKER_RETRY_BACKOFF_SECONDS: float = env_float(
+    "WORKER_RETRY_BACKOFF_SECONDS", 30.0, minimum=1.0
+)
 
 # ---------------------------------------------------------------------------
 # Retention
@@ -371,12 +378,19 @@ WORKER_MAX_ATTEMPTS: int = env_int("WORKER_MAX_ATTEMPTS", 3, minimum=1)
 UPDATES_RETENTION_DAYS: int = env_int("UPDATES_RETENTION_DAYS", 14, minimum=0)
 # Delete finished requests and their events older than this (0 = keep).
 REQUESTS_RETENTION_DAYS: int = env_int("REQUESTS_RETENTION_DAYS", 0, minimum=0)
+# With KEEP_DOWNLOADED_FILES, work directories older than this are still
+# removed by the periodic TMP_DIR sweep (orphans are otherwise removed after 1 h).
+TMP_RETENTION_HOURS: float = env_float("TMP_RETENTION_HOURS", 24.0, minimum=0.0)
 
 # ---------------------------------------------------------------------------
 # Admin GUI
 # ---------------------------------------------------------------------------
 # Poll interval used by the GUI to tail the DB event log.
 GUI_DB_POLL_SECONDS: float = env_float("GUI_DB_POLL_SECONDS", 1.0, minimum=0.2)
+# "Unlimit + requeue" in the GUI only requeues refusals younger than this.
+GUI_REQUEUE_MAX_AGE_SECONDS: int = env_int(
+    "GUI_REQUEUE_MAX_AGE_SECONDS", 86400, minimum=0
+)
 
 
 def validate() -> list[str]:

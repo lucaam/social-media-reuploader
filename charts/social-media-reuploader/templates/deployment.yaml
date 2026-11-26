@@ -142,9 +142,11 @@ spec:
             {{- with .Values.probes.liveness }}
             {{- toYaml . | nindent 12 }}
             {{- end }}
+          # /ready checks the DB, the worker heartbeat and that updates are
+          # being received; /health (liveness) only checks the process.
           readinessProbe:
             httpGet:
-              path: /health
+              path: /ready
               port: http
             {{- with .Values.probes.readiness }}
             {{- toYaml . | nindent 12 }}
