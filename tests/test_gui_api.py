@@ -1007,6 +1007,19 @@ def test_tokens_are_redacted_from_uvicorn_log_lines():
     ]
 
 
+def test_hidden_elements_stay_hidden_without_bootstrap():
+    # .page-center { display: flex } beats the browser's [hidden] rule: only
+    # Bootstrap's reboot (a CDN file that may not load) or app.css hides #boot.
+    css = (Path(gui.STATIC_DIR) / "app.css").read_text(encoding="utf-8")
+    css = re.sub(r"/\*.*?\*/", "", css, flags=re.DOTALL)
+    hidden = [
+        body
+        for selectors, body in re.findall(r"([^{}]+)\{([^}]*)\}", css)
+        if "[hidden]" in {selector.strip() for selector in selectors.split(",")}
+    ]
+    assert any(re.search(r"display:\s*none\s*!important", body) for body in hidden)
+
+
 def test_docs_are_disabled(client):
     for path in ("/docs", "/redoc", "/openapi.json"):
         assert client.get(path).status_code == 404

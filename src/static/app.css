@@ -1,4 +1,13 @@
 /* Admin console styles (served from /static: no inline styles anywhere). */
+
+/* Bootstrap's reboot has the same rule; repeated here so that hidden elements
+   (#boot, the overlays, the modal) stay hidden when its CDN stylesheet does not
+   load, since author rules such as .page-center { display: flex } beat the
+   browser's own [hidden] rule. */
+[hidden] {
+  display: none !important;
+}
+
 body {
   background: #f6f7f9;
   font-size: 0.95rem;
@@ -32,11 +41,6 @@ body {
   padding: 1rem;
   background: rgba(15, 23, 42, 0.45);
   z-index: 2000;
-}
-
-.overlay[hidden],
-.modal-layer[hidden] {
-  display: none !important;
 }
 
 .login-card {
