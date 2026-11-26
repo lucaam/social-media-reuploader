@@ -7,6 +7,7 @@ Real SQLite database (one temp file per test); fakes replace yt-dlp
 
 import asyncio
 import os
+import sqlite3
 import subprocess
 import sys
 import threading
@@ -388,6 +389,28 @@ def metric(name, **labels):
 
 def workdirs(env):
     return sorted(path.name for path in env.work.iterdir()) if env.work.exists() else []
+
+
+def break_db(monkeypatch, name, failures=None):
+    """db.<name> raises 'database is locked' while state["on"] (or only for
+    its first ``failures`` calls); it works normally afterwards."""
+    real = getattr(db, name)
+    state = {"on": True, "calls": 0}
+
+    def fake(*args, **kwargs):
+        state["calls"] += 1
+        if state["on"] and (failures is None or state["calls"] <= failures):
+            raise sqlite3.OperationalError("database is locked")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(db, name, fake)
+    return state
+
+
+@pytest.fixture
+def fast_retries(monkeypatch):
+    monkeypatch.setattr(pipeline, "OUTCOME_WRITE_BACKOFF_SECONDS", 0.0)
+    monkeypatch.setattr(worker, "SETTLE_RETRY_SECONDS", 0.05)
 
 
 # ---------------------------------------------------------------------------
@@ -1123,6 +1146,178 @@ def test_keep_downloaded_files_keeps_the_work_directory(env, monkeypatch):
     assert name.startswith(f"smr-{row['id']}-")
     assert (env.work / name / "item-01.mp4").exists()
     assert (env.work / name).stat().st_mode & 0o777 == 0o700
+
+
+# ---------------------------------------------------------------------------
+# Outcomes the database refuses: never a stranded row
+# ---------------------------------------------------------------------------
+def test_delivery_whose_mark_done_keeps_failing_is_settled_later(
+    env, monkeypatch, fast_retries
+):
+    broken = break_db(monkeypatch, "mark_done")
+    request_id = new_request()
+    result = run(process(claim(request_id)))
+    assert broken["calls"] == pipeline.OUTCOME_WRITE_ATTEMPTS
+    assert result.outcome == pipeline.Outcome.DONE
+    assert (result.sent, result.bytes_sent) == ({"video": 1}, 2 * MIB)  # metrics
+    assert env.tg.reactions() == ["👀", "🏆"]
+    assert status(request_id) == "sending"  # not recorded yet...
+    settlement = result.settlement
+    assert (settlement.request_id, settlement.outcome) == (request_id, "done")
+    broken["on"] = False
+    assert settlement.write() is True  # ...but the pool can record it later
+    row = db.get_request(request_id)
+    assert (row["status"], row["media_type"]) == ("done", "video")
+    assert row["sent_message_id"] == env.tg.message_ids[-1]
+    assert db.count_active_for_chat(42) == 0
+
+
+def test_url_fetch_delivery_is_recorded_once_the_database_recovers(
+    env, monkeypatch, fast_retries
+):
+    env.site.items = [make_item(1, direct_url=DIRECT, filesize=5 * MIB)]
+    break_db(monkeypatch, "mark_done", failures=pipeline.OUTCOME_WRITE_ATTEMPTS + 2)
+    sent = metric("files_sent_total", media_type="video")
+
+    async def scenario():
+        pool = await started_pool()
+        try:
+            result = await pool.submit(42, URL, provider=match(), original_message_id=1)
+            await wait_until(lambda: status(result.request_id) == "done")
+            await wait_until(lambda: not pool._unsettled)
+            return result
+        finally:
+            await pool.stop()
+
+    result = run(scenario())
+    # Left 'processing', the next start would have requeued it: posted twice.
+    assert len(env.tg.uploads()) == 1
+    assert db.get_request(result.request_id)["final_size"] == 5 * MIB
+    assert metric("files_sent_total", media_type="video") == sent + 1
+
+
+def test_retry_whose_deferral_keeps_failing_is_settled_later(
+    env, monkeypatch, fast_retries
+):
+    env.site.fetch_errors.append(downloader.DownloadError("HTTP 503", retryable=True))
+    broken = break_db(monkeypatch, "defer_request")
+    request_id = new_request()
+    result = run(process(claim(request_id)))  # nothing escapes the job
+    assert result.outcome == pipeline.Outcome.RETRY
+    assert result.settlement.outcome == "deferred"
+    assert status(request_id) == "processing"
+    broken["on"] = False
+    assert result.settlement.write() is True
+    row = db.get_request(request_id)
+    assert row["status"] == "queued"
+    assert row["not_before"] is not None
+
+
+def test_failure_whose_write_keeps_failing_is_reported_and_settled_later(
+    env, monkeypatch, fast_retries
+):
+    env.site.fetch_errors.append(downloader.ContentUnavailable("gone"))
+    broken = break_db(monkeypatch, "mark_failed")
+    request_id = new_request()
+    result = run(process(claim(request_id)))
+    assert result.outcome == pipeline.Outcome.FAILED
+    assert env.tg.reactions() == ["👀", "🍌"]  # the user gets the outcome now
+    assert env.tg.texts() == [messages.failure("unavailable")]
+    broken["on"] = False
+    assert result.settlement.write() is True
+    row = db.get_request(request_id)
+    assert (row["status"], row["error_code"]) == ("failed", "unavailable")
+
+
+def test_invalid_row_whose_failure_cannot_be_written_is_settled_later(
+    env, monkeypatch, fast_retries
+):
+    request_id = new_request()
+    row = dict(claim(request_id))
+    row["url"] = None
+    broken = break_db(monkeypatch, "mark_failed")
+    result = run(process(row))
+    assert result.error_code == "invalid_request"
+    assert result.settlement.outcome == "failed"
+    broken["on"] = False
+    result.settlement.write()
+    assert status(request_id) == "failed"
+
+
+def test_pool_settles_a_refused_deferral_and_retries_the_link(
+    env, monkeypatch, fast_retries
+):
+    monkeypatch.setattr(config, "WORKER_RETRY_BACKOFF_SECONDS", 0.05)
+    env.site.fetch_errors.append(downloader.DownloadError("HTTP 503", retryable=True))
+    break_db(monkeypatch, "defer_request", failures=pipeline.OUTCOME_WRITE_ATTEMPTS + 1)
+
+    async def scenario():
+        pool = await started_pool()
+        try:
+            result = await pool.submit(42, URL, provider=match(), original_message_id=1)
+            await wait_until(lambda: status(result.request_id) == "done")
+            return result
+        finally:
+            await pool.stop()
+
+    result = run(scenario())
+    assert db.get_request(result.request_id)["attempts"] == 2
+    assert len(env.tg.uploads()) == 1
+    assert db.count_active_for_chat(42) == 0  # no pending slot held
+
+
+@pytest.mark.parametrize("claimed", [False, True], ids=["processing", "sending"])
+def test_row_of_a_crashed_job_is_settled_like_a_restart_would(
+    env, monkeypatch, fast_retries, claimed
+):
+    async def crash(token, row, state):
+        if claimed:
+            db.mark_sending(row["id"])
+        raise RuntimeError("a bug")
+
+    monkeypatch.setattr(pipeline, "process", crash)
+
+    def settled(request_id):
+        row = db.get_request(request_id)
+        return row["status"] == "failed" or row["not_before"] is not None
+
+    async def scenario():
+        pool = await started_pool()
+        try:
+            result = await pool.submit(42, URL, provider=match(), original_message_id=1)
+            await wait_until(lambda: settled(result.request_id))
+            return result
+        finally:
+            await pool.stop()
+
+    result = run(scenario())
+    row = db.get_request(result.request_id)
+    if claimed:  # the upload may have happened: never resent
+        assert (row["status"], row["error_code"]) == (
+            "failed",
+            "interrupted_while_sending",
+        )
+    else:  # back in the queue, with the backoff of a retry
+        assert (row["status"], row["attempts"]) == ("queued", 1)
+        assert db.ts_from_iso(row["not_before"]) > time.time() + 20
+
+
+def test_stop_makes_a_last_attempt_to_record_pending_outcomes(
+    env, monkeypatch, fast_retries
+):
+    monkeypatch.setattr(worker, "SETTLE_RETRY_SECONDS", 60.0)  # only stop() retries
+    broken = break_db(monkeypatch, "mark_done")
+
+    async def scenario():
+        pool = await started_pool()
+        result = await pool.submit(42, URL, provider=match(), original_message_id=1)
+        await wait_until(lambda: result.request_id in pool._unsettled)
+        broken["on"] = False
+        await pool.stop()
+        return result
+
+    result = run(scenario())
+    assert status(result.request_id) == "done"
 
 
 # ---------------------------------------------------------------------------

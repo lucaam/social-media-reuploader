@@ -16,6 +16,10 @@ The ``requests`` table IS the queue (there is no in-memory copy of it):
 * A heartbeat task publishes the pool status (``db.set_worker_status``) for
   the GUI; a maintenance task prunes old history daily and removes stale work
   directories from ``TMP_DIR``.
+* A job outcome the database refused (``pipeline.Settlement``) and the row of
+  a job that crashed are settled in the background, so no row stays
+  ``processing``/``sending`` (holding a pending slot of its chat) until the
+  next start.
 
 Lifecycle: ``WorkerPool(token)`` starts nothing; ``await pool.start()``
 recovers requests interrupted by a previous process and starts the tasks;
@@ -28,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
 import os
 import shutil
@@ -71,6 +76,10 @@ NOTICE_GRACE_SECONDS = 2.0
 DEFERRED_NOTICE_MEMORY = 1024
 # Timers for deferred rows fire slightly after their not_before.
 WAKE_DELAY_EPSILON = 0.05
+# Outcomes the database refused are written again after this many seconds,
+# doubling up to the maximum, and once more when the pool stops.
+SETTLE_RETRY_SECONDS = 5.0
+SETTLE_MAX_RETRY_SECONDS = 120.0
 
 _DEFAULTS: dict[str, Any] = {
     "WORKERS": 2,
@@ -190,6 +199,38 @@ def _make_dir(path: str) -> None:
     os.makedirs(path, mode=0o700, exist_ok=True)
 
 
+def recover_crashed(request_id: int, *, max_attempts: int) -> bool:
+    """Settle the row of a job that crashed, like a restart would (blocking).
+
+    ``processing`` goes back to the queue (``failed``/``interrupted`` once
+    ``max_attempts`` are used); ``sending`` becomes ``failed``/
+    ``interrupted_while_sending``: the upload may have happened, it is never
+    resent. See :func:`src.db.recover_interrupted`.
+    """
+    row = db.get_request(request_id)
+    if row is None:
+        return False
+    if row["status"] == db.Status.SENDING:
+        return db.mark_failed(
+            request_id,
+            error_code="interrupted_while_sending",
+            error_message="the job crashed during the upload; not resent",
+        )
+    if row["status"] != db.Status.PROCESSING:
+        return False
+    attempts = int(row["attempts"] or 0)
+    if attempts >= max_attempts:
+        return db.mark_failed(
+            request_id,
+            error_code="interrupted",
+            error_message=f"the job crashed (attempt {attempts}); giving up",
+        )
+    retry_at = time.time() + pipeline.retry_delay(attempts)
+    return db.defer_request(
+        request_id, db.iso_from_ts(retry_at), reason="the job crashed"
+    )
+
+
 class WorkerPool:
     """Accepts links (:meth:`submit`) and processes the queue (see module doc)."""
 
@@ -201,6 +242,9 @@ class WorkerPool:
         self.limiter = RateLimiter()
         self._chat_locks: dict[int, _ChatLock] = {}
         self._jobs: dict[int, _Job] = {}
+        # Outcomes still to be written, by request id (see _settle_loop).
+        self._unsettled: dict[int, pipeline.Settlement] = {}
+        self._settler: asyncio.Task[None] | None = None
         self._tasks: set[asyncio.Task[Any]] = set()
         self._timers: set[asyncio.TimerHandle] = set()
         self._deferred_notices: OrderedDict[tuple[int, int], None] = OrderedDict()
@@ -318,7 +362,12 @@ class WorkerPool:
             # would leave the write running in its thread, racing "stopped".
             self._halt_event.set()
         await self._finish_notices()
-        background = [t for t in (self._heartbeat, self._maintenance) if t is not None]
+        # The halt event also asks the settler for its last attempt.
+        background = [
+            t
+            for t in (self._heartbeat, self._maintenance, self._settler)
+            if t is not None
+        ]
         if background:
             _done, pending = await asyncio.wait(
                 background, timeout=CANCEL_GRACE_SECONDS
@@ -359,11 +408,8 @@ class WorkerPool:
             logger.error("%d job(s) did not stop after cancellation", len(still))
 
     async def _finish_notices(self) -> None:
-        notices = [
-            task
-            for task in self._tasks
-            if task not in (self._dispatcher, self._heartbeat, self._maintenance)
-        ]
+        own = (self._dispatcher, self._heartbeat, self._maintenance, self._settler)
+        notices = [task for task in self._tasks if task not in own]
         if not notices:
             return
         _done, pending = await asyncio.wait(notices, timeout=NOTICE_GRACE_SECONDS)
@@ -744,6 +790,8 @@ class WorkerPool:
         self, row: Mapping[str, Any], state: pipeline.JobState
     ) -> pipeline.JobResult:
         result = await pipeline.process(self.token, row, state)
+        if result.settlement is not None:
+            self._settle_later(result.settlement)
         if result.retry_at is not None:
             self._wake_at(result.retry_at)
         metrics.record_job(
@@ -772,6 +820,69 @@ class WorkerPool:
         if exc is not None:
             metrics.record_job("crashed", elapsed)
             logger.error("Request %s: job crashed", state.request_id, exc_info=exc)
+            # Its row is still processing/sending: settle it as a restart would.
+            recover = functools.partial(
+                recover_crashed,
+                state.request_id,
+                max_attempts=int(_setting("WORKER_MAX_ATTEMPTS")),
+            )
+            self._settle_later(
+                pipeline.Settlement(state.request_id, "interrupted", recover)
+            )
+
+    # ------------------------------------------------------------------
+    # Settling outcomes the database refused
+    # ------------------------------------------------------------------
+    def _settle_later(self, settlement: pipeline.Settlement) -> None:
+        """Write ``settlement`` in the background, retrying until it works."""
+        self._unsettled[settlement.request_id] = settlement
+        if self._settler is None or self._settler.done():
+            self._settler = self._spawn(self._settle_loop(), "worker-settle")
+
+    async def _settle_loop(self) -> None:
+        halt = self._halt_event
+        if halt is None:
+            raise RuntimeError("the settler runs only after start()")
+        delay = SETTLE_RETRY_SECONDS
+        try:
+            while self._unsettled:
+                with contextlib.suppress(TimeoutError):
+                    async with asyncio.timeout(delay):
+                        await halt.wait()  # stopping: one last attempt now
+                await self._settle_pending()
+                if halt.is_set():
+                    break
+                delay = min(2 * delay, SETTLE_MAX_RETRY_SECONDS)
+        finally:
+            for request_id, settlement in self._unsettled.items():
+                logger.error(
+                    "Request %s: its %s outcome may not be recorded; the next "
+                    "start settles the row as interrupted",
+                    request_id,
+                    settlement.outcome,
+                )
+
+    async def _settle_pending(self) -> None:
+        for request_id, settlement in list(self._unsettled.items()):
+            try:
+                recorded = await db.aio(settlement.write)
+            except sqlite3.Error as exc:
+                logger.warning(
+                    "Request %s: cannot record its %s outcome yet: %s",
+                    request_id,
+                    settlement.outcome,
+                    exc,
+                )
+                continue
+            if self._unsettled.get(request_id) is settlement:
+                del self._unsettled[request_id]
+            logger.info(
+                "Request %s: %s outcome recorded%s",
+                request_id,
+                settlement.outcome,
+                "" if recorded else " (the row was no longer active)",
+            )
+            self.wake()
 
     # ------------------------------------------------------------------
     # Heartbeat

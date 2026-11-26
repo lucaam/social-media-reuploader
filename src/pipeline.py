@@ -23,6 +23,10 @@ Every attempt ends with exactly one outcome (:class:`Outcome`):
   queue, or to ``failed``/``interrupted_while_sending`` when an upload may
   already have reached Telegram; the ``CancelledError`` propagates.
 
+Outcome writes are retried on database errors; one the database keeps
+refusing is returned as ``JobResult.settlement`` and written later by the
+worker pool (the user already got the outcome), so no row stays active.
+
 Nothing is ever posted twice on purpose: local uploads are claimed with
 ``mark_sending`` first (a refusal means: do not send); the Telegram URL fetch
 runs while the row is still ``processing`` (so a refusal can fall back to a
@@ -35,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import functools
 import logging
 import os
 import shutil
@@ -70,8 +75,11 @@ MAX_UPLOAD_WAIT_SECONDS = 300.0
 UPLOAD_RETRY_DELAY_SECONDS = 15.0
 # Best-effort Telegram calls made while a job is being cancelled.
 CANCEL_CLEANUP_SECONDS = 5.0
-# mark_done after a delivery is retried on database errors (never re-sent).
-MARK_DONE_ATTEMPTS = 3
+# Outcome writes (mark_done, defer_request, mark_failed) are retried on
+# database errors, waiting attempt * backoff seconds in between; when they
+# keep failing the worker pool records the outcome later (JobResult.settlement).
+OUTCOME_WRITE_ATTEMPTS = 3
+OUTCOME_WRITE_BACKOFF_SECONDS = 1.0
 
 _DEFAULTS: dict[str, Any] = {
     "TMP_DIR": "/tmp/telegram_downloader",
@@ -205,6 +213,21 @@ class Request:
 
 
 @dataclass(frozen=True)
+class Settlement:
+    """A job outcome the database did not accept (it kept raising sqlite3.Error).
+
+    The row is still ``processing``/``sending``, and nothing but this worker
+    changes such rows, so :class:`src.worker.WorkerPool` runs ``write`` (a
+    blocking db call) again later instead of leaving the row active, holding
+    a pending slot of the chat, until the next start.
+    """
+
+    request_id: int
+    outcome: str  # what ``write`` records: "done", "deferred", "failed", ...
+    write: Callable[[], object] = field(repr=False, compare=False)
+
+
+@dataclass(frozen=True)
 class JobResult:
     outcome: Outcome
     error_code: str | None = None
@@ -214,6 +237,7 @@ class JobResult:
     media_type: str | None = None
     sent: Mapping[str, int] = field(default_factory=dict)  # media type -> files
     bytes_sent: int = 0
+    settlement: Settlement | None = None  # the outcome still to be recorded
 
 
 @dataclass(frozen=True)
@@ -257,12 +281,27 @@ class PreparedItem:
 @dataclass(frozen=True)
 class Delivery:
     message_id: int | None
-    media_type: str
+    media_type: str | None
     sent: Mapping[str, int]
     bytes_sent: int
-    original_size: int
-    final_size: int
-    compressed: bool
+    original_size: int | None
+    final_size: int | None
+    compressed: bool | None
+
+    def row_fields(self) -> dict[str, Any]:
+        """``db.mark_done`` keywords (None keeps the row's value)."""
+        return {
+            "sent_message_id": self.message_id,
+            "media_type": self.media_type,
+            "original_size": self.original_size,
+            "final_size": self.final_size,
+            "compressed": self.compressed,
+        }
+
+
+# Something was posted but the job did not get to describe it (it failed or
+# was cancelled in between): the row is marked done without details.
+UNKNOWN_DELIVERY = Delivery(None, None, {}, 0, None, None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -418,6 +457,43 @@ def common_kind(kinds: Iterable[str]) -> str | None:
     return found.pop() if len(found) == 1 else None
 
 
+async def _record(
+    request_id: int, write: Callable[[], object], what: str
+) -> bool | None:
+    """Run an outcome write, retried on database errors (OUTCOME_WRITE_*).
+
+    True/False: written / refused (the row was no longer active); None: the
+    database kept failing, so the caller hands a :class:`Settlement` back.
+    """
+    for attempt in range(1, OUTCOME_WRITE_ATTEMPTS + 1):
+        try:
+            return bool(await db.aio(write))
+        except sqlite3.Error:
+            if attempt == OUTCOME_WRITE_ATTEMPTS:
+                logger.exception(
+                    "Request %s: cannot record %s; the worker retries it later",
+                    request_id,
+                    what,
+                )
+                return None
+            logger.warning(
+                "Request %s: cannot record %s (attempt %d); retrying",
+                request_id,
+                what,
+                attempt,
+                exc_info=True,
+            )
+            await asyncio.sleep(attempt * OUTCOME_WRITE_BACKOFF_SECONDS)
+    return None
+
+
+def _settlement(
+    request_id: int, outcome: str, write: Callable[[], object], recorded: bool | None
+) -> Settlement | None:
+    """The Settlement of a write that :func:`_record` could not run (None)."""
+    return Settlement(request_id, outcome, write) if recorded is None else None
+
+
 def _make_workdir(root: str, prefix: str) -> str:
     os.makedirs(root, mode=0o700, exist_ok=True)
     return tempfile.mkdtemp(prefix=prefix, dir=root)  # private (0700)
@@ -544,14 +620,20 @@ async def process(token: str, row: Mapping[str, Any], state: JobState) -> JobRes
     try:
         request = Request.from_row(row)
     except ValueError as exc:
-        logger.error("Request %s cannot be processed: %s", row.get("id"), exc)
-        await db.aio(
+        request_id = int(row["id"])
+        logger.error("Request %s cannot be processed: %s", request_id, exc)
+        write = functools.partial(
             db.mark_failed,
-            int(row["id"]),
+            request_id,
             error_code="invalid_request",
             error_message=str(exc),
         )
-        return JobResult(Outcome.FAILED, error_code="invalid_request")
+        recorded = await _record(request_id, write, "the failure")
+        return JobResult(
+            Outcome.FAILED,
+            error_code="invalid_request",
+            settlement=_settlement(request_id, "failed", write, recorded),
+        )
     return await RequestProcessor(token, request, state).run()
 
 
@@ -566,6 +648,7 @@ class RequestProcessor:
         self._sending = False  # mark_sending succeeded: the row is 'sending'
         self._send_in_flight = False  # a URL send may reach Telegram (row 'processing')
         self._delivered = False  # something was posted: never retry or fail it
+        self._delivery: Delivery | None = None  # what was posted, once known
         self._method = "local"  # how the media reaches Telegram
         self._kind: str | None = None  # "video"/"audio" (None: not known yet/mixed)
         self._encoder_shared = False  # another job converted at the same time
@@ -943,33 +1026,15 @@ class RequestProcessor:
         return first_id, sent
 
     # -- outcomes --------------------------------------------------------------
-    async def _mark_done(self, delivery: Delivery) -> bool:
-        for attempt in range(1, MARK_DONE_ATTEMPTS + 1):
-            try:
-                return await db.aio(
-                    db.mark_done,
-                    self.request.id,
-                    sent_message_id=delivery.message_id,
-                    media_type=delivery.media_type,
-                    original_size=delivery.original_size,
-                    final_size=delivery.final_size,
-                    compressed=delivery.compressed,
-                )
-            except sqlite3.Error:
-                if attempt == MARK_DONE_ATTEMPTS:
-                    raise
-                logger.warning(
-                    "Request %s: mark_done failed (attempt %d); retrying",
-                    self.request.id,
-                    attempt,
-                    exc_info=True,
-                )
-                await asyncio.sleep(attempt)
-        return False
-
     async def _done(self, delivery: Delivery, *, method: str) -> JobResult:
+        """Record the delivery; the post exists, so it is never retried."""
         self._stage(Stage.FINISHING)
-        if not await self._mark_done(delivery):
+        self._delivery = delivery
+        write = functools.partial(
+            db.mark_done, self.request.id, **delivery.row_fields()
+        )
+        recorded = await _record(self.request.id, write, "the delivery")
+        if recorded is False:
             logger.warning(
                 "Request %s: delivered, but the row was no longer active",
                 self.request.id,
@@ -990,6 +1055,7 @@ class RequestProcessor:
             media_type=delivery.media_type,
             sent=dict(delivery.sent),
             bytes_sent=delivery.bytes_sent,
+            settlement=_settlement(self.request.id, "done", write, recorded),
         )
 
     async def _skipped(self, reason: str) -> JobResult:
@@ -1007,31 +1073,37 @@ class RequestProcessor:
         return Phase.DOWNLOAD
 
     async def _failed(self, err: DownloadError) -> JobResult:
+        """The attempt failed: retry it later or fail the request.
+
+        Never raises sqlite3.Error: an outcome the database does not accept
+        is handed back as a :class:`Settlement`.
+        """
         request = self.request
-        phase = self._phase(err)
         if self._delivered:
             # Something was posted: never retry or fail it, whatever went wrong
-            # afterwards (the row is settled by mark_done or by the recovery).
+            # afterwards; it is recorded as done.
             logger.error(
                 "Request %s: error after the delivery ([%s] %s)",
                 request.id,
                 err.code,
                 err.detail,
             )
-            await self.feedback.finish(REACTION_DONE)
-            await self.feedback.clear_status()
-            return JobResult(Outcome.DONE, method=self._method)
+            return await self._done(
+                self._delivery or UNKNOWN_DELIVERY, method=self._method
+            )
+        phase = self._phase(err)
         max_attempts = int(setting("WORKER_MAX_ATTEMPTS"))
         if err.retryable and not self.maybe_posted and request.attempts < max_attempts:
             delay = retry_delay(request.attempts, getattr(err, "retry_after", None))
             retry_at = time.time() + delay
-            deferred = await db.aio(
+            write = functools.partial(
                 db.defer_request,
                 request.id,
                 db.iso_from_ts(retry_at),
                 reason=f"{err.code}: {err.detail}"[:500],
             )
-            if deferred:
+            deferred = await _record(request.id, write, "the retry")
+            if deferred is not False:
                 logger.info(
                     "Request %s: [%s] %s; retry %d/%d in %.0fs",
                     request.id,
@@ -1047,6 +1119,7 @@ class RequestProcessor:
                     error_code=err.code,
                     error_phase=phase,
                     retry_at=retry_at,
+                    settlement=_settlement(request.id, "deferred", write, deferred),
                 )
         logger.warning(
             "Request %s failed: [%s] %s", request.id, err.code, err.detail or err.code
@@ -1055,15 +1128,22 @@ class RequestProcessor:
             logger.debug(
                 "Request %s yt-dlp stderr tail:\n%s", request.id, err.stderr_tail
             )
-        if not await db.aio(
+        write = functools.partial(
             db.mark_failed,
             request.id,
             error_code=err.code,
             error_message=err.detail or err.code,
-        ):
+        )
+        failed = await _record(request.id, write, "the failure")
+        if failed is False:
             return await self._skipped("the request was no longer active")
         await self._report_failure(err)
-        return JobResult(Outcome.FAILED, error_code=err.code, error_phase=phase)
+        return JobResult(
+            Outcome.FAILED,
+            error_code=err.code,
+            error_phase=phase,
+            settlement=_settlement(request.id, "failed", write, failed),
+        )
 
     async def _report_failure(self, err: DownloadError) -> None:
         """🍌, plus the explanation in private chats (groups: too_large only,
