@@ -16,6 +16,8 @@ Every output is re-probed, so the returned metadata (dimensions, codecs,
 size) describes the file that will actually be sent. CPU-heavy encodes are
 limited by a module-wide semaphore (``TRANSCODE_CONCURRENCY``) and every
 ffmpeg run is killed with its process group on timeout or cancellation.
+``TRANSCODE_TIMEOUT`` bounds the whole conversion; the time spent waiting
+for a semaphore slot is not counted.
 """
 
 from __future__ import annotations
@@ -28,6 +30,7 @@ import math
 import os
 import shutil
 import weakref
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
@@ -878,6 +881,10 @@ class _Deadline:
             )
         return left
 
+    def extend(self, seconds: float) -> None:
+        """Move the deadline ``seconds`` later (time that must not count)."""
+        self._end += max(0.0, seconds)
+
 
 @dataclass
 class _Job:
@@ -949,6 +956,19 @@ class _Job:
     def preset(self) -> str:
         return str(setting("TRANSCODE_PRESET", "veryfast") or "veryfast")
 
+    @contextlib.asynccontextmanager
+    async def encode_slot(self) -> AsyncIterator[None]:
+        """Hold one ``TRANSCODE_CONCURRENCY`` slot for an encode.
+
+        Waiting for the slot (another job's encode) does not count against
+        ``TRANSCODE_TIMEOUT``: the deadline moves by the time spent waiting.
+        """
+        loop = asyncio.get_running_loop()
+        waiting_since = loop.time()
+        async with transcode_semaphore():
+            self.deadline.extend(loop.time() - waiting_since)
+            yield
+
     async def video(self) -> PreparedMedia:
         p = self.probe
         dst = self.output(".mp4")
@@ -969,14 +989,14 @@ class _Job:
         argv = video_encode_argv(
             self.ffmpeg, self.src, dst, p, plan, preset=self.preset()
         )
-        async with transcode_semaphore():
+        async with self.encode_slot():
             prepared = await self.run(argv, dst, Action.TRANSCODE, "transcode")
         if self.fits(prepared):
             return prepared
         return await self.compress_video(dst)
 
     async def compress_video(self, dst: str) -> PreparedMedia:
-        async with transcode_semaphore():
+        async with self.encode_slot():
             return await self._compress(dst, video=True)
 
     async def compress_audio(self, dst: str) -> PreparedMedia:

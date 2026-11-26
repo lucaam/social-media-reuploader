@@ -501,6 +501,66 @@ def test_transcode_semaphore_is_per_loop_and_follows_the_setting(monkeypatch):
     assert run(value()) == 3
 
 
+def _fake_ffmpeg(monkeypatch, *, encode_seconds: float, limits: list) -> None:
+    """ffmpeg/ffprobe stand-ins: the "encode" takes ``encode_seconds`` and is
+    killed (DownloadTimeout) when its time limit is shorter, like run_command."""
+    monkeypatch.setattr(media.shutil, "which", lambda name: f"/fake/bin/{name}")
+
+    async def fake_run(argv, *, time_limit, label, **kwargs):
+        limits.append(time_limit)
+        if time_limit < encode_seconds:
+            await asyncio.sleep(time_limit)
+            raise DownloadTimeout(f"{label} timed out after {time_limit:g}s")
+        await asyncio.sleep(encode_seconds)
+        pathlib.Path(argv[-1].removeprefix("file:")).write_bytes(b"\0" * 1000)
+        return downloader.CommandResult(0, "", "", encode_seconds)
+
+    async def fake_probe(path):
+        return make_probe(size=os.path.getsize(path), duration=1.0)
+
+    monkeypatch.setattr(media, "run_command", fake_run)
+    monkeypatch.setattr(media, "probe", fake_probe)
+
+
+def _vp9_inputs(tmp_path, count: int) -> list[str]:
+    paths = []
+    for n in range(count):
+        path = tmp_path / f"in{n}.webm"
+        path.write_bytes(b"\0" * 5000)
+        paths.append(str(path))
+    return paths
+
+
+VP9_PROBE = make_probe(vcodec="vp9", acodec="opus", container="webm", duration=1.0)
+
+
+def test_waiting_for_a_transcode_slot_does_not_use_up_the_timeout(
+    monkeypatch, tmp_path
+):
+    # One slot, three conversions: each encode takes more than a third of
+    # TRANSCODE_TIMEOUT, so the queued jobs would starve if waiting counted.
+    monkeypatch.setattr(config, "TRANSCODE_CONCURRENCY", 1)
+    monkeypatch.setattr(config, "TRANSCODE_TIMEOUT", 1.0)
+    limits: list[float] = []
+    _fake_ffmpeg(monkeypatch, encode_seconds=0.4, limits=limits)
+
+    async def scenario():
+        return await asyncio.gather(
+            *(
+                media.prepare_for_telegram(
+                    path, str(tmp_path), max_bytes=50 * MIB, probe_result=VP9_PROBE
+                )
+                for path in _vp9_inputs(tmp_path, 3)
+            )
+        )
+
+    results = run(scenario())
+    assert [r.action for r in results] == ["transcode"] * 3
+    assert len(limits) == 3
+    # every encode got (almost) the whole TRANSCODE_TIMEOUT for itself
+    assert min(limits) > 0.9, limits
+
+
 # ---------------------------------------------------------------------------
 # End to end with ffmpeg (generated media)
 # ---------------------------------------------------------------------------
