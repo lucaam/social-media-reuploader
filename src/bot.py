@@ -20,7 +20,9 @@ receive updates.
 
 Shutdown on SIGTERM/SIGINT (a second signal forces it): stop receiving
 updates -> wait for running update handlers -> ``WorkerPool.stop()`` -> close
-the aiogram and shared HTTP client sessions -> stop the HTTP server.
+the aiogram and shared HTTP client sessions -> stop the HTTP server. A signal
+during startup cancels a pending getMe/deleteWebhook/setWebhook call (they
+retry for minutes when the Bot API does not answer) and exits with 0.
 
 Exit codes: 0 after a normal shutdown, 1 on runtime failures, 2 on
 configuration errors (missing or rejected ``BOT_TOKEN``, invalid webhook
@@ -38,7 +40,7 @@ import signal
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from logging.handlers import RotatingFileHandler
-from typing import Any
+from typing import Any, TypeVar
 from urllib.parse import urlsplit, urlunsplit
 
 import aiohttp
@@ -97,6 +99,7 @@ MISSING_TOKEN_MESSAGE = (
 )
 _SECRET_RE = re.compile(r"[A-Za-z0-9_-]{1,256}")
 _LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+_T = TypeVar("_T")
 # Handlers installed by setup_logging (replaced, never duplicated, on a new call).
 _installed_handlers: list[logging.Handler] = []
 
@@ -419,9 +422,10 @@ class BotApp:
             )
         await self._start_http(app)
 
-        dispatcher["bot_info"] = await self._get_me()
-        if self._stop.is_set():
+        me = await self._unless_stopped(self._get_me())
+        if me is None or self._stop.is_set():
             return
+        dispatcher["bot_info"] = me
         await asyncio.to_thread(providers.warm_up)
         if self._stop.is_set():
             return
@@ -449,6 +453,27 @@ class BotApp:
             "HTTP server listening on %s:%s (%s)", self.host, self.http_port, endpoints
         )
 
+    async def _unless_stopped(self, call: Awaitable[_T]) -> _T | None:
+        """``await call``, or cancel it and return ``None`` once a stop is requested.
+
+        Startup calls to Telegram retry for minutes when the Bot API does not
+        answer (4 attempts of TELEGRAM_API_TIMEOUT): SIGTERM must not wait.
+        """
+        task = asyncio.ensure_future(call)
+        stop_waiter = asyncio.ensure_future(self._stop.wait())
+        try:
+            await asyncio.wait({task, stop_waiter}, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            task.cancel()
+            raise
+        finally:
+            stop_waiter.cancel()
+        if task.done():
+            return task.result()
+        task.cancel()
+        await asyncio.wait({task})
+        return None
+
     async def _get_me(self) -> dict[str, Any]:
         result = await telegram_api.get_me(self.token)
         description = telegram_api.redact(result.get("description"), self.token)
@@ -471,7 +496,9 @@ class BotApp:
         return me
 
     async def _start_polling(self) -> None:
-        result = await telegram_api.delete_webhook(self.token)
+        result = await self._unless_stopped(telegram_api.delete_webhook(self.token))
+        if result is None or self._stop.is_set():
+            return
         if not result.get("ok"):
             logger.warning(
                 "deleteWebhook failed (%s): if a webhook is still set, polling "
@@ -502,12 +529,16 @@ class BotApp:
         if settings is None:  # pragma: no cover
             raise StartupError("internal error: webhook settings missing")
         self.state.accepting_updates = True
-        result = await telegram_api.set_webhook(
-            self.token,
-            settings.url,
-            secret_token=settings.secret,
-            allowed_updates=list(ALLOWED_UPDATES),
+        result = await self._unless_stopped(
+            telegram_api.set_webhook(
+                self.token,
+                settings.url,
+                secret_token=settings.secret,
+                allowed_updates=list(ALLOWED_UPDATES),
+            )
         )
+        if result is None:
+            return
         if not result.get("ok"):
             raise StartupError(
                 "Telegram refused the webhook: "

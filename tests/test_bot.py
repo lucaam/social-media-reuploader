@@ -514,6 +514,49 @@ def test_stop_requested_during_startup(events):
     assert "pool.start" not in events and events[-1] == "http.stop"
 
 
+@pytest.mark.parametrize(
+    ("mode", "hung"),
+    [("polling", "get_me"), ("polling", "delete_webhook"), ("webhook", "set_webhook")],
+)
+def test_stop_during_a_hung_startup_call_does_not_wait_for_it(
+    events, monkeypatch, mode, hung
+):
+    """getMe & co. retry for minutes when the Bot API does not answer."""
+    monkeypatch.setattr(config, "WEBHOOK_URL", WEBHOOK_BASE)
+    cancelled = asyncio.Event()
+
+    async def never_answers(*args, **kwargs):
+        events.append(hung)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
+
+    monkeypatch.setattr(telegram_api, hung, never_answers)
+    app, _, _ = make_app(events, mode=mode)
+
+    async def scenario():
+        task = asyncio.create_task(app.run())
+        await wait_for(lambda: hung in events)
+        app._on_signal(signal.SIGTERM)
+        try:
+            code = await asyncio.wait_for(task, 5)
+        finally:
+            task.cancel()
+        assert cancelled.is_set()
+        return code
+
+    assert asyncio.run(scenario()) == bot_module.EXIT_OK
+    assert events[-1] == "http.stop"
+    assert "getUpdates" not in events
+    assert not app.state.webhook_registered
+    if hung == "get_me":
+        assert "warm_up" not in events and "pool.start" not in events
+    else:
+        assert events[-len(SHUTDOWN_TAIL) :] == SHUTDOWN_TAIL
+
+
 def test_unexpected_errors_exit_1(events, caplog):
     class BrokenPool(FakePool):
         async def start(self):
