@@ -221,10 +221,12 @@ def add(chat_id, status="queued", *, age=0.0, not_before=None, url=None):
         url or f"https://example.com/{chat_id}/{time.monotonic_ns()}",
         not_before=not_before,
     )
-    with db.write() as conn:
+    created = db.iso_from_ts(time.time() - age)
+    with db.write() as conn:  # submitted `age` seconds ago: the slot follows
         conn.execute(
-            "UPDATE requests SET status = ?, created_at = ? WHERE id = ?",
-            (status, db.iso_from_ts(time.time() - age), request_id),
+            """UPDATE requests SET status = ?, created_at = ?,
+                   slot_at = COALESCE(not_before, ?) WHERE id = ?""",
+            (status, created, created, request_id),
         )
     return request_id
 

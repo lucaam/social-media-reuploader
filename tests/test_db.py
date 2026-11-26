@@ -55,11 +55,20 @@ def make(chat_id=1, url="https://example.com/v/1", **kwargs):
 
 
 def force(request_id, **columns):
-    """Put a row in an arbitrary state, bypassing the state machine."""
-    sets = ", ".join(f"{name} = ?" for name in columns)
+    """Put a row in an arbitrary state, bypassing the state machine.
+
+    Forcing ``created_at`` means "submitted then", so the rate-limit slot
+    follows it (``COALESCE(not_before, created_at)``) unless ``slot_at`` is
+    given too.
+    """
+    sets = [f"{name} = ?" for name in columns]
+    params = list(columns.values())
+    if "created_at" in columns and "slot_at" not in columns:
+        sets.append("slot_at = COALESCE(not_before, ?)")
+        params.append(columns["created_at"])
     with db.write() as conn:
         conn.execute(
-            f"UPDATE requests SET {sets} WHERE id = ?", (*columns.values(), request_id)
+            f"UPDATE requests SET {', '.join(sets)} WHERE id = ?", (*params, request_id)
         )
 
 
@@ -389,7 +398,7 @@ EXPECTED_REQUEST_COLUMNS = {
     "processing_finished_at", "processing_duration_seconds", "description",
     "chat_type", "user_id", "normalized_url", "provider", "not_before",
     "attempts", "error_code", "error_message", "sent_message_id",
-    "media_type", "updated_at",
+    "media_type", "updated_at", "slot_at",
 }
 # fmt: on
 
@@ -483,6 +492,7 @@ def test_migrates_a_database_created_by_the_old_code(tmp_path, monkeypatch):
             "idx_requests_chat_created",
             "idx_requests_chat_norm_url_created",
             "idx_requests_chat_message",
+            "idx_requests_chat_status_slot",
             "idx_users_email_norm",
             "idx_processed_messages_chat_message",
             "idx_request_events_request_id",
@@ -503,6 +513,7 @@ def test_migrates_a_database_created_by_the_old_code(tmp_path, monkeypatch):
             assert ISO_RE.match(row["created_at"])
             assert ISO_RE.match(row["updated_at"])
             assert row["attempts"] == 0
+            assert row["slot_at"] == row["created_at"]  # legacy rows: submission
         assert rows[1]["updated_at"] == rows[1]["processing_finished_at"]
         for table in ("request_events", "users", "processed_messages"):
             for (value,) in conn.execute(f"SELECT created_at FROM {table}"):
@@ -578,6 +589,31 @@ def test_fresh_database_has_the_full_schema(db_file):
             conn, "requests"
         )
         assert db._index_exists(conn, "idx_requests_chat_message")
+        assert db._index_exists(conn, "idx_requests_chat_status_slot")
+
+
+def test_migration_3_stores_the_slot_existing_rows_already_had(db_file):
+    plain = make(1, "https://a.b/plain")
+    deferred = make(1, "https://a.b/deferred", not_before=ago(-60))
+    retried = processing(1, "https://a.b/retried")
+    first_start = db.get_request(retried)["processing_started_at"]
+    db.defer_request(retried, ago(-900), reason="429")
+    conn = raw_conn(db_file)  # back to a version 2 database
+    try:
+        conn.execute("DROP INDEX idx_requests_chat_status_slot")
+        conn.execute("ALTER TABLE requests DROP COLUMN slot_at")
+        conn.execute("PRAGMA user_version = 2")
+    finally:
+        conn.close()
+
+    db.init_db()
+    rows = {rid: db.get_request(rid) for rid in (plain, deferred, retried)}
+    assert rows[plain]["slot_at"] == rows[plain]["created_at"]
+    assert rows[deferred]["slot_at"] == rows[deferred]["not_before"]
+    assert rows[retried]["slot_at"] == first_start  # the slot it had consumed
+    with db.connect() as conn:
+        assert db._user_version(conn) == db.SCHEMA_VERSION
+        assert db._index_exists(conn, "idx_requests_chat_status_slot")
 
 
 def test_failed_migration_is_rolled_back_and_raises(tmp_path, monkeypatch):
@@ -761,29 +797,64 @@ def test_init_db_waits_for_a_migration_running_in_another_process(
     assert db.get_request(1)["created_at"] == "2026-11-20T10:00:00.123456+00:00"
 
 
-def test_hot_queries_use_indexes(db_file):
-    claim_sql = (
-        "SELECT * FROM requests WHERE status = ? AND (not_before IS NULL OR"
-        " not_before <= ?) ORDER BY COALESCE(not_before, created_at), id LIMIT 1"
-    )
-    duplicate_sql = (
-        "SELECT * FROM requests WHERE chat_id = ? AND normalized_url = ?"
-        " AND created_at >= ?"
-    )
-    plans = {
-        "claim": (claim_sql, ("queued", db.now_iso())),
-        "message": (
-            "SELECT * FROM requests WHERE chat_id = ? AND original_message_id = ?",
-            (1, 2),
-        ),
-        "duplicate": (duplicate_sql, (1, "u", db.now_iso())),
-    }
+def query_plans(monkeypatch, call):
+    """EXPLAIN QUERY PLAN lines of every SELECT that ``call()`` really runs."""
+    statements = []
+    configure = db._configure
+
+    def traced(conn):
+        configure(conn)
+        conn.set_trace_callback(statements.append)  # SQL with values inlined
+
+    monkeypatch.setattr(db, "_configure", traced)
+    try:
+        call()
+    finally:
+        monkeypatch.setattr(db, "_configure", configure)
+    selects = [sql for sql in statements if sql.lstrip().upper().startswith("SELECT")]
+    assert selects, "nothing was traced"
     with db.connect() as conn:
-        for name, (sql, params) in plans.items():
-            detail = " ".join(
-                row[3] for row in conn.execute(f"EXPLAIN QUERY PLAN {sql}", params)
-            )
-            assert "USING INDEX" in detail or "USING COVERING INDEX" in detail, name
+        return [
+            row[3]
+            for sql in selects
+            for row in conn.execute(f"EXPLAIN QUERY PLAN {sql}")
+        ]
+
+
+def test_hot_queries_use_indexes(db_file, monkeypatch):
+    """The per-submit and per-claim queries read index ranges, never a history."""
+    make(1, "https://a.b/x", original_message_id=7)
+    refused = db.create_request(1, "https://a.b/y", status="rate_limited")
+    status_slot = "idx_requests_chat_status_slot"
+    cases = {
+        "pending cap": (
+            lambda: db.count_active_for_chat(1),
+            [f"USING COVERING INDEX {status_slot} (chat_id=? AND status=?)"],
+        ),
+        "rate windows": (
+            lambda: db.accepted_times(1, ago(3600)),
+            [f"USING INDEX {status_slot} (chat_id=? AND status=? AND slot_at>?)"],
+        ),
+        "message dedupe": (
+            lambda: db.find_request_for_message(1, 7, "https://a.b/x"),
+            ["idx_requests_chat_message (chat_id=? AND original_message_id=?)"],
+        ),
+        "claim": (
+            db.claim_next_request,
+            ["USING INDEX idx_requests_status_not_before (status=?"],
+        ),
+        "requeue": (
+            lambda: db.requeue_requests([refused]),
+            [f"USING INDEX {status_slot} (chat_id=? AND status=?)"],
+        ),
+    }
+    for name, (call, expected) in cases.items():
+        lines = query_plans(monkeypatch, call)
+        for wanted in expected:
+            assert any(wanted in line for line in lines), (name, lines)
+        for line in lines:
+            assert not line.startswith("SCAN"), (name, lines)  # no full scans
+            assert not line.endswith("(chat_id=?)"), (name, lines)  # whole chat
 
 
 # ---------------------------------------------------------------------------
@@ -1191,11 +1262,21 @@ def test_accepted_times_honours_reset_at(db_file):
 
 
 def test_retry_deferral_keeps_the_original_rate_limit_slot(db_file):
-    request_id = processing(1, "https://a.b/retry")
-    started = db.get_request(request_id)["processing_started_at"]
-    db.defer_request(request_id, db.iso_from_ts(time.time() + 900), reason="429")
-    (slot,) = db.accepted_times(1, ago(60))
-    assert slot == pytest.approx(db.ts_from_iso(started), abs=1e-6)
+    request_id = make(1, "https://a.b/retry")
+    submitted = db.ts_from_iso(db.get_request(request_id)["created_at"])
+    assert db.claim_request(request_id)
+    first_retry = time.time() + 30
+    db.defer_request(request_id, db.iso_from_ts(first_retry), reason="timeout")
+    assert db.accepted_times(1, ago(60)) == [pytest.approx(submitted, abs=1)]
+    # claimed again at the retry time, then a long flood wait, then done
+    assert db.claim_request(request_id, now_iso=db.iso_from_ts(first_retry + 1))
+    second_retry = first_retry + 1800
+    db.defer_request(request_id, db.iso_from_ts(second_retry), reason="429")
+    assert db.accepted_times(1, ago(60)) == [pytest.approx(submitted, abs=1)]
+    assert db.claim_request(request_id, now_iso=db.iso_from_ts(second_retry + 1))
+    assert db.accepted_times(1, ago(60)) == [pytest.approx(submitted, abs=1)]
+    assert db.mark_done(request_id)
+    assert db.accepted_times(1, ago(60)) == [pytest.approx(submitted, abs=1)]
 
 
 def test_queue_snapshot(db_file):

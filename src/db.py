@@ -51,7 +51,7 @@ from . import config
 logger = logging.getLogger(__name__)
 
 # Version written to ``PRAGMA user_version`` once every migration has run.
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 # Seconds a connection waits for a lock held by another connection before
 # raising ``sqlite3.OperationalError: database is locked``. Read on every
 # connect, so tests may lower it.
@@ -705,9 +705,40 @@ def _migration_2_queue_and_limits(conn: sqlite3.Connection) -> None:
         )
 
 
+# How the rate-limit slot was derived before schema version 3 stored it. It
+# moved to the retry time once a retried request was claimed again, and it
+# could not be indexed. Only used to fill slot_at for existing rows.
+_LEGACY_SLOT_SQL = """CASE
+    WHEN processing_started_at IS NOT NULL
+         AND processing_started_at < COALESCE(not_before, created_at)
+    THEN processing_started_at
+    ELSE COALESCE(not_before, created_at)
+END"""
+
+
+def _migration_3_rate_slots(conn: sqlite3.Connection) -> None:
+    """Stored rate-limit slot (``requests.slot_at``) and a per-chat index.
+
+    ``slot_at`` is when a request counts in its chat's rate-limit windows. It
+    is set at submission and never moved by claims or retries. The
+    ``(chat_id, status, slot_at)`` index keeps the per-submit reads (pending
+    cap, rate windows, active copies) proportional to the rows they return,
+    not to the chat's whole history.
+    """
+    _add_missing_columns(conn, "requests", {"slot_at": "TEXT"})
+    conn.execute(
+        f"UPDATE requests SET slot_at = {_LEGACY_SLOT_SQL} WHERE slot_at IS NULL"
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_requests_chat_status_slot"
+        " ON requests(chat_id, status, slot_at)"
+    )
+
+
 _MIGRATIONS: tuple[tuple[int, Callable[[sqlite3.Connection], None]], ...] = (
     (1, _migration_1_legacy_baseline),
     (2, _migration_2_queue_and_limits),
+    (3, _migration_3_rate_slots),
 )
 
 
@@ -812,8 +843,9 @@ def _insert_request(
     cur = conn.execute(
         """INSERT INTO requests (chat_id, url, status, created_at, updated_at,
                normalized_url, provider, chat_type, user_id, description,
-               original_message_id, not_before, error_code, error_message, attempts)
-           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)""",
+               original_message_id, not_before, slot_at, error_code, error_message,
+               attempts)
+           VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0)""",
         (
             chat_id,
             url,
@@ -827,6 +859,7 @@ def _insert_request(
             description,
             original_message_id,
             not_before,
+            not_before or now,  # slot_at: deferred at submit = counted then
             error_code,
             _truncate(error_message),
         ),
@@ -1471,39 +1504,28 @@ def count_active_for_chat(chat_id: int) -> int:
     return int(row[0])
 
 
-# Slot of an accepted request in the rate-limit windows: COALESCE(not_before,
-# created_at), but never later than processing_started_at. Requests deferred
-# at submit keep their future slot; a request moved back to the queue by
-# defer_request() (retry) keeps the slot it already consumed instead of
-# occupying a new one in the future.
-_SLOT_SQL = """CASE
-    WHEN processing_started_at IS NOT NULL
-         AND processing_started_at < COALESCE(not_before, created_at)
-    THEN processing_started_at
-    ELSE COALESCE(not_before, created_at)
-END"""
-
-
 def accepted_times(chat_id: int, since_iso: str) -> list[float]:
     """Epoch slots (sorted) of the chat's accepted requests since ``since_iso``.
 
     Accepted = :data:`ACCEPTED_STATUSES`. Rows created before
-    ``chat_limits.reset_at`` are ignored. The slot is
-    ``COALESCE(not_before, created_at)`` (requests deferred at submit count at
-    their ``not_before``), except that a request already started and then
-    deferred again for a retry keeps its ``processing_started_at``.
+    ``chat_limits.reset_at`` are ignored. The slot (``requests.slot_at``) is
+    fixed at submission: ``COALESCE(not_before, created_at)``, so requests
+    deferred at submit count at their ``not_before``. Claims and retries
+    (:func:`defer_request`) never move it.
     """
     since = _canonical_iso(since_iso)
     with connect() as conn:
+        # One index range per status on (chat_id, status, slot_at): only the
+        # window is read. The unary + makes reset_at a plain filter, so the
+        # planner never prefers a created_at range over the whole history.
         rows = conn.execute(
-            f"""SELECT slot FROM (
-                    SELECT {_SLOT_SQL} AS slot, created_at FROM requests
-                    WHERE chat_id = ?
-                      AND status IN ({_marks(len(ACCEPTED_STATUSES))}))
-                WHERE slot >= ?
-                  AND created_at >= COALESCE(
+            f"""SELECT slot_at FROM requests
+                WHERE chat_id = ?
+                  AND status IN ({_marks(len(ACCEPTED_STATUSES))})
+                  AND slot_at >= ?
+                  AND +created_at >= COALESCE(
                       (SELECT reset_at FROM chat_limits WHERE chat_id = ?), '')
-                ORDER BY slot""",
+                ORDER BY slot_at""",
             (chat_id, *ACCEPTED_STATUSES, since, chat_id),
         ).fetchall()
     times: list[float] = []
@@ -2044,7 +2066,7 @@ def _prune_requests(cutoff: str, accepted_cutoff: str) -> tuple[int, int]:
         WHERE created_at < ?
           AND (status IS NULL OR status NOT IN ({active}))
           AND NOT (status IS NOT NULL AND status IN ({accepted})
-                   AND {_SLOT_SQL} >= ?)
+                   AND COALESCE(slot_at, created_at) >= ?)
         ORDER BY id LIMIT ?"""
     params = (
         cutoff,
