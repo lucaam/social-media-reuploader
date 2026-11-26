@@ -292,13 +292,34 @@ Operator) che legge `/metrics` dal Service del bot.
 
 ### Aggiornare da versioni del chart precedenti a 0.2.0
 
+!!! warning "Database su PVC (`db.pvc.enabled=true` con il chart 0.1.x)"
+    Il chart 0.1.x creava il PVC `social-media-reuploader-data` (oppure
+    `<fullnameOverride>-data`; controlla con `kubectl get pvc`) senza
+    l'annotazione `helm.sh/resource-policy: keep`. `helm upgrade` cancella le
+    risorse che spariscono dal manifest: se il PVC cambia nome (i nuovi nomi
+    delle risorse, qui sotto) o viene sostituito da `db.pvc.existingClaim`, il
+    vecchio PVC viene cancellato e con lui, con la reclaim policy `Delete`, il
+    database. Prima dell'upgrade proteggilo:
+
+    ```bash
+    kubectl -n <namespace> annotate pvc social-media-reuploader-data \
+      helm.sh/resource-policy=keep
+    ```
+
+    Poi aggiorna con `fullnameOverride: social-media-reuploader` (o il
+    `fullnameOverride` che usavi) e con gli stessi `db.pvc.size` e
+    `db.pvc.storageClass` di prima: il PVC resta lo stesso e il nuovo chart lo
+    tiene con `keep`. In alternativa, con i nuovi nomi, usa
+    `db.pvc.existingClaim: social-media-reuploader-data`: il PVC protetto resta
+    fuori dalla release (da cancellare a mano quando non serve più). Non usare
+    `db.pvc.existingClaim` senza aver aggiunto l'annotazione.
+
 - I nomi delle risorse sono ora `<release>-social-media-reuploader`, oppure
   solo `<release>` se il nome della release contiene già
   `social-media-reuploader`. Per mantenere i nomi precedenti imposta
   `fullnameOverride: social-media-reuploader`.
-- Il PVC del database è attivo di default. Se usavi già `db.pvc.enabled=true`
-  con un altro nome di release, riusa il vecchio volume con
-  `db.pvc.existingClaim` (oppure con `fullnameOverride`).
+- Il PVC del database è attivo di default. Se usavi già `db.pvc.enabled=true`,
+  segui l'avviso qui sopra prima dell'upgrade.
 - `env.MODE` è `polling` di default; `TELEGRAM_MAX_FILE_SIZE` e gli altri
   numeri sono resi correttamente (prima `5.24288e+07` bloccava l'avvio).
 - Le credenziali della GUI stanno sempre in un Secret: `gui.useSecret` non
