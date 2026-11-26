@@ -392,6 +392,14 @@ async def login_submit(request: Request) -> Response:
     state.limiter.reset(key)
     gui_auth.start_token_session(request.session, state.settings)
     logger.info("Admin-token login from %s", key)
+    plain_http = gui_auth.external_base_url(request).startswith("http://")
+    if state.settings.cookie_secure and plain_http:
+        logger.warning(
+            "Admin-token login from %s over plain HTTP with SESSION_COOKIE_SECURE=true:"
+            " the browser will not store the session cookie (serve the GUI over HTTPS"
+            " or check X-Forwarded-Proto behind a proxy)",
+            key,
+        )
     if as_json:
         principal = Principal(method=AuthMethod.TOKEN, is_admin=True)
         return JSONResponse({"ok": True, "me": principal.public()})

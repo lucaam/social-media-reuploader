@@ -580,7 +580,14 @@
     try {
       await api('login', { method: 'POST', body: { token }, quiet: true, authHandling: false })
       input.value = ''
+      me = null
       await initAuth()
+      if (me && !me.authenticated) {
+        // The token was right, but the next request carried no session cookie.
+        errorEl.textContent = 'Token corretto, ma il browser non ha salvato il cookie di sessione. ' +
+          'Con SESSION_COOKIE_SECURE=true la console va aperta in HTTPS; controlla anche che il browser accetti i cookie di questo sito.'
+        errorEl.hidden = false
+      }
     } catch (e) {
       errorEl.textContent = e instanceof ApiError ? e.detail : 'Errore imprevisto'
       errorEl.hidden = false

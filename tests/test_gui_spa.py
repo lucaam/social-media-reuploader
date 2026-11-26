@@ -29,6 +29,7 @@ from src.gui_auth import AuthSettings
 
 TOKEN = "admin-token-0123456789abcdef"
 BEARER = {"Authorization": f"Bearer {TOKEN}"}
+SAME_ORIGIN = {"Origin": "http://testserver"}
 APP_JS = Path(gui.STATIC_DIR) / "app.js"
 INDEX_HTML = Path(gui.STATIC_DIR) / "index.html"
 # What the console loads at start and on each tab (bare paths, as app.js asks).
@@ -483,6 +484,61 @@ def test_a_failing_scenario_fails_the_test(tmp_path, api):
     routes = snapshot(api, *DEFAULT_GETS)
     with pytest.raises(AssertionError, match="expected"):
         run_spa(tmp_path, "h.eq(1, 2, 'numbers')", routes=routes)
+
+
+# ---------------------------------------------------------------------------
+# Login
+# ---------------------------------------------------------------------------
+LOGIN_WITH_TOKEN = """
+h.ok(!h.el('loginOverlay').hidden, 'the login form is shown')
+h.el('tokenInput').value = 'the-admin-token'
+h.el('tokenForm').dispatch('submit')
+await h.settle()
+const posts = h.calls.filter((call) => call.method === 'POST')
+h.eq(posts.map((call) => [call.path, call.body]), [['login', { token: 'the-admin-token' }]], 'login')
+"""
+
+
+def test_token_login_explains_a_session_cookie_the_browser_dropped(tmp_path, api):
+    anonymous = TestClient(api.app)
+    routes = snapshot(anonymous, "config", "api/me")
+    login = anonymous.post("/login", json={"token": TOKEN}, headers=SAME_ORIGIN)
+    assert login.status_code == 200
+    # e.g. SESSION_COOKIE_SECURE=true on plain HTTP: /api/me stays anonymous
+    routes["POST login"] = {"body": login.json()}
+    run_spa(
+        tmp_path,
+        LOGIN_WITH_TOKEN + """
+        h.ok(!h.el('loginOverlay').hidden, 'still on the login form')
+        h.ok(!h.el('tokenError').hidden, 'an error is shown')
+        h.ok(h.text('tokenError').includes('cookie di sessione'), h.text('tokenError'))
+        h.ok(h.text('tokenError').includes('HTTPS'), h.text('tokenError'))
+        """,
+        routes=routes,
+    )
+
+
+def test_token_login_opens_the_console(tmp_path, api):
+    anonymous = TestClient(api.app)
+    routes = snapshot(api, *DEFAULT_GETS)
+    admin = routes["GET api/me"]
+    routes.update(snapshot(anonymous, "api/me"))
+    login = anonymous.post("/login", json={"token": TOKEN}, headers=SAME_ORIGIN)
+    routes["POST login"] = {"body": login.json()}
+    run_spa(
+        tmp_path,
+        "h.route('POST login', () => { h.route('GET api/me', h.data); return "
+        + json.dumps(routes["POST login"])
+        + " })\n"
+        + LOGIN_WITH_TOKEN
+        + """
+        h.ok(!h.el('app').hidden, 'the console is shown')
+        h.ok(h.el('loginOverlay').hidden, 'no login form')
+        h.ok(h.el('tokenError').hidden, 'no error')
+        """,
+        routes=routes,
+        data=admin,
+    )
 
 
 # ---------------------------------------------------------------------------

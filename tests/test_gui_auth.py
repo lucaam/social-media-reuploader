@@ -441,6 +441,29 @@ def test_secure_cookie_flag_is_configurable():
     assert "; secure" in response.headers["set-cookie"].lower()
 
 
+def test_secure_cookie_over_plain_http_is_reported(caplog):
+    app = gui.create_app(settings(cookie_secure=True))
+    lan = TestClient(app, base_url="http://gui.lan:8081")
+    response = lan.post("/login", json={"token": TOKEN}, headers=lan_origin())
+    assert response.status_code == 200
+    assert "SESSION_COOKIE_SECURE=true" in caplog.text
+    assert "plain HTTP" in caplog.text
+    caplog.clear()
+    behind_tls = {
+        "Origin": "https://gui.example.com",
+        "X-Forwarded-Proto": "https",
+        "X-Forwarded-Host": "gui.example.com",
+    }
+    assert lan.post("/login", json={"token": TOKEN}, headers=behind_tls).is_success
+    plain = TestClient(gui.create_app(settings()), base_url="http://gui.lan:8081")
+    assert plain.post("/login", json={"token": TOKEN}, headers=lan_origin()).is_success
+    assert "plain HTTP" not in caplog.text
+
+
+def lan_origin():
+    return {"Origin": "http://gui.lan:8081"}
+
+
 # ---------------------------------------------------------------------------
 # CSRF / Origin checks
 # ---------------------------------------------------------------------------
