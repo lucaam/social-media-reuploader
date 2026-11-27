@@ -295,6 +295,12 @@ env:
   # Base of the exponential backoff for retryable failures (default 30 s).
   WORKER_RETRY_BACKOFF_SECONDS: null
 
+  # --- Database --------------------------------------------------------------
+  # SQLite journal mode: wal (default; needs a local volume) or delete /
+  # truncate (rollback journal, synchronous=FULL) for a DB volume on NFS/SMB.
+  # A database already in WAL switches as soon as no other connection is open.
+  SQLITE_JOURNAL_MODE: null
+
   # --- Retention ------------------------------------------------------------
   # Days of event log (default 14) / finished requests (default 0 = keep).
   UPDATES_RETENTION_DAYS: null
@@ -343,7 +349,8 @@ db:
     existingClaim: ""
     # Empty: cluster default StorageClass; "-": no StorageClass ("").
     storageClass: ""
-    # SQLite needs a local (block) volume: keep ReadWriteOnce, no NFS.
+    # Keep ReadWriteOnce. In WAL mode (default) SQLite needs a local (block)
+    # volume; on NFS set env.SQLITE_JOURNAL_MODE: delete.
     accessModes:
       - ReadWriteOnce
     size: 1Gi

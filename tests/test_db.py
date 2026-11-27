@@ -322,6 +322,86 @@ def test_db_module_never_broadcasts_to_websockets(db_file, monkeypatch):
     assert calls == []
 
 
+@pytest.mark.parametrize("mode", ["delete", "truncate"])
+def test_rollback_journal_mode_uses_synchronous_full(tmp_path, monkeypatch, mode):
+    path = tmp_path / "data" / "requests.db"
+    monkeypatch.setenv("REQUESTS_DB", str(path))
+    monkeypatch.setattr(db.config, "SQLITE_JOURNAL_MODE", mode)
+    db.init_db()
+    assert make() > 0
+    with db.connect() as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == mode
+        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2  # FULL
+    assert not Path(f"{path}-wal").exists()
+    assert not Path(f"{path}-shm").exists()
+
+
+def test_unknown_journal_mode_falls_back_to_wal(tmp_path, monkeypatch):
+    monkeypatch.setenv("REQUESTS_DB", str(tmp_path / "requests.db"))
+    monkeypatch.setattr(db.config, "SQLITE_JOURNAL_MODE", "off")
+    with db.connect() as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+
+
+def test_wal_database_leaves_wal_once_no_other_connection_is_open(
+    db_file, monkeypatch, caplog
+):
+    # db_file was created in WAL (the default); another process keeps it open.
+    first = make(url="https://example.com/v/before")
+    other = raw_conn(db_file)
+    assert other.execute("SELECT count(*) FROM requests").fetchone()[0] == 1
+    monkeypatch.setattr(db.config, "SQLITE_JOURNAL_MODE", "delete")
+    caplog.set_level("INFO", logger=db.__name__)
+
+    # Busy: the connection stays in WAL (synchronous NORMAL), and works.
+    with db.connect() as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 1
+    second = make(url="https://example.com/v/during")
+    pending = [r for r in caplog.records if "is in WAL mode" in r.getMessage()]
+    assert len(pending) == 1  # warned once, not on every connection
+    assert pending[0].levelname == "WARNING"
+
+    other.close()
+    with db.connect() as conn:
+        assert conn.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+        assert conn.execute("PRAGMA synchronous").fetchone()[0] == 2
+    assert any("switched from WAL" in r.getMessage() for r in caplog.records)
+    assert not Path(f"{db_file}-wal").exists()
+    assert db.get_request(first)["url"] == "https://example.com/v/before"
+    assert db.get_request(second)["url"] == "https://example.com/v/during"
+    # A new connection of another process now opens the file in rollback mode.
+    fresh = raw_conn(db_file)
+    assert fresh.execute("PRAGMA journal_mode").fetchone()[0] == "delete"
+    fresh.close()
+
+
+class _BrokenJournalConnection:
+    """In WAL, and fails with ``error`` when asked to leave it."""
+
+    def __init__(self, error):
+        self.error = error
+
+    def execute(self, sql):
+        if sql == "PRAGMA journal_mode":
+            return _FakeCursor("wal")
+        raise sqlite3.OperationalError(self.error)
+
+
+def test_rollback_journal_switch_raises_errors_other_than_busy(tmp_path):
+    path = str(tmp_path / "x.db")
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O"):
+        db._set_rollback_journal(
+            _BrokenJournalConnection("disk I/O error"), path, "delete"
+        )
+    # Lock contention only postpones the switch.
+    db._set_rollback_journal(
+        _BrokenJournalConnection("database is locked"), path, "delete"
+    )
+    assert path in db._wal_exit_pending
+    db._wal_exit_pending.discard(path)
+
+
 # ---------------------------------------------------------------------------
 # schema & migrations
 # ---------------------------------------------------------------------------
