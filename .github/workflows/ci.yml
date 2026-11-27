@@ -378,11 +378,20 @@ jobs:
 
       # On the merge of the pull request into main, so the tags of main are
       # in its history. (The "commitlint" check tells what the squash merge
-      # releases: this plan counts every commit of the branch.)
+      # releases: this plan counts every commit of the branch.) A re-run of
+      # an old check reuses the old merge commit, so the current main is
+      # added as a second parent: a release made since then is in the
+      # history instead of failing the plan as a tag outside it.
       - name: Plan the release (dry run)
         id: plan
+        env:
+          GIT_AUTHOR_NAME: release dry run
+          GIT_AUTHOR_EMAIL: dry-run@invalid
+          GIT_COMMITTER_NAME: release dry run
+          GIT_COMMITTER_EMAIL: dry-run@invalid
         run: |
-          python scripts/release/version.py plan --summary-file "$GITHUB_STEP_SUMMARY"
+          ref="$(git commit-tree "HEAD^{tree}" -p HEAD -p origin/main -m 'release dry run')"
+          python scripts/release/version.py plan --ref "$ref" --summary-file "$GITHUB_STEP_SUMMARY"
           echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
 
       # The tags of release.yml, for a stable release that moves `latest`.
@@ -516,3 +525,28 @@ jobs:
           done
           jq -e '.SPDX.spdxVersion' "$RUNNER_TEMP/SBOM.json"
           jq -e '.SLSA.buildDefinition.buildType' "$RUNNER_TEMP/Provenance.json"
+
+  # One stable, non-matrix check that sums up the release dry run, so it can
+  # be made required (the per-platform names of a skipped matrix job are
+  # never reported, so they would stay pending forever). Skipped dry runs
+  # (no release/docker change) pass; a failed or cancelled leg fails it. With
+  # it required, Renovate's yt-dlp automerge also waits for both image builds.
+  release-dry-run-result:
+    name: Release dry run
+    needs: [release-dry-run, release-dry-run-image]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    steps:
+      - name: Every dry-run job passed or was skipped
+        env:
+          RESULTS: ${{ join(needs.*.result, ' ') }}
+        run: |
+          for result in $RESULTS; do
+            case "$result" in
+              success|skipped) ;;
+              *) echo "::error::release dry run: $result"; exit 1 ;;
+            esac
+          done
+          echo "release dry run: $RESULTS"

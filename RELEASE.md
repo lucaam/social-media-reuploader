@@ -170,10 +170,13 @@ quando non ci sono release in corso.
    (actionlint)`, `Build Docker image (test)`, `Determine changed areas`,
    `commitlint`) hanno ancora gli stessi nomi; facoltativo `Docs build
    (mkdocs --strict)`. Nei metodi di merge consentiti lascia solo `squash`.
-   I check `Release dry run (...)` (piano, chart e immagine `linux/amd64` e
-   `linux/arm64` come li costruisce la release) non vanno resi obbligatori:
-   girano solo sulle PR che toccano immagine o release, e un job a matrice
-   saltato non riporta i nomi per piattaforma, quindi un check obbligatorio
+   Aggiungi agli obbligatori **`Release dry run`**: riassume la prova della
+   release (piano, chart e immagine `linux/amd64` e `linux/arm64` come li
+   costruisce la release) e passa anche quando la prova viene saltata (PR che
+   non toccano immagine o release), quindi non resta mai in attesa. Così anche
+   l'automerge di Renovate per yt-dlp aspetta che entrambe le immagini si
+   costruiscano. Non rendere obbligatori i singoli `Release dry run (...)`:
+   un job a matrice saltato non riporta i nomi per piattaforma e il check
    resterebbe in attesa.
 3. *Packages* (dopo la prima release): rendi pubblico il package
    `charts/social-media-reuploader` (*Package settings → Change visibility*) e
@@ -229,9 +232,14 @@ quando non ci sono release in corso.
   mano su un altro branch: controllalo (`git branch -r --contains vX.Y.Z`,
   pagina delle release). Se non ha una release pubblicata cancellalo
   (`git push --delete origin vX.Y.Z`, disattivando il ruleset dei tag) e
-  rilancia il workflow. **Non cancellare mai il tag di una release
-  pubblicata**: se è una release vera, rilascia sopra di essa con un avvio
-  manuale e un `bump` sufficiente.
+  rilancia il workflow. **Non cancellare il tag di una release pubblicata**
+  finché esiste un'alternativa: se il tag fuori da `main` ha la stessa
+  versione major dell'ultima release di `main`, rilascia sopra di esso con
+  un avvio manuale e un `bump` sufficiente. Se ha una major più alta (es.
+  `v2.0.0` fuori da `main` con `main` a `v1.3.0`) nessun `bump` lo supera:
+  l'unica uscita è cancellare quel tag (disattivando il ruleset dei tag),
+  ricreare a mano la sua release se serve, e rilanciare il workflow. Il
+  ruleset dei tag del punto 5 serve proprio a evitarlo.
 - *`vX.Y.Z (...) is not in the history of ...: only a release of main can be
   published again`*: si ripubblicano solo i tag di `main` (il gate viene
   saltato).

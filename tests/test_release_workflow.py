@@ -236,3 +236,22 @@ def test_the_guard_fails_closed(guard):
         result = guard(tag)
         assert result.returncode == 1
         assert "::error::no release tag in the plan" in result.stdout
+
+
+def test_the_dry_run_has_one_stable_check_that_can_be_required():
+    result = CI["release-dry-run-result"]
+    assert result["name"] == "Release dry run"  # no matrix: always reported
+    assert set(result["needs"]) == {"release-dry-run", "release-dry-run-image"}
+    assert "!cancelled()" in result["if"]  # runs (and passes) when they skip
+    assert result["permissions"] == {}
+    [script] = scripts(result)
+    assert "success|skipped" in script and "exit 1" in script
+
+
+def test_the_dry_run_plans_on_the_current_main():
+    # A re-run reuses the old merge commit: main is added as a second parent
+    # so a release published since then is in the history.
+    plan = step(CI["release-dry-run"], "plan")
+    assert "-p HEAD -p origin/main" in plan["run"]
+    assert '--ref "$ref"' in plan["run"]
+    assert {"GIT_AUTHOR_NAME", "GIT_COMMITTER_EMAIL"} <= set(plan["env"])
