@@ -1126,6 +1126,44 @@ def test_defer_request_moves_back_to_the_queue(db_file):
     assert db.defer_request(request_id, until) is False
 
 
+def test_release_sending_gives_a_claimed_upload_back_to_the_queue(db_file):
+    request_id = processing()
+    until = db.iso_from_ts(time.time() + 600)
+    assert db.release_sending(request_id, until) is False  # not claimed yet
+    assert db.mark_sending(request_id)
+    assert db.release_sending(request_id, until, reason="429")
+    row = db.get_request(request_id)
+    assert row["status"] == "queued" and row["not_before"] == until
+    assert history(request_id) == ["processing", "sending", "deferred"]
+    (released,) = [e for e in events("request_status") if e.get("released")]
+    assert released["previous"] == "sending" and released["status"] == "queued"
+    reclaimed = db.claim_next_request(now_iso=db.iso_from_ts(time.time() + 601))
+    assert reclaimed["id"] == request_id and reclaimed["attempts"] == 2
+    for terminal in ("done", "failed", "cancelled"):
+        force(request_id, status=terminal)
+        assert db.release_sending(request_id, until) is False
+
+
+def test_release_sending_keeps_the_original_rate_limit_slot(db_file):
+    request_id = make(1, "https://a.b/released")
+    submitted = db.ts_from_iso(db.get_request(request_id)["created_at"])
+    assert db.claim_request(request_id) and db.mark_sending(request_id)
+    db.release_sending(request_id, db.iso_from_ts(time.time() + 1800))
+    assert db.accepted_times(1, ago(60)) == [pytest.approx(submitted, abs=1)]
+
+
+def test_unclaim_sending_returns_the_row_to_processing(db_file):
+    request_id = processing()
+    assert db.unclaim_sending(request_id) is False  # only from 'sending'
+    assert db.mark_sending(request_id)
+    assert db.unclaim_sending(request_id, reason="URL fetch refused")
+    row = db.get_request(request_id)
+    assert row["status"] == "processing" and row["attempts"] == 1
+    assert history(request_id) == ["processing", "sending", "unclaimed"]
+    assert db.mark_sending(request_id)  # claimed again for the local upload
+    assert db.mark_done(request_id)
+
+
 def test_set_request_fields_is_whitelisted(db_file):
     request_id = make()
     db.set_request_fields(request_id, compressed=False, provider="Reddit")

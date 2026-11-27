@@ -3,38 +3,42 @@
 :class:`src.worker.WorkerPool` claims a ``queued`` row (it becomes
 ``processing``) and runs :meth:`RequestProcessor.run` for it::
 
-    👀 -> fetch_info -> [Telegram URL fetch] -> download -> prepare_for_telegram
-       -> thumbnail -> mark_sending -> send -> mark_done -> 🏆 -> cleanup
+    👀 -> fetch_info -> [mark_sending -> Telegram URL fetch] -> download
+       -> prepare_for_telegram -> thumbnail -> mark_sending -> send
+       -> mark_done -> 🏆 -> cleanup
 
 Every attempt ends with exactly one outcome (:class:`Outcome`):
 
 * ``done``: delivered, ``mark_done`` (sizes, sent message id, media type).
 * ``retry``: a retryable error (``DownloadError.retryable``, or a Telegram
-  flood wait seen before anything was uploaded: at start or on the URL
-  fetch) with attempts left: ``defer_request`` with exponential backoff (at
-  least the flood wait). A flood wait during a claimed upload is waited out
-  in place (bounded), because a ``sending`` row cannot go back to the queue.
+  flood wait / a connection that never reached Telegram) with attempts left:
+  the row goes back to the queue with exponential backoff (at least the flood
+  wait): ``defer_request`` before the upload was claimed, ``release_sending``
+  for a claimed upload that certainly did not reach Telegram (a short flood
+  wait during an upload is first waited out in place).
 * ``failed``: ``mark_failed(error_code)``; the user gets 🍌 plus, in private
   chats, the Italian explanation (groups only get a text for ``too_large``,
   which carries the original link, or when the chat refuses the 🍌).
 * ``skipped``: ``mark_sending`` refused (the row was cancelled, deleted or
   already handled): nothing is sent.
 * interrupted (the task is cancelled by a shutdown): the row goes back to the
-  queue, or to ``failed``/``interrupted_while_sending`` when an upload may
-  already have reached Telegram (``failed``/``interrupted`` when the upload
-  was claimed but nothing was sent: a claimed row cannot be requeued); the
-  👀 of a request that is over is removed; the ``CancelledError`` propagates.
+  queue (also when its upload was claimed but nothing was sent), or to
+  ``failed``/``interrupted_while_sending`` when an upload may already have
+  reached Telegram; the 👀 of a request that is over is removed; the
+  ``CancelledError`` propagates.
 
 Outcome writes are retried on database errors; one the database keeps
 refusing is returned as ``JobResult.settlement`` and written later by the
 worker pool (the user already got the outcome), so no row stays active.
 
-Nothing is ever posted twice on purpose: local uploads are claimed with
-``mark_sending`` first (a refusal means: do not send); the Telegram URL fetch
-runs while the row is still ``processing`` (so a refusal can fall back to a
-download or be retried) but counts as in flight; ambiguous failures
-(timeouts, disconnects, 5xx: Telegram may have posted) are never retried; and
-once something was delivered no error can send the request back to the queue.
+Nothing is ever posted twice on purpose: every send (local upload or
+Telegram URL fetch) is claimed with ``mark_sending`` first (a refusal means:
+do not send), so a request whose post may exist is never requeued, not even
+by the recovery at the next start; a URL fetch Telegram refused without
+posting gives the claim back (``unclaim_sending``) and falls back to a local
+download; ambiguous failures (timeouts, disconnects, 5xx: Telegram may have
+posted) are never retried; and once something was delivered no error can
+send the request back to the queue.
 """
 
 from __future__ import annotations
@@ -69,11 +73,12 @@ MAX_ALBUM_ITEMS = telegram_api.MAX_MEDIA_GROUP
 # Retry backoff for retryable errors: base * 2 ** (attempt - 1), capped.
 DEFAULT_RETRY_BACKOFF_SECONDS = 30.0
 MAX_RETRY_BACKOFF_SECONDS = 15 * 60.0
-# Uploads claimed with mark_sending cannot go back to the queue: a flood wait
-# (429) or a connection failure that certainly did not reach Telegram is
-# retried in place, at most this many extra times and waiting at most this long.
+# A claimed upload refused by a flood wait (429) or a connection failure that
+# certainly did not reach Telegram is retried in place when the wait is short
+# (the converted file is ready); a longer wait gives the claim back with
+# db.release_sending and the request is retried later (see _failed).
 UPLOAD_EXTRA_ATTEMPTS = 1
-MAX_UPLOAD_WAIT_SECONDS = 300.0
+MAX_UPLOAD_WAIT_SECONDS = 30.0
 UPLOAD_RETRY_DELAY_SECONDS = 15.0
 # Best-effort Telegram calls made while a job is being cancelled.
 CANCEL_CLEANUP_SECONDS = 5.0
@@ -746,12 +751,17 @@ class RequestProcessor:
     async def _server_fetch(self, item: MediaItem) -> JobResult | None:
         """Let Telegram fetch the URL itself; None = fall back to a download.
 
-        The row stays ``processing`` (so a refusal can still fall back or be
-        retried); the send counts as in flight for the cancellation handler.
+        Claimed with ``mark_sending`` like a local upload, so that a post
+        whose ``mark_done`` is lost (crash, database down at shutdown) is never
+        posted again by the next start. A refusal that certainly posted
+        nothing gives the claim back (``unclaim_sending``) and the job goes on
+        with a local download; a flood wait goes back to the queue.
         """
-        row = await db.aio(db.get_request, self.request.id)
-        if row is None or row.get("status") != db.Status.PROCESSING:
-            return await self._skipped("the request is no longer processing")
+        # Its thread commits even if the job is cancelled meanwhile.
+        self._claim_started = True
+        if not await db.aio(db.mark_sending, self.request.id):
+            return await self._skipped("mark_sending refused")
+        self._sending = True
         self._stage(Stage.SERVER_FETCH)
         self._method = "server_fetch"
         caption = messages.caption(self.request.description)
@@ -786,8 +796,18 @@ class RequestProcessor:
         not_sent = getattr(failure, "not_sent", True)
         if not not_sent or isinstance(failure, SendForbidden) or failure.retryable:
             # Unknown outcome (never post a second copy), the bot cannot post
-            # here at all, or a flood wait: a local upload would fare no better.
+            # here at all, or a flood wait (back to the queue, see _failed): a
+            # local upload would fare no better.
             raise failure
+        # Telegram refused to fetch the URL and posted nothing.
+        if not await db.aio(
+            db.unclaim_sending,
+            self.request.id,
+            reason=f"Telegram could not fetch the URL: {failure.detail}"[:500],
+        ):
+            return await self._skipped("the request is no longer sending")
+        self._sending = False
+        self._claim_started = False
         logger.info(
             "Request %s: Telegram could not fetch the URL (%s); downloading it",
             self.request.id,
@@ -1071,11 +1091,12 @@ class RequestProcessor:
             )
         phase = self._phase(err)
         max_attempts = int(setting("WORKER_MAX_ATTEMPTS"))
-        if err.retryable and not self.maybe_posted and request.attempts < max_attempts:
+        requeue = self._requeue_transition(err)
+        if err.retryable and requeue is not None and request.attempts < max_attempts:
             delay = retry_delay(request.attempts, getattr(err, "retry_after", None))
             retry_at = time.time() + delay
             write = functools.partial(
-                db.defer_request,
+                requeue,
                 request.id,
                 db.iso_from_ts(retry_at),
                 reason=f"{err.code}: {err.detail}"[:500],
@@ -1122,6 +1143,25 @@ class RequestProcessor:
             error_phase=phase,
             settlement=_settlement(request.id, "failed", write, failed),
         )
+
+    def _requeue_transition(self, err: DownloadError) -> Callable[..., bool] | None:
+        """How this attempt can go back to the queue, or None when it cannot.
+
+        Before the upload was claimed: ``defer_request``. A claimed upload
+        only when Telegram certainly has no post of it (it answered with a
+        flood wait or the connection never reached it): ``release_sending``.
+        """
+        if not self.maybe_posted:
+            return db.defer_request
+        if (
+            self._sending
+            and not self._send_in_flight
+            and not self._delivered
+            and isinstance(err, SendFailed)
+            and err.not_sent
+        ):
+            return db.release_sending
+        return None
 
     async def _report_failure(self, err: DownloadError) -> None:
         """🍌, plus the explanation in private chats (groups: too_large only,
@@ -1194,17 +1234,16 @@ class RequestProcessor:
         ):
             return "back in the queue", False
         # Not 'processing': the upload was claimed (mark_sending may also have
-        # landed while the job was being cancelled), yet nothing was sent. A
-        # 'sending' row cannot go back to the queue: fail it saying so (an
-        # admin can requeue it) instead of leaving it to the next start, which
-        # would call it interrupted while uploading.
+        # landed while the job was being cancelled), yet nothing was sent:
+        # give the claim back instead of leaving it to the next start, which
+        # would call it interrupted while uploading and never retry it.
         if (self._sending or self._claim_started) and await db.aio(
-            db.mark_failed,
+            db.release_sending,
             request_id,
-            error_code="interrupted",
-            error_message="worker stopped before anything was uploaded; not resent",
+            db.now_iso(),
+            reason="worker stopped before anything was uploaded",
         ):
-            return "nothing uploaded, but a claimed upload cannot be requeued", True
+            return "back in the queue (nothing was uploaded)", False
         return "not requeued: the row was no longer processing", False
 
     async def _cleanup(self) -> None:

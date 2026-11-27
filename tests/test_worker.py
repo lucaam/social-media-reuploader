@@ -599,6 +599,63 @@ def test_server_side_fetch_refused_falls_back_to_a_local_upload(env):
     assert row["status"] == "done"
 
 
+def test_server_side_fetch_is_claimed_before_the_send(env, monkeypatch):
+    env.site.items = [make_item(1, direct_url=DIRECT, filesize=5 * MIB)]
+    request_id = new_request()
+    seen = []
+    fake = telegram_api.send_video
+
+    async def send_video(token, chat_id, video, **kwargs):
+        seen.append(db.get_request(request_id)["status"])
+        return await fake(token, chat_id, video, **kwargs)
+
+    monkeypatch.setattr(telegram_api, "send_video", send_video)
+    result = run(process(claim(request_id)))
+    assert result.method == "server_fetch"
+    assert seen == ["sending"]  # a post never exists for a 'processing' row
+    assert status(request_id) == "done"
+
+
+def test_server_side_fetch_whose_outcome_is_lost_is_not_posted_again(env, monkeypatch):
+    # Delivered by Telegram, but mark_done never lands (DB down, then a
+    # crash): the next start must not requeue it (it is 'sending', not
+    # 'processing'), so the video is not posted a second time.
+    env.site.items = [make_item(1, direct_url=DIRECT, filesize=5 * MIB)]
+    monkeypatch.setattr(pipeline, "OUTCOME_WRITE_BACKOFF_SECONDS", 0.0)
+
+    def refuse(*args, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(db, "mark_done", refuse)
+    request_id = new_request()
+    result = run(process(claim(request_id)))
+    assert result.method == "server_fetch"
+    assert status(request_id) == "sending"
+    counts = db.recover_interrupted(rehydrate=True, max_attempts=3)
+    assert counts["requeued"] == 0
+    row = db.get_request(request_id)
+    assert (row["status"], row["error_code"]) == (
+        "failed",
+        "interrupted_while_sending",
+    )
+    assert len(env.tg.uploads()) == 1
+
+
+def test_server_side_fetch_refusal_gives_the_claim_back(env):
+    env.site.items = [make_item(1, direct_url=DIRECT, filesize=5 * MIB)]
+    env.tg.respond(
+        "send_video",
+        {"ok": False, "error_code": 400, "description": "Bad Request: wrong type"},
+    )
+    _, row = process_new()
+    events = [e["event_type"] for e in reversed(db.get_request_events(row["id"]))]
+    # claimed for the URL fetch, given back, claimed again for the upload
+    assert events.count("sending") == 2
+    assert "unclaimed" in events
+    assert events.index("unclaimed") < len(events) - 1
+    assert row["status"] == "done"
+
+
 def test_server_side_fetch_with_unknown_outcome_is_never_resent(env):
     env.site.items = [make_item(1, direct_url=DIRECT, filesize=5 * MIB)]
     env.tg.respond(
@@ -833,7 +890,9 @@ def test_upload_flood_wait_is_retried_in_place(env):
     assert row["status"] == "done"
 
 
-def test_long_upload_flood_wait_fails_without_resending(env):
+def test_long_upload_flood_wait_gives_the_claim_back_to_the_queue(env):
+    # A flood wait means Telegram posted nothing: the claimed upload goes back
+    # to the queue (release_sending) instead of failing, and frees the slot.
     env.tg.respond(
         "send_video",
         {
@@ -843,11 +902,42 @@ def test_long_upload_flood_wait_fails_without_resending(env):
             "parameters": {"retry_after": 3600},
         },
     )
-    _, row = process_new()
+    before = time.time()
+    result, row = process_new()
     assert len(env.tg.of("send_video")) == 1
-    assert row["status"] == "failed"
-    assert row["error_code"] == "send_failed"
-    assert env.tg.texts() == [messages.failure("send_failed", kind="video")]
+    assert result.outcome == pipeline.Outcome.RETRY
+    assert row["status"] == "queued"
+    assert db.ts_from_iso(row["not_before"]) >= before + 3599
+    assert env.tg.texts() == []  # no failure message for a retry
+    assert env.tg.reactions() == ["👀"]
+
+
+def test_upload_connection_failure_is_retried_later(env, monkeypatch):
+    # The connection never reached Telegram (twice): requeued, never failed.
+    monkeypatch.setattr(pipeline, "UPLOAD_RETRY_DELAY_SECONDS", 0.01)
+    refused = {
+        "ok": False,
+        "description": "network error: ClientConnectorError: Cannot connect",
+    }
+    env.tg.respond("send_video", refused, refused)
+    result, row = process_new()
+    assert len(env.tg.of("send_video")) == 2  # one in-place retry
+    assert result.outcome == pipeline.Outcome.RETRY
+    assert row["status"] == "queued"
+    events = [event["event_type"] for event in db.get_request_events(row["id"])]
+    assert events[0] == "deferred"  # newest first
+
+
+def test_upload_given_back_after_the_last_attempt_fails(env, monkeypatch):
+    monkeypatch.setattr(pipeline, "UPLOAD_RETRY_DELAY_SECONDS", 0.01)
+    refused = {"ok": False, "description": "network error: ClientConnectorError: x"}
+    env.tg.respond("send_video", refused, refused)
+    request_id = new_request()
+    force(request_id, attempts=2)  # the claim makes it the 3rd and last
+    result = run(process(claim(request_id)))
+    row = db.get_request(request_id)
+    assert result.outcome == pipeline.Outcome.FAILED
+    assert (row["status"], row["error_code"]) == ("failed", "send_failed")
 
 
 @pytest.mark.parametrize(
@@ -1191,12 +1281,12 @@ def cancel_during_mark_sending(env, monkeypatch, *, commit_first):
 
 def test_claim_landing_during_a_cancellation_does_not_strand_the_row(env, monkeypatch):
     row = cancel_during_mark_sending(env, monkeypatch, commit_first=True)
-    # A 'sending' row cannot be requeued, but it must not stay 'sending' (a
-    # pending slot, then "interrupted while uploading" at the next start).
-    assert (row["status"], row["error_code"]) == ("failed", "interrupted")
-    assert "before anything was uploaded" in row["error_message"]
+    # The claim landed but nothing was uploaded: the claim is given back
+    # (release_sending), so the request is processed again instead of staying
+    # 'sending' (a pending slot, then "interrupted while uploading").
+    assert row["status"] == "queued"
     assert env.tg.uploads() == []
-    assert env.tg.reactions() == ["👀", None]
+    assert env.tg.reactions() == ["👀"]  # it will be processed again
 
 
 def test_cancellation_before_the_claim_lands_requeues_the_row(env, monkeypatch):

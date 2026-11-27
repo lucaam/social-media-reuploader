@@ -1298,6 +1298,54 @@ def defer_request(
         )
 
 
+def release_sending(
+    request_id: int, not_before_iso: str, *, reason: str | None = None
+) -> bool:
+    """``sending`` -> ``queued`` with ``not_before``: give back a claimed upload.
+
+    Only for uploads that certainly did not reach Telegram (a flood wait, a
+    connection that never got to it, the worker stopping before it sent
+    anything): the request is retried later instead of failing. Keeps the
+    rate-limit slot like :func:`defer_request`.
+    """
+    now = _utc_now()
+    not_before = _canonical_iso(not_before_iso)
+    details = f"until {not_before}" + (f": {reason}" if reason else "")
+    with write() as conn:
+        return _apply_transition(
+            conn,
+            _fetch_request(conn, request_id),
+            allowed_from=(Status.SENDING,),
+            to_status=Status.QUEUED,
+            now=now,
+            assignments={"not_before": not_before},
+            history="deferred",
+            details=details,
+            extra={"not_before": not_before, "reason": reason, "released": True},
+        )
+
+
+def unclaim_sending(request_id: int, *, reason: str | None = None) -> bool:
+    """``sending`` -> ``processing``: give back the upload claim in the same attempt.
+
+    For a send that Telegram refused without posting anything (it could not
+    fetch the URL itself): the worker goes on with a local download and claims
+    the upload again with :func:`mark_sending`.
+    """
+    now = _utc_now()
+    with write() as conn:
+        return _apply_transition(
+            conn,
+            _fetch_request(conn, request_id),
+            allowed_from=(Status.SENDING,),
+            to_status=Status.PROCESSING,
+            now=now,
+            history="unclaimed",
+            details=reason,
+            extra={"reason": reason},
+        )
+
+
 def set_request_fields(request_id: int, **fields: Any) -> None:
     """Update whitelisted non-status columns (see ``_SETTABLE_FIELDS``).
 
