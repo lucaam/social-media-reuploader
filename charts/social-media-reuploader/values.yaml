@@ -406,7 +406,7 @@ gui:
     # Comma-separated IdP groups that are GUI admins.
     oauthAdminGroups: ""
   # Extra GUI environment variables (not secrets), e.g.
-  #   SESSION_COOKIE_SECURE: true    # GUI served over HTTPS
+  #   SESSION_COOKIE_SECURE: true    # default auto: Secure on HTTPS (proxy trusted via forwardedAllowIps)
   #   SESSION_MAX_AGE_SECONDS: 43200 # session lifetime (default 12 h)
   #   GUI_TRUSTED_ORIGINS: https://admin.example.com  # proxy rewrites Host
   #   OAUTH_ISSUER: https://idp.example.com          # without discovery

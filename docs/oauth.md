@@ -18,7 +18,7 @@ che, o in aggiunta a, `ADMIN_TOKEN`.
 | `OAUTH_ADMIN_GROUPS` | Gruppi del provider (separati da virgola) i cui membri sono amministratori. Gli altri utenti sono amministratori solo se registrati con ruolo `admin` nella GUI. |
 | `OAUTH_ASSUME_EMAIL_VERIFIED` | Il ruolo `admin` registrato nella GUI vale solo per e-mail con `email_verified=true`. Con provider che non inviano il claim ma restituiscono solo e-mail verificate (GitHub) imposta `true`. Non con Microsoft Entra ID, il cui claim `email` non è verificato: usa i gruppi (`OAUTH_ADMIN_GROUPS`). |
 | `SECRET_KEY` | Chiave dei cookie di sessione, almeno 32 caratteri casuali. |
-| `SESSION_COOKIE_SECURE` | `true` quando la GUI è in HTTPS. |
+| `SESSION_COOKIE_SECURE` | `auto` (default): `Secure` quando la richiesta arriva in HTTPS tramite il proxy fidato; `true` lo forza. |
 
 ## Registrare il client
 
@@ -96,7 +96,10 @@ schema e host pubblici:
   proxy>` (il chart lo fa già, vedi `gui.forwardedAllowIps`; in Docker usa la
   variabile `FORWARDED_ALLOW_IPS` di uvicorn, che `docker-compose.yml` prende
   dal file `.env`: vedi [Deploy](deploy.md#docker-compose));
-- imposta `SESSION_COOKIE_SECURE=true`.
+- lascia `SESSION_COOKIE_SECURE=auto` (il cookie diventa `Secure` appena
+  uvicorn si fida del proxy) o forzalo con `true`.
+
+Il login usa PKCE (S256) oltre al client secret.
 
 Senza questi accorgimenti il provider riceve un redirect URI `http://...` e
 rifiuta il login con "redirect_uri mismatch".

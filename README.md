@@ -252,7 +252,7 @@ mappa `env` di `values.yaml` (numeri e booleani vengono resi come stringhe).
 |---|---|---|
 | `SECRET_KEY` | obbligatorio | Chiave che firma i cookie di sessione: almeno 32 caratteri casuali (`openssl rand -hex 32`). Cambiarla chiude tutte le sessioni. |
 | `ADMIN_TOKEN` | – | Token di accesso amministratore (login con token o header `Authorization: Bearer`). Necessario se OAuth non è configurato. |
-| `SESSION_COOKIE_SECURE` | – | `true` quando la GUI è servita in HTTPS (cookie di sessione `Secure`); `false` per l'HTTP in locale. |
+| `SESSION_COOKIE_SECURE` | `auto` | `auto`: il cookie di sessione è `Secure` quando la richiesta arriva in HTTPS (direttamente o da un reverse proxy fidato, vedi `FORWARDED_ALLOW_IPS`); `true`/`false` lo forzano. |
 | `SESSION_MAX_AGE_SECONDS` | `43200` (12 h) | Durata massima di una sessione della GUI (300-604800). |
 | `GUI_TRUSTED_ORIGINS` | – | Origin aggiuntive (separate da virgola, es. `https://admin.example.com`) accettate per le richieste che modificano dati e per il WebSocket, quando un proxy riscrive l'header `Host`. |
 | `OAUTH_CLIENT_ID` | – | Client ID OAuth2 / OpenID Connect. |
@@ -285,9 +285,12 @@ mappa `env` di `values.yaml` (numeri e booleani vengono resi come stringhe).
   (`podAffinity` obbligatoria su `kubernetes.io/hostname`). Niente NFS.
 - **Accesso alla GUI.** La GUI richiede una `SECRET_KEY` robusta (chi la conosce
   può firmare sessioni da amministratore) e `ADMIN_TOKEN` oppure OAuth per il
-  login. Esponila solo in HTTPS (con
-  `SESSION_COOKIE_SECURE=true`) dietro un reverse proxy; con OAuth imposta
-  `OAUTH_REDIRECT_URI`. Docker Compose pubblica le porte solo su `127.0.0.1`.
+  login. Esponila solo in HTTPS dietro un reverse proxy fidato da uvicorn
+  (il cookie di sessione diventa `Secure` da solo; `SESSION_COOKIE_SECURE=true`
+  lo forza); con OAuth imposta `OAUTH_REDIRECT_URI`. Le sessioni sono salvate
+  nel database: l'uscita e il pulsante "Termina" nella scheda Utenti le
+  chiudono davvero, anche se il cookie fosse stato copiato. Docker Compose
+  pubblica le porte solo su `127.0.0.1`.
 - **Health e metriche.** Il bot espone `/health` e `/metrics` (Prometheus) su
   `PORT` sia in polling sia in webhook; la GUI espone `/health`. Non pubblicare
   `/metrics` su Internet: in webhook instrada verso il bot solo `WEBHOOK_PATH`.

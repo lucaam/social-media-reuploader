@@ -83,9 +83,10 @@ services:
       SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY to a long random string, e.g. openssl rand -hex 32}
       # Token login (needed unless OAuth is configured)
       ADMIN_TOKEN:
-      # Plain HTTP here: the session cookie must not be Secure-only. Set it to
-      # true when the GUI is served over HTTPS.
-      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-false}
+      # auto: the session cookie is Secure when the request arrives over HTTPS
+      # (directly or from a proxy trusted through FORWARDED_ALLOW_IPS), plain
+      # otherwise; true/false force it.
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-auto}
       # Behind a reverse proxy: the address the proxy connects from (uvicorn
       # trusts X-Forwarded-* only from it; default 127.0.0.1, i.e. nobody here),
       # so that client IPs (login throttling, logs) and the scheme are right.

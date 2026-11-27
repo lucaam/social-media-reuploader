@@ -67,8 +67,9 @@ docker compose logs -f bot
   GUI si ferma all'avvio anche senza `ADMIN_TOKEN` o una configurazione OAuth
   completa.
 - Le porte sono pubblicate solo su `127.0.0.1` (`BIND_ADDRESS` per cambiarlo):
-  per esporre la GUI usa un reverse proxy con HTTPS e imposta
-  `SESSION_COOKIE_SECURE=true`.
+  per esporre la GUI usa un reverse proxy con HTTPS (con `FORWARDED_ALLOW_IPS`
+  il cookie di sessione diventa `Secure` da solo; `SESSION_COOKIE_SECURE=true`
+  lo forza).
 - Dietro il reverse proxy imposta nel file `.env` anche `FORWARDED_ALLOW_IPS`
   con l'indirizzo da cui il proxy si collega alla GUI (è quello che compare nei
   log di accesso della GUI; con il proxy sullo stesso host e le porte su

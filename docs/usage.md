@@ -121,7 +121,11 @@ Accesso:
 - **OAuth2 / OpenID Connect**: vedi [OAuth](oauth.md).
 
 La GUI richiede sempre una `SECRET_KEY` robusta (firma i cookie di sessione).
-Servita in HTTPS, imposta `SESSION_COOKIE_SECURE=true`.
+Servita in HTTPS il cookie diventa `Secure` da solo (`SESSION_COOKIE_SECURE=auto`,
+il default, quando uvicorn si fida del reverse proxy); `true` lo forza.
+Le sessioni sono salvate nel database: l'uscita le termina davvero e dalla
+scheda Utenti puoi vedere le sessioni attive e chiuderle (anche tutte tranne
+la tua).
 
 ## Health check e metriche
 
