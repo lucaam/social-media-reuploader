@@ -23,6 +23,15 @@
       "matchStrings": [
         "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: extractVersion=(?<extractVersion>\\S+))?\\s+[A-Z0-9_]+: [\"']?(?<currentValue>[^\"'\\s]+)"
       ]
+    },
+    {
+      "customType": "regex",
+      "description": "Build images of the workflows pinned by digest (BuildKit, its SBOM generator), after a `# renovate: datasource=docker` comment",
+      "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/"],
+      "matchStrings": [
+        "# renovate: datasource=docker\\s+[A-Z0-9_]+: (?<depName>[^:\\s]+):(?<currentValue>[^@\\s]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker"
     }
   ],
   "packageRules": [
@@ -85,9 +94,9 @@
       "schedule": ["* 0-5 * * 1"]
     },
     {
-      "description": "yt-dlp: sites break often and its fixes must ship without a human. Automerged (squash) once the required checks pass, which releases a patch",
+      "description": "yt-dlp: sites break often and its fixes must ship without a human. Automerged (squash) once the required checks pass, which releases a patch. Its versions are dates (CalVer): the first release of a year is a 'major' update for Renovate, merged like the others",
       "matchPackageNames": ["yt-dlp"],
-      "matchUpdateTypes": ["minor", "patch"],
+      "matchUpdateTypes": ["major", "minor", "patch"],
       "automerge": true,
       "automergeType": "pr",
       "automergeStrategy": "squash",
