@@ -415,6 +415,30 @@ def _first_message_id(result: Mapping[str, Any]) -> int | None:
     return None
 
 
+# Providers already told about (once per process) in the cookies hint below.
+_cookie_hints: set[str] = set()
+
+
+def _hint_cookies(provider: str | None) -> None:
+    """Operator hint, once per provider: a login wall needs a cookies.txt.
+
+    yt-dlp's own text names its command-line flags; the bot is configured
+    with YTDLP_COOKIES_PATH (Helm: ytdlpCookies.existingSecret).
+    """
+    if setting("YTDLP_COOKIES_PATH") or setting("YTDLP_COOKIES_FROM_BROWSER"):
+        return
+    name = provider or "this site"
+    if name in _cookie_hints:
+        return
+    _cookie_hints.add(name)
+    logger.warning(
+        "%s asked for a login: set YTDLP_COOKIES_PATH to a cookies.txt exported"
+        " from a logged-in browser (Helm: ytdlpCookies.existingSecret) to download"
+        " such content; use a secondary account",
+        name,
+    )
+
+
 def retry_delay(attempt: int, retry_after: float | None = None) -> float:
     """Seconds before the next attempt after ``attempt`` (1-based) failed."""
     try:
@@ -1139,6 +1163,8 @@ class RequestProcessor:
         logger.warning(
             "Request %s failed: [%s] %s", request.id, err.code, err.detail or err.code
         )
+        if err.code == downloader.AuthRequired.code:
+            _hint_cookies(request.provider)
         if err.stderr_tail:
             logger.debug(
                 "Request %s yt-dlp stderr tail:\n%s", request.id, err.stderr_tail

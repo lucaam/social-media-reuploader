@@ -2423,3 +2423,28 @@ def test_job_metrics_follow_the_outcome(env):
     assert metric("processed_links_total", outcome="done") == done + 1
     assert metric("downloads_failed_total", code="unavailable") == failed + 1
     assert metric("files_sent_total", media_type="video") == sent + 1
+
+
+def test_login_walls_hint_the_operator_at_the_cookies_setting(env, monkeypatch, caplog):
+    import logging
+
+    monkeypatch.setattr(pipeline, "_cookie_hints", set())
+    monkeypatch.setattr(config, "YTDLP_COOKIES_PATH", None, raising=False)
+    monkeypatch.setattr(config, "YTDLP_COOKIES_FROM_BROWSER", None, raising=False)
+    wall = "TikTok is requiring login for access to this content"
+    with caplog.at_level(logging.WARNING, logger="src.pipeline"):
+        for message_id in (1, 2):
+            env.site.fetch_errors.append(downloader.AuthRequired(wall))
+            _, row = process_new(provider="TikTok", message_id=message_id)
+            assert row["error_code"] == "auth_required"
+    hints = [r for r in caplog.records if "YTDLP_COOKIES_PATH" in r.getMessage()]
+    assert len(hints) == 1  # once per provider
+    assert hints[0].getMessage().startswith("TikTok asked for a login")
+
+    caplog.clear()
+    monkeypatch.setattr(pipeline, "_cookie_hints", set())
+    monkeypatch.setattr(config, "YTDLP_COOKIES_PATH", "/run/cookies.txt", raising=False)
+    with caplog.at_level(logging.WARNING, logger="src.pipeline"):
+        env.site.fetch_errors.append(downloader.AuthRequired(wall))
+        process_new(provider="TikTok", message_id=3)
+    assert not [r for r in caplog.records if "YTDLP_COOKIES_PATH" in r.getMessage()]
