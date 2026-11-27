@@ -12,7 +12,8 @@ regole e la checklist.
 - **Database SQLite condiviso** tra bot e GUI su un PVC `ReadWriteOnce`
   (`db.pvc`, attivo di default e conservato da `helm uninstall`). La GUI viene
   schedulata sullo stesso nodo del bot (`podAffinity` obbligatoria su
-  `kubernetes.io/hostname`). Usa storage a blocchi o local-path, non NFS.
+  `kubernetes.io/hostname`). Usa storage a blocchi o local-path; su NFS imposta
+  `env.SQLITE_JOURNAL_MODE: delete` (rollback journal al posto del WAL).
 - **Segreti solo nei Secret**: token del bot (`secret.name`), credenziali della
   GUI (`gui.existingSecret` o il Secret generato dal chart). Gestiscili con
   SealedSecrets, External Secrets o SOPS; non committare mai segreti.

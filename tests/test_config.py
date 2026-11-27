@@ -122,3 +122,35 @@ def test_x264_presets_are_kept(monkeypatch, value, expected):
 
     assert config.TRANSCODE_PRESET == expected
     assert warnings_about(config, "TRANSCODE_PRESET") == []
+
+
+# ---------------------------------------------------------------------------
+# SQLITE_JOURNAL_MODE
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (None, "wal"),
+        ("", "wal"),
+        ("wal", "wal"),
+        ("DELETE", "delete"),
+        (" Truncate ", "truncate"),
+    ],
+)
+def test_sqlite_journal_modes_are_kept(monkeypatch, value, expected):
+    config = load_config(monkeypatch, SQLITE_JOURNAL_MODE=value)
+
+    assert config.SQLITE_JOURNAL_MODE == expected
+    assert config.summary()["sqlite_journal_mode"] == expected
+    assert warnings_about(config, "SQLITE_JOURNAL_MODE") == []
+
+
+# Not offered: "off" and "memory" can corrupt the database on a crash, and
+# "persist" leaves a journal file behind on the shared volume.
+@pytest.mark.parametrize("value", ["off", "memory", "persist", "rollback"])
+def test_unknown_sqlite_journal_mode_falls_back_to_wal(monkeypatch, value):
+    config = load_config(monkeypatch, SQLITE_JOURNAL_MODE=value)
+
+    assert config.SQLITE_JOURNAL_MODE == "wal"
+    [warning] = warnings_about(config, "SQLITE_JOURNAL_MODE")
+    assert "using 'wal'" in warning

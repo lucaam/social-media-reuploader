@@ -262,7 +262,8 @@ mappa `env` di `values.yaml` (numeri e booleani vengono resi come stringhe).
 
 | Variabile | Default | Descrizione |
 |---|---|---|
-| `REQUESTS_DB` | `data/requests.db` | File SQLite condiviso da bot e GUI (nel container `/app/data/requests.db`). Deve stare su un filesystem locale, mai su NFS/SMB. `:memory:` solo per i test. |
+| `REQUESTS_DB` | `data/requests.db` | File SQLite condiviso da bot e GUI (nel container `/app/data/requests.db`). In modalità WAL (default) deve stare su un filesystem locale; su NFS/SMB imposta `SQLITE_JOURNAL_MODE=delete`. `:memory:` solo per i test. |
+| `SQLITE_JOURNAL_MODE` | `wal` | Journal di SQLite: `wal` (filesystem locale) oppure `delete` / `truncate` (rollback journal con `synchronous=FULL`) per un database su NFS/SMB, dove l'indice del WAL in memoria condivisa non è affidabile. Bot e GUI devono usare lo stesso valore. Un database già in WAL passa al rollback journal appena nessun'altra connessione è aperta. |
 | `UPDATES_RETENTION_DAYS` | `14` | Giorni di log degli eventi conservati (0 = per sempre). |
 | `REQUESTS_RETENTION_DAYS` | `0` | Giorni di richieste concluse conservati (0 = per sempre). Le richieste che contano ancora per `RATE_LIMITS` non vengono mai cancellate. |
 | `TMP_RETENTION_HOURS` | `24` | Con `KEEP_DOWNLOADED_FILES` attivo, ore dopo cui le directory di lavoro vengono comunque rimosse dalla pulizia periodica di `TMP_DIR` (senza, le directory orfane vengono rimosse dopo 1 ora). |
@@ -300,10 +301,11 @@ mappa `env` di `values.yaml` (numeri e booleani vengono resi come stringhe).
   coda: non avviare mai due repliche. Il chart Helm rifiuta
   `replicaCount > 1` e aggiorna il bot con la strategia `Recreate`.
 - **Database condiviso sullo stesso nodo.** Bot e GUI comunicano solo tramite il
-  file SQLite (`REQUESTS_DB`, in modalità WAL): devono vedere lo stesso file su
-  un filesystem locale. Con Docker Compose è il volume `data`; con Helm è un PVC
-  `ReadWriteOnce` e la GUI viene schedulata sullo stesso nodo del bot
-  (`podAffinity` obbligatoria su `kubernetes.io/hostname`). Niente NFS.
+  file SQLite (`REQUESTS_DB`): devono vedere lo stesso file. Con Docker Compose
+  è il volume `data`; con Helm è un PVC `ReadWriteOnce` e la GUI viene
+  schedulata sullo stesso nodo del bot (`podAffinity` obbligatoria su
+  `kubernetes.io/hostname`). In modalità WAL (default) serve un filesystem
+  locale; su NFS imposta `SQLITE_JOURNAL_MODE=delete`.
 - **Accesso alla GUI.** La GUI richiede una `SECRET_KEY` robusta (chi la conosce
   può firmare sessioni da amministratore) e `ADMIN_TOKEN` oppure OAuth per il
   login. Esponila solo in HTTPS dietro un reverse proxy fidato da uvicorn

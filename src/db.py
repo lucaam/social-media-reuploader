@@ -9,7 +9,9 @@ Rules followed by every function in this module:
 * Each call opens its own short-lived connection through :func:`connect` and
   closes it before returning: connections are never shared between threads
   and nothing leaks when a statement fails.
-* Connections use WAL, ``synchronous=NORMAL``, foreign keys and a busy timeout
+* Connections use the journal mode of ``config.SQLITE_JOURNAL_MODE`` (WAL with
+  ``synchronous=NORMAL`` by default; a rollback journal with
+  ``synchronous=FULL`` for network filesystems), foreign keys and a busy timeout
   of :data:`BUSY_TIMEOUT_SECONDS`. They run in autocommit mode; every write is
   an explicit ``BEGIN IMMEDIATE`` transaction (:func:`write`), so
   read-modify-write sequences are atomic across threads and processes.
@@ -287,6 +289,8 @@ def _normalize_email(email: Any) -> str | None:
 _memory_lock = threading.RLock()
 _memory_conn: sqlite3.Connection | None = None
 _wal_ready: set[str] = set()
+# Files still in WAL although a rollback journal is configured (warned once).
+_wal_exit_pending: set[str] = set()
 _newer_schema_warned: set[int] = set()
 
 
@@ -343,6 +347,58 @@ def _ensure_wal(conn: sqlite3.Connection, path: str) -> None:
         logger.warning("Could not enable WAL for %s (journal_mode=%s)", path, mode)
 
 
+def _journal_mode() -> str:
+    """The configured journal mode: ``config.SQLITE_JOURNAL_MODE`` (default WAL)."""
+    mode = str(getattr(config, "SQLITE_JOURNAL_MODE", "wal") or "wal").lower()
+    return mode if mode in ("wal", "delete", "truncate") else "wal"
+
+
+def _set_rollback_journal(conn: sqlite3.Connection, path: str, mode: str) -> None:
+    """Use a rollback journal (``delete`` or ``truncate``) with ``synchronous=FULL``.
+
+    Runs on every connection: TRUNCATE lasts only for the connection, and a
+    file in WAL stays in WAL for every new connection until one switches it
+    back. Leaving WAL needs every other connection to the file closed; while
+    another process (or thread) has one open SQLite answers SQLITE_BUSY at
+    once, without calling the busy handler. This connection then keeps WAL
+    (and ``synchronous=NORMAL``, safe in WAL) and the next one retries: every
+    call opens a short-lived connection, so the switch happens as soon as no
+    other connection is open.
+    """
+    before = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+    current = before
+    if before != mode:
+        try:
+            current = str(
+                conn.execute(f"PRAGMA journal_mode = {mode.upper()}").fetchone()[0]
+            ).lower()
+        except sqlite3.OperationalError as exc:
+            if not _is_busy(exc):
+                raise
+    if current == "wal":
+        if path not in _wal_exit_pending:
+            _wal_exit_pending.add(path)
+            logger.warning(
+                "%s is in WAL mode: it switches to journal_mode=%s as soon as no"
+                " other connection to it is open",
+                path,
+                mode,
+            )
+        return
+    conn.execute("PRAGMA synchronous = FULL")
+    if before == "wal":
+        _wal_exit_pending.discard(path)
+        logger.info("%s switched from WAL to journal_mode=%s", path, current)
+
+
+def _ensure_journal_mode(conn: sqlite3.Connection, path: str) -> None:
+    mode = _journal_mode()
+    if mode == "wal":
+        _ensure_wal(conn, path)
+    else:
+        _set_rollback_journal(conn, path, mode)
+
+
 def _open_file(path: str) -> sqlite3.Connection:
     parent = os.path.dirname(path)
     if parent:
@@ -353,7 +409,7 @@ def _open_file(path: str) -> sqlite3.Connection:
         raise sqlite3.OperationalError(f"cannot open database {path!r}: {exc}") from exc
     try:
         _configure(conn)
-        _ensure_wal(conn, path)
+        _ensure_journal_mode(conn, path)
         _ensure_schema(conn)
     except BaseException:
         conn.close()
@@ -391,8 +447,9 @@ def _close_memory_db() -> None:
 def connect() -> Iterator[sqlite3.Connection]:
     """Yield a configured connection and close it on exit.
 
-    Autocommit mode (``isolation_level=None``), ``sqlite3.Row`` rows, WAL,
-    ``synchronous=NORMAL``, ``foreign_keys=ON``, busy timeout. The schema is
+    Autocommit mode (``isolation_level=None``), ``sqlite3.Row`` rows, the
+    configured journal mode (WAL and ``synchronous=NORMAL`` by default),
+    ``foreign_keys=ON``, busy timeout. The schema is
     created/migrated on first use of a database file. ``REQUESTS_DB=":memory:"``
     yields one shared, lock-protected connection (tests only). A database
     that cannot be opened raises ``sqlite3.OperationalError``.

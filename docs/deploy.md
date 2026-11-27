@@ -17,9 +17,12 @@ Regole valide per ogni deploy:
 
 1. **Un solo bot per token**: mai due repliche o due container del bot con lo
    stesso `BOT_TOKEN`.
-2. **Bot e GUI condividono lo stesso file SQLite** (`REQUESTS_DB`) su un
-   filesystem locale dello stesso host/nodo. Niente NFS o SMB: SQLite in
-   modalità WAL ha bisogno dei lock del kernel locale.
+2. **Bot e GUI condividono lo stesso file SQLite** (`REQUESTS_DB`) sullo stesso
+   host/nodo. In modalità WAL (default) serve un filesystem locale: l'indice
+   del WAL in memoria condivisa non è affidabile su NFS o SMB. Se il database
+   sta su NFS/SMB imposta `SQLITE_JOURNAL_MODE=delete` (rollback journal); un
+   database già in WAL passa al rollback journal appena nessun'altra
+   connessione è aperta.
 3. **La GUI va protetta**: `SECRET_KEY` robusta, `ADMIN_TOKEN` o OAuth, HTTPS.
 
 ## Docker

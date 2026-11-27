@@ -401,6 +401,23 @@ WORKER_RETRY_BACKOFF_SECONDS: float = env_float(
 )
 
 # ---------------------------------------------------------------------------
+# Database
+# ---------------------------------------------------------------------------
+# Journal mode of the SQLite database (REQUESTS_DB). "wal" (default) needs a
+# local filesystem: its shared-memory index is not safe on network
+# filesystems. "delete" or "truncate" (rollback journal, synchronous=FULL)
+# for a database on NFS/SMB; a database already in WAL is switched back as
+# soon as no other connection to it is open.
+SQLITE_JOURNAL_MODES: tuple[str, ...] = ("wal", "delete", "truncate")
+SQLITE_JOURNAL_MODE: str = (env_str("SQLITE_JOURNAL_MODE", "wal") or "wal").lower()
+if SQLITE_JOURNAL_MODE not in SQLITE_JOURNAL_MODES:
+    CONFIG_WARNINGS.append(
+        f"SQLITE_JOURNAL_MODE={SQLITE_JOURNAL_MODE!r} is not one of "
+        f"{', '.join(SQLITE_JOURNAL_MODES)}; using 'wal'"
+    )
+    SQLITE_JOURNAL_MODE = "wal"
+
+# ---------------------------------------------------------------------------
 # Retention
 # ---------------------------------------------------------------------------
 # Delete event-log rows (table `updates`) older than this many days (0 = keep).
@@ -474,6 +491,7 @@ def summary() -> dict:
         "keep_downloaded_files": KEEP_DOWNLOADED_FILES,
         "transcode_concurrency": TRANSCODE_CONCURRENCY,
         "worker_poll_seconds": WORKER_POLL_SECONDS,
+        "sqlite_journal_mode": SQLITE_JOURNAL_MODE,
         "cookies_configured": bool(YTDLP_COOKIES_PATH or YTDLP_COOKIES_FROM_BROWSER),
         "proxy_configured": bool(YTDLP_PROXY),
     }
