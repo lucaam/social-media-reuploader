@@ -235,14 +235,30 @@ def test_an_already_released_commit_is_not_released_again():
 def test_refuses_a_version_that_exists_elsewhere():
     existing = [Version.parse("0.8.1"), Version.parse("0.8.2")]
 
-    with pytest.raises(rv.ReleaseError, match="v0.8.2 already exists"):
+    with pytest.raises(rv.ReleaseError, match="v0.8.2 already exists as a tag outside"):
         plan(["fix: a"], existing=existing)
 
 
-def test_latest_only_for_the_highest_release():
+def test_refuses_to_release_below_a_tag_elsewhere():
+    # The workflow would never publish 0.8.2 below 1.0.0 (nor make it the
+    # latest): say why at once.
+    existing = [Version.parse("0.8.1"), Version.parse("1.0.0"), Version.parse("0.9.0")]
+
+    with pytest.raises(rv.ReleaseError) as raised:
+        plan(["fix: a"], existing=existing)
+
+    assert str(raised.value).startswith(
+        "v1.0.0 is higher than the next version v0.8.2 but outside the history"
+    )
+    assert "rebase it on main" in str(raised.value)
+
+
+def test_a_new_release_is_the_latest():
     assert plan(["fix: a"]).latest
-    existing = [Version.parse("0.8.1"), Version.parse("1.0.0")]
-    assert not plan(["fix: a"], existing=existing).latest
+    # Lower tags elsewhere (e.g. on another branch) do not matter.
+    existing = [Version.parse("0.8.1"), Version.parse("0.8.0"), Version.parse("0.7.9")]
+    result = plan(["feat: a"], existing=existing)
+    assert (str(result.version), result.latest) == ("0.9.0", True)
 
 
 def test_outputs_for_the_workflow():
@@ -300,6 +316,31 @@ def test_republish_plan():
         rv.republished_version("v0.9.2", existing)
     with pytest.raises(rv.ReleaseError, match="not a release tag"):
         rv.republished_version("main", existing)
+
+
+def test_republish_compares_latest_with_the_releases_of_main_only():
+    merged = [Version.parse(v) for v in ("0.9.0", "0.9.1")]
+    existing = [*merged, Version.parse("2.0.0")]  # v2.0.0: not on main
+
+    # An older release: `latest` stays where it is, whatever the stray tag.
+    old = rv.plan_republish(
+        Version(0, 9, 0), sha="c" * 40, existing=existing, merged=merged
+    )
+    assert not old.latest
+    # The newest release of main would be the latest, but v2.0.0 is in the
+    # way: refused, like the workflow would.
+    with pytest.raises(rv.ReleaseError, match="v2.0.0 is higher than v0.9.1"):
+        rv.plan_republish(
+            Version(0, 9, 1), sha="c" * 40, existing=existing, merged=merged
+        )
+
+
+def test_the_no_release_summary_names_every_releasing_type():
+    summary = rv.render_summary(plan(["chore: a", "build(docker): b"]))
+
+    assert "**no release**: no feat, fix, perf, revert, build(deps) or breaking" in (
+        summary
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -456,8 +497,11 @@ def repo(tmp_path, monkeypatch):
             return git("rev-parse", "HEAD")
 
         @staticmethod
-        def tag(name, ref="HEAD"):
-            git("tag", name, ref)
+        def tag(name, ref="HEAD", annotated=False):
+            if annotated:
+                git("tag", "-a", "-m", f"Release {name}", name, ref)
+            else:
+                git("tag", name, ref)
 
     return Repo
 
@@ -482,7 +526,7 @@ def test_plan_from_git_reads_the_commits_since_the_latest_reachable_tag(repo):
     assert result.changes[2].pr == 12
 
 
-def test_plan_from_git_ignores_tags_of_other_branches_but_refuses_collisions(repo):
+def test_plan_from_git_refuses_tags_of_other_branches_in_the_way(repo):
     repo.commit("feat: first")
     repo.tag("v1.0.0")
     repo.run("checkout", "-q", "-b", "hotfix")
@@ -490,18 +534,57 @@ def test_plan_from_git_ignores_tags_of_other_branches_but_refuses_collisions(rep
     repo.tag("v1.0.1")
     repo.tag("v2.0.0")
     repo.run("checkout", "-q", "main")
-    repo.commit("feat: on main")
+    head = repo.commit("feat: on main")
 
+    # A stray v2.0.0 would keep `latest` (and the workflow) away for good.
+    with pytest.raises(
+        rv.ReleaseError,
+        match=f"v2.0.0 is higher than the next version v1.1.0 but outside the "
+        f"history of {head[:12]}",
+    ):
+        rv.plan_from_git(rv.Git(repo.root))
+
+    repo.run("tag", "-d", "v2.0.0")
     result = rv.plan_from_git(rv.Git(repo.root))
     assert result.previous == Version(1, 0, 0)
-    assert str(result.version) == "1.1.0"
-    assert not result.latest  # v2.0.0 exists on another branch
+    # A lower tag elsewhere (v1.0.1) does not keep the release from `latest`.
+    assert (str(result.version), result.latest) == ("1.1.0", True)
 
     repo.commit("chore: noise")
     repo.run("reset", "-q", "--hard", "HEAD~2")
     repo.commit("fix: only a fix")
-    with pytest.raises(rv.ReleaseError, match="v1.0.1 already exists"):
+    with pytest.raises(rv.ReleaseError, match="v1.0.1 already exists as a tag"):
         rv.plan_from_git(rv.Git(repo.root))
+
+
+@pytest.mark.parametrize("annotated", [False, True])
+def test_plan_from_git_refuses_commits_of_a_newer_release(repo, annotated):
+    # "Re-run all jobs" of the run of an old commit, after newer releases.
+    repo.commit("chore: init")
+    repo.tag("v0.8.1", annotated=annotated)
+    old = repo.commit("fix: a")
+    # The newer release has the very version this commit would get.
+    released = repo.commit("fix: b")
+    repo.tag("v0.8.2", annotated=annotated)
+    repo.commit("feat: c")
+    repo.tag("v0.9.0", annotated=annotated)
+    repo.commit("fix: d (not released yet)")
+
+    with pytest.raises(rv.ReleaseError) as raised:
+        rv.plan_from_git(rv.Git(repo.root), ref=old)
+    assert str(raised.value) == (
+        f"{old[:12]} is already in the release v0.8.2, tagged on a later "
+        "commit: this run is older than that release and has nothing to publish"
+    )
+    with pytest.raises(rv.ReleaseError, match="already in the release v0.9.0"):
+        rv.plan_from_git(rv.Git(repo.root), ref=released, forced=Bump.PATCH)
+
+    # The tip of main is planned as usual.
+    result = rv.plan_from_git(rv.Git(repo.root))
+    assert (str(result.previous), str(result.version)) == ("0.9.0", "0.9.1")
+    # So is a commit whose own tag is its newest release.
+    repo.tag("v0.9.1", annotated=annotated)
+    assert not rv.plan_from_git(rv.Git(repo.root)).release
 
 
 def test_plan_from_git_without_tags_and_with_a_tagged_head(repo):
@@ -529,6 +612,35 @@ def test_plan_from_git_republishes_an_existing_tag(repo):
     assert (str(result.version), result.new, result.latest) == ("0.3.0", False, True)
     with pytest.raises(rv.ReleaseError, match="no release tag v0.4.0"):
         rv.plan_from_git(rv.Git(repo.root), republish="v0.4.0")
+
+
+def test_plan_from_git_republishes_only_releases_of_main(repo):
+    repo.commit("chore: init")
+    repo.tag("v0.8.0")
+    repo.commit("fix: a")
+    repo.tag("v0.8.1")
+    repo.run("checkout", "-q", "-b", "unreviewed")
+    stray = repo.commit("feat: never merged")
+    repo.tag("v0.9.9")
+    repo.run("checkout", "-q", "main")
+    head = repo.commit("docs: b")
+
+    # The gate is skipped for a republished tag: one that never reached main
+    # is refused.
+    with pytest.raises(rv.ReleaseError) as raised:
+        rv.plan_from_git(rv.Git(repo.root), republish="v0.9.9")
+    assert str(raised.value) == (
+        f"v0.9.9 ({stray[:12]}) is not in the history of {head[:12]}: only a "
+        "release of main can be published again"
+    )
+    # An older release of main: published again without moving `latest`.
+    older = rv.plan_from_git(rv.Git(repo.root), republish="v0.8.0")
+    assert (older.release, older.new, older.latest) == (True, False, False)
+    # The newest release of main would move `latest`, which v0.9.9 forbids.
+    with pytest.raises(rv.ReleaseError, match="v0.9.9 is higher than v0.8.1"):
+        rv.plan_from_git(rv.Git(repo.root), republish="v0.8.1")
+    repo.run("tag", "-d", "v0.9.9")
+    assert rv.plan_from_git(rv.Git(repo.root), republish="v0.8.1").latest
 
 
 def test_plan_from_git_refuses_shallow_clones(repo, tmp_path):

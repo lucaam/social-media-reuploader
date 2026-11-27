@@ -23,6 +23,13 @@ the header of a commit on ``main`` is the title of its pull request):
 
 The release bumps by the largest of them.
 
+The plan refuses to release (the workflow then publishes nothing) a commit
+that a newer release tag already contains (a run older than that release),
+and a version that a release tag outside the history of the commit equals or
+exceeds (a tag pushed by hand, or a branch behind ``main``). A republished
+tag must be in the history of the planned commit (the tip of ``main``): the
+workflow skips the gate for it.
+
 Commands:
 
     version.py plan                   the next release (a dry run locally)
@@ -277,7 +284,8 @@ class Plan:
     bump: Bump
     #: Create the tag and the GitHub release (False when republishing).
     new: bool
-    #: Highest release: the image tags `latest`, `X.Y` and `X` move to it.
+    #: Highest release of the history: the image tags `latest`, `X.Y` and `X`
+    #: move to it (always True for a new release).
     latest: bool
     changes: tuple[Change, ...] = ()
 
@@ -305,6 +313,13 @@ class Plan:
         }
 
 
+#: What a release tag outside the history of the planned commit means.
+OFF_HISTORY = (
+    "on a branch, rebase it on main first; on main, that tag was pushed "
+    "outside the release workflow (see RELEASE.md)"
+)
+
+
 def plan_release(
     changes: Sequence[Change],
     *,
@@ -317,9 +332,10 @@ def plan_release(
 ) -> Plan:
     """The next release after ``previous`` for ``changes``.
 
-    ``existing``: every release tag of the repository (reachable or not);
-    ``already_tagged``: a release tag already on ``sha``; ``forced``: the
-    minimum bump asked for by hand (literal: a forced major on 0.y.z
+    ``previous``: the highest release tag in the history of ``sha``;
+    ``existing``: every release tag of the repository (in that history or
+    not); ``already_tagged``: a release tag already on ``sha``; ``forced``:
+    the minimum bump asked for by hand (literal: a forced major on 0.y.z
     releases 1.0.0).
     """
     bump = max(release_bump(changes, previous), forced)
@@ -336,13 +352,21 @@ def plan_release(
         version = initial or Version.parse(INITIAL_VERSION)
     else:
         version = previous.bumped(bump)
+    # The tags in the history of sha are at most `previous`: a tag from the
+    # next version up is elsewhere. The workflow never publishes a version
+    # below an existing release tag, so stop here and say why.
     if version in existing:
         raise ReleaseError(
-            f"the next version {version.tag} already exists as a tag that is "
-            f"not an ancestor of {sha[:12]}: create the release by hand"
+            f"the next version {version.tag} already exists as a tag outside "
+            f"the history of {sha[:12]}: {OFF_HISTORY}"
         )
-    latest = all(version > other for other in existing)
-    return Plan(sha, previous, version, bump, True, latest, tuple(changes))
+    higher = max((other for other in existing if other > version), default=None)
+    if higher is not None:
+        raise ReleaseError(
+            f"{higher.tag} is higher than the next version {version.tag} but "
+            f"outside the history of {sha[:12]}: {OFF_HISTORY}"
+        )
+    return Plan(sha, previous, version, bump, True, True, tuple(changes))
 
 
 def republished_version(tag: str, existing: Collection[Version]) -> Version:
@@ -356,10 +380,29 @@ def republished_version(tag: str, existing: Collection[Version]) -> Version:
 
 
 def plan_republish(
-    version: Version, *, sha: str, existing: Collection[Version]
+    version: Version,
+    *,
+    sha: str,
+    existing: Collection[Version],
+    merged: Collection[Version] | None = None,
+    head: str = "main",
 ) -> Plan:
-    """Publish the image and the chart of an existing release again."""
-    latest = all(version >= other for other in existing)
+    """Publish the image and the chart of an existing release again.
+
+    ``merged``: the release tags in the history of ``head``, the tip of
+    main (default: ``existing``). The release is the latest when no tag of
+    that history is higher; a higher tag elsewhere would keep `latest` away
+    from it, which the workflow refuses.
+    """
+    released = existing if merged is None else merged
+    latest = all(version >= other for other in released)
+    higher = max((other for other in existing if other > version), default=None)
+    if latest and higher is not None:
+        raise ReleaseError(
+            f"{higher.tag} is higher than {version.tag} but outside the history "
+            f"of {head[:12]}, so `latest` cannot move to {version.tag}: "
+            f"{OFF_HISTORY}"
+        )
     return Plan(sha, None, version, Bump.NONE, False, latest)
 
 
@@ -440,7 +483,10 @@ def render_summary(plan: Plan) -> str:
     if plan.new or not plan.release:
         lines.append(f"- commits since {since}: {len(plan.changes)} ({kinds or '-'})")
     if plan.version is None:
-        lines.append("- **no release**: no feat, fix, perf, revert or breaking change")
+        lines.append(
+            "- **no release**: no feat, fix, perf, revert, build(deps) "
+            "or breaking change"
+        )
     elif plan.new:
         lines.append(f"- **release {plan.version.tag}** ({plan.bump} bump)")
     else:
@@ -488,24 +534,36 @@ class Git:
         self.repo = repo
 
     def __call__(self, *args: str) -> str:
-        try:
-            result = subprocess.run(
-                ["git", *args],
-                cwd=self.repo,
-                check=True,
-                capture_output=True,
-                text=True,
-                timeout=120,
-            )
-        except subprocess.CalledProcessError as exc:
-            detail = exc.stderr.strip() or exc.stdout.strip()
-            raise ReleaseError(f"git {' '.join(args)} failed: {detail}") from exc
-        return result.stdout
+        return self.run(*args).stdout
+
+    def run(
+        self, *args: str, ok: Collection[int] = (0,)
+    ) -> subprocess.CompletedProcess[str]:
+        """Run ``git args``; an exit status outside ``ok`` is an error."""
+        result = subprocess.run(
+            ["git", *args],
+            cwd=self.repo,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        if result.returncode not in ok:
+            detail = result.stderr.strip() or result.stdout.strip()
+            raise ReleaseError(f"git {' '.join(args)} failed: {detail}")
+        return result
 
     def resolve(self, ref: str) -> str:
         return self(
             "rev-parse", "--verify", "--end-of-options", f"{ref}^{{commit}}"
         ).strip()
+
+    def is_ancestor(self, ancestor: str, descendant: str) -> bool:
+        """Whether commit ``ancestor`` is in the history of ``descendant``."""
+        result = self.run(
+            "merge-base", "--is-ancestor", ancestor, descendant, ok=(0, 1)
+        )
+        return result.returncode == 0
 
     def is_shallow(self) -> bool:
         return self("rev-parse", "--is-shallow-repository").strip() == "true"
@@ -539,22 +597,45 @@ def plan_from_git(
             "(actions/checkout with fetch-depth: 0)"
         )
     existing = git.release_tags()
+    head = git.resolve(ref)
     if republish:
         # Validated before git sees it.
         version = republished_version(republish, existing)
         sha = git.resolve(f"refs/tags/{version.tag}")
-        return plan_republish(version, sha=sha, existing=existing)
-    sha = git.resolve(ref)
+        # The workflow skips the gate for a republished tag: its commit must
+        # be one that reached main (and passed the gate there).
+        if not git.is_ancestor(sha, head):
+            raise ReleaseError(
+                f"{version.tag} ({sha[:12]}) is not in the history of "
+                f"{head[:12]}: only a release of main can be published again"
+            )
+        return plan_republish(
+            version,
+            sha=sha,
+            existing=existing,
+            merged=git.release_tags("--merged", head),
+            head=head,
+        )
+    sha = head
+    here = git.release_tags("--points-at", sha)
+    # A release cut from a later commit contains this one: this run is older
+    # than that release (e.g. "Re-run all jobs" of an old run).
+    newer = sorted(set(git.release_tags("--contains", sha)) - set(here))
+    if newer:
+        raise ReleaseError(
+            f"{sha[:12]} is already in the release {newer[0].tag}, tagged on "
+            "a later commit: this run is older than that release and has "
+            "nothing to publish"
+        )
     reachable = git.release_tags("--merged", sha)
     previous = max(reachable, default=None)
     revisions = f"{reachable[previous]}..{sha}" if previous else sha
-    here = sorted(git.release_tags("--points-at", sha).values())
     return plan_release(
         git.changes(revisions),
         sha=sha,
         previous=previous,
         existing=existing,
-        already_tagged=", ".join(here),
+        already_tagged=", ".join(here[version] for version in sorted(here)),
         forced=forced,
     )
 
