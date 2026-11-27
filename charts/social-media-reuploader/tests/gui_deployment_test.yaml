@@ -347,6 +347,15 @@ tests:
           path: spec.template.spec.securityContext.runAsUser
           value: 1000
 
+  - it: uses the image of the chart's own release (appVersion)
+    chart:
+      version: 1.4.2
+      appVersion: 1.4.2
+    asserts:
+      - equal:
+          path: spec.template.spec.containers[0].image
+          value: ghcr.io/lucaam/social-media-reuploader:1.4.2
+
   - it: uses the bot image unless overridden
     set:
       image.repository: registry.example.com/smr

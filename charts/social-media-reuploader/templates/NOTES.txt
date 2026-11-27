@@ -2,6 +2,14 @@
 {{- $env := .Values.env | default dict -}}
 {{- $mode := include "social-media-reuploader.envString" (get $env "MODE" | default "polling") | lower -}}
 social-media-reuploader {{ .Chart.AppVersion }} installed as release "{{ .Release.Name }}" in namespace "{{ .Release.Namespace }}".
+{{- if and (eq .Chart.AppVersion "0.0.0") (not .Values.image.tag) }}
+
+WARNING: this chart comes from a source checkout (version 0.0.0), not from a
+release, and the image {{ include "social-media-reuploader.image" . }} does not exist.
+Install a released chart:
+  helm upgrade --install {{ .Release.Name }} oci://ghcr.io/lucaam/charts/social-media-reuploader --version <version> --reuse-values
+or set image.tag to a released version.
+{{- end }}
 
 Bot ({{ $mode }} mode, {{ .Values.replicaCount }} replica):
 {{- if include "social-media-reuploader.useBotSecret" . }}

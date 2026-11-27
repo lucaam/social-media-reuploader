@@ -649,11 +649,21 @@ tests:
       - failedTemplate:
           errorPattern: "unknown resourceProfile \"huge\""
 
-  - it: uses the image of the chart
+  - it: uses the image of the chart's own release (appVersion)
+    # The release workflow packages the chart with --app-version X.Y.Z.
+    chart:
+      version: 1.4.2
+      appVersion: 1.4.2
     asserts:
-      - matchRegex:
+      - equal:
           path: spec.template.spec.containers[0].image
-          pattern: ^ghcr\.io/lucaam/social-media-reuploader:\d+\.\d+\.\d+$
+          value: ghcr.io/lucaam/social-media-reuploader:1.4.2
+      - equal:
+          path: metadata.labels["app.kubernetes.io/version"]
+          value: "1.4.2"
+      - equal:
+          path: metadata.labels["helm.sh/chart"]
+          value: social-media-reuploader-1.4.2
 
   - it: uses an image override
     set:

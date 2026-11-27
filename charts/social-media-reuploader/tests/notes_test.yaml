@@ -1,0 +1,32 @@
+suite: NOTES.txt
+templates:
+  - templates/NOTES.txt
+release:
+  name: smr
+  namespace: bots
+set:
+  secret.name: smr-bot
+tests:
+  - it: names the release version
+    chart:
+      version: 1.4.2
+      appVersion: 1.4.2
+    asserts:
+      - matchRegexRaw:
+          pattern: social-media-reuploader 1\.4\.2 installed as release "smr" in namespace "bots"
+      - notMatchRegexRaw:
+          pattern: source checkout
+
+  - it: warns that a chart from a checkout (appVersion 0.0.0) has no image
+    asserts:
+      - matchRegexRaw:
+          pattern: "WARNING: this chart comes from a source checkout"
+      - matchRegexRaw:
+          pattern: oci://ghcr\.io/lucaam/charts/social-media-reuploader --version <version>
+
+  - it: does not warn when image.tag picks a released image
+    set:
+      image.tag: 1.4.2
+    asserts:
+      - notMatchRegexRaw:
+          pattern: source checkout
