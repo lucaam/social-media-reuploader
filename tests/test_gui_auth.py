@@ -1139,3 +1139,28 @@ def test_dataclass_settings_are_immutable():
     config = settings()
     with pytest.raises(dataclasses.FrozenInstanceError):
         config.admin_token = "x"  # type: ignore[misc]
+
+
+def test_session_activity_is_written_at_most_once_a_minute():
+    config = settings()
+    session: dict = {}
+    session_id = gui_auth.start_token_session(session, config)
+    record = dict(db.get_gui_session(gui_auth.session_hash(session["sid"])))
+    touched = []
+
+    def principal_with(last_seen):
+        record["last_seen_at"] = last_seen
+        return gui_auth.session_principal(
+            session,
+            config,
+            oauth_enabled=False,
+            lookup_session=lambda _hash: record,
+            touch_session=touched.append,
+        )
+
+    assert principal_with(db.now_iso()).session_id == session_id
+    assert touched == []  # seen just now: no write transaction
+    principal_with(db.iso_from_ts(time.time() - 120))
+    assert touched == [session_id]
+    principal_with(None)
+    assert touched == [session_id, session_id]

@@ -511,16 +511,14 @@ def resolve_principal(
     session = conn.scope.get("session")
     if not isinstance(session, Mapping):
         return ANONYMOUS
-    principal = session_principal(
+    return session_principal(
         session,
         settings,
         oauth_enabled=oauth_enabled,
         lookup_user=lookup_user,
         lookup_session=lookup_session,
+        touch_session=touch_session,
     )
-    if principal.session_id is not None:
-        (touch_session or db.touch_gui_session)(principal.session_id)
-    return principal
 
 
 def _bearer_principal(
@@ -570,30 +568,46 @@ def session_principal(
     oauth_enabled: bool,
     lookup_user: UserLookup | None = None,
     lookup_session: SessionLookup | None = None,
+    touch_session: SessionTouch | None = None,
 ) -> Principal:
     """Principal of a session cookie: anonymous unless it names an active
-    server-side session (not revoked, not expired)."""
+    server-side session (not revoked, not expired). Records the activity
+    (``last_seen_at``) at most once a minute."""
     record = session_record(session, lookup_session)
     if record is None:
         return ANONYMOUS
     session_id = int(record["id"])
     kind = record.get("auth")
+    principal = ANONYMOUS
     if kind == AuthMethod.TOKEN.value:
         expected = token_fingerprint(settings)
         stored = record.get("token_fp")
         if expected and isinstance(stored, str) and tokens_match(stored, expected):
-            return Principal(
+            principal = Principal(
                 method=AuthMethod.TOKEN,
                 is_admin=True,
                 subject="admin-token",
                 session_id=session_id,
             )
-        return ANONYMOUS
-    if kind == AuthMethod.OAUTH.value and oauth_enabled:
-        return _oauth_principal(
+    elif kind == AuthMethod.OAUTH.value and oauth_enabled:
+        principal = _oauth_principal(
             record, settings, lookup_user or db.get_user_by_email, session_id
         )
-    return ANONYMOUS
+    if principal.authenticated and _seen_long_ago(record.get("last_seen_at")):
+        # Only then a write: a write transaction per request would compete
+        # with the bot for the database lock.
+        (touch_session or db.touch_gui_session)(session_id)
+    return principal
+
+
+def _seen_long_ago(last_seen: Any) -> bool:
+    if not isinstance(last_seen, str) or not last_seen:
+        return True
+    try:
+        seen = db.ts_from_iso(last_seen)
+    except ValueError:
+        return True
+    return time.time() - seen >= db.GUI_SESSION_TOUCH_SECONDS
 
 
 def session_record(
