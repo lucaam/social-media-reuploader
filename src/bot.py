@@ -53,10 +53,12 @@ from aiohttp import web
 from . import (
     __version__,
     config,
+    cpu,
     db,
     handlers,
     http_client,
     http_server,
+    media,
     providers,
     telegram_api,
     telegram_client,
@@ -284,6 +286,13 @@ def log_startup(mode: str) -> None:
         logger.warning("Configuration: %s", problem)
     logger.info(
         "Configuration: %s", json.dumps(config.summary(), sort_keys=True, default=str)
+    )
+    limit = cpu.cgroup_cpu_limit()
+    logger.info(
+        "CPU: %d usable, container limit %s; %d ffmpeg thread(s) per conversion",
+        cpu.usable_cpus(),
+        f"{limit:g}" if limit is not None else "none",
+        media.encode_threads(),
     )
 
 

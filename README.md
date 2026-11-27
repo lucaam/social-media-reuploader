@@ -239,6 +239,7 @@ mappa `env` di `values.yaml` (numeri e booleani vengono resi come stringhe).
 | `TRANSCODE_PRESET` | `veryfast` | Preset di x264: `ultrafast`, `superfast`, `veryfast`, `faster`, `fast`, `medium`, `slow`, `slower`, `veryslow` o `placebo` (più lento = file più piccoli, più CPU). |
 | `TRANSCODE_TIMEOUT` | `900` | Timeout in secondi di una conversione completa (min 30). |
 | `TRANSCODE_CONCURRENCY` | `1` | Conversioni ffmpeg contemporanee (1-8): sono il lavoro più pesante per la CPU. |
+| `TRANSCODE_THREADS` | `0` | Thread di ogni conversione (decoder, filtri e x264). `0` = automatico: le CPU utilizzabili, limitate dal limite CPU del container (cgroup), divise per `TRANSCODE_CONCURRENCY`, da 1 a 16. Altrimenti ffmpeg conterebbe tutti i core del nodo. |
 | `TRANSCODE_MAX_SIDE` | `1280` | Lato lungo in pixel quando la compressione richiede di ridurre la risoluzione (min 240). |
 
 #### Coda, rate limit e duplicati

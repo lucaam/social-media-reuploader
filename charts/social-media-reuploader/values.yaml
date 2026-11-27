@@ -264,6 +264,10 @@ env:
   TRANSCODE_TIMEOUT: null
   TRANSCODE_CONCURRENCY: null
   TRANSCODE_MAX_SIDE: null
+  # Threads per conversion (0 = auto: the container CPU limit split across
+  # TRANSCODE_CONCURRENCY, 1-16): keeps ffmpeg from sizing its pools from
+  # every core of the node.
+  TRANSCODE_THREADS: null
 
   # --- Queue, rate limits, duplicates ------------------------------------------
   # Queued + running requests per chat; further links are refused (only them).

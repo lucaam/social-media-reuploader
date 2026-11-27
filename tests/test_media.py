@@ -55,6 +55,7 @@ def _isolated_settings(monkeypatch):
         "TRANSCODE_PRESET": "veryfast",
         "TRANSCODE_TIMEOUT": 300,
         "TRANSCODE_CONCURRENCY": 1,
+        "TRANSCODE_THREADS": 0,
         "SIMPLE_YTDLP_ONLY": False,
     }.items():
         monkeypatch.setattr(config, name, value, raising=False)
@@ -434,6 +435,57 @@ def test_encode_argv_never_pads_and_uses_settings():
         "ffmpeg", "/w/in", "/w/out", silent, plan, preset="fast"
     )
     assert "-an" in silent_argv and "0:1" not in silent_argv
+
+
+def test_encode_argv_caps_every_thread_pool():
+    p = make_probe(duration=60.0, video_index=0, audio_index=1)
+    plan = plan_video_encode(p, 50 * MIB, size_targeted=True)
+    argv = media.video_encode_argv(
+        "ffmpeg", "/w/in", "/w/out.mp4", p, plan, preset="veryfast", threads=2
+    )
+    source = argv.index("-i")
+    # filter graph and decoder: input-side options, before -i
+    assert argv.index("-filter_threads") < source
+    assert argv[argv.index("-filter_threads") + 1] == "2"
+    decoder = argv.index("-threads")
+    assert decoder < source and argv[decoder + 1] == "2"
+    # x264: an output option, after -c:v libx264
+    encoder = argv.index("-threads", source)
+    assert argv[encoder - 1] == "libx264" and argv[encoder + 1] == "2"
+    default = media.video_encode_argv(
+        "ffmpeg", "/w/in", "/w/out.mp4", p, plan, preset="veryfast"
+    )
+    assert "-threads" not in default and "-filter_threads" not in default
+
+
+@pytest.mark.parametrize(
+    ("budget", "concurrency", "expected"),
+    [
+        (1.0, 1, 1),  # chart "medium": one CPU
+        (0.3, 1, 1),  # chart "small": never below one thread
+        (1.5, 1, 1),  # rounded down: the remainder is left to the bot
+        (2.0, 1, 2),  # chart "large"
+        (2.9, 1, 2),
+        (8.0, 2, 4),  # split across concurrent encodes
+        (1.0, 2, 1),
+        (64.0, 1, media.MAX_AUTO_THREADS),
+    ],
+)
+def test_encode_threads_split_the_cpu_budget(
+    monkeypatch, budget, concurrency, expected
+):
+    monkeypatch.setattr(media.cpu, "cpu_budget", lambda: budget)
+    monkeypatch.setattr(config, "TRANSCODE_CONCURRENCY", concurrency)
+    assert media.encode_threads() == expected
+
+
+def test_transcode_threads_overrides_the_budget(monkeypatch):
+    monkeypatch.setattr(media.cpu, "cpu_budget", lambda: 1.0)
+    monkeypatch.setattr(config, "TRANSCODE_THREADS", 6)
+    assert media.encode_threads() == 6
+    monkeypatch.setattr(config, "TRANSCODE_THREADS", "junk")
+    monkeypatch.setattr(config, "TRANSCODE_CONCURRENCY", "junk")
+    assert media.encode_threads() == 1  # unreadable values: auto, one encode
 
 
 def test_remux_argv_for_audio_and_video():
@@ -1059,6 +1111,33 @@ def test_thumbnail(gen, tmp_path):
     assert run(media.probe(thumb_big)).width == 320
     audio = gen("a.m4a", *LAVFI_AUDIO, "-t", "1", "-c:a", "aac")
     assert run(media.make_thumbnail(audio, work, duration=1.0)) is None
+
+
+@needs_ffmpeg
+def test_conversions_and_thumbnails_use_the_cpu_budget(gen, monkeypatch, tmp_path):
+    webm = gen(
+        "vp9.webm", *LAVFI_VIDEO, *LAVFI_AUDIO, "-t", "1", *FAST_VP9, "-shortest"
+    )
+    monkeypatch.setattr(media.cpu, "cpu_budget", lambda: 2.0)
+    calls = []
+    real_run = media.run_command
+
+    async def recording(argv, **kwargs):
+        calls.append((kwargs.get("label"), list(argv)))
+        return await real_run(argv, **kwargs)
+
+    monkeypatch.setattr(media, "run_command", recording)
+    work = _workdir(tmp_path)
+    prepared = run(media.prepare_for_telegram(webm, work, max_bytes=50 * MIB))
+    assert prepared.action == "transcode"
+    assert run(media.make_thumbnail(prepared.path, work, duration=1.0)) is not None
+    by_label = dict(calls)
+    transcode = by_label["transcode"]
+    assert transcode.count("-threads") == 2  # decoder and x264
+    assert transcode[transcode.index("-filter_threads") + 1] == "2"
+    thumbnail = by_label["thumbnail"]
+    assert thumbnail[thumbnail.index("-threads") + 1] == "2"
+    assert thumbnail.index("-threads") < thumbnail.index("-i")
 
 
 def _processes_mentioning(token: str) -> list[int]:

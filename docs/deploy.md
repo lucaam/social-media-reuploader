@@ -306,6 +306,15 @@ lì; yt-dlp lavora su una copia per ogni richiesta. Per montaggi diversi ci sono
 `resources`, `terminationGracePeriodSeconds` e `tmpVolume.sizeLimit` scavalcano
 il profilo. La GUI usa `guiResources`.
 
+Le conversioni ffmpeg leggono il limite CPU del container (cgroup) e dividono
+quella quota fra le `TRANSCODE_CONCURRENCY` conversioni contemporanee
+(`TRANSCODE_THREADS=0`, il default). Con `small` e `medium` ogni conversione
+usa quindi un thread per decoder, filtri e x264, con `large` due. Senza questo
+calcolo ffmpeg conterebbe tutti i core del nodo: in un pod da una CPU
+partirebbero decine di thread che esauriscono la quota, rallentano anche il bot
+e occupano memoria. Per conversioni più rapide alza `limits.cpu`. Alza
+`TRANSCODE_CONCURRENCY` solo quando le CPU sono più di una.
+
 ### Metriche
 
 `metrics.serviceMonitor.enabled: true` crea un `ServiceMonitor` (Prometheus
