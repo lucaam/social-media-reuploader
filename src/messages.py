@@ -230,6 +230,7 @@ _FAILURES: Mapping[str, str] = {
         "(ad esempio un post con sole immagini)."
     ),
     "unsupported": "Questo link non è supportato.",
+    "blocked": "Questo sito è stato disattivato dall'amministratore del bot.",
     "timeout": "Il download ha impiegato troppo tempo. Riprova più tardi.",
     "failed": "Non sono riuscito a scaricare questo contenuto. Riprova più tardi.",
 }

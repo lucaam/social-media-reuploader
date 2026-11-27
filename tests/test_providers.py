@@ -967,6 +967,23 @@ def test_domain_rules_cover_every_domain_of_the_site(monkeypatch, rule, urls):
     assert providers.check_link(vimeo).reason is Rejection.BLOCKED
 
 
+def test_extractor_allowed_applies_the_policy_to_the_extractor_used(monkeypatch):
+    reddit = "https://www.reddit.com/r/videos/comments/abc123/title/"
+    assert providers.extractor_allowed("Youtube", reddit)
+    monkeypatch.setattr(config, "BLOCKED_PROVIDERS", ("youtube",))
+    # a Reddit post whose video is a YouTube embed is refused after extraction
+    assert providers.extractor_allowed("Youtube", reddit) is False
+    assert providers.extractor_allowed("Reddit", reddit)
+    monkeypatch.setattr(config, "BLOCKED_PROVIDERS", ())
+    monkeypatch.setattr(config, "ALLOWED_PROVIDERS", ("reddit",))
+    assert providers.extractor_allowed("Reddit", reddit)
+    assert providers.extractor_allowed("Youtube", reddit) is False
+    assert providers.extractor_allowed("Generic", reddit) is False
+    # no key or an unknown one: the link-level decision stands
+    assert providers.extractor_allowed(None, reddit)
+    assert providers.extractor_allowed("NotAnExtractor", reddit)
+
+
 def test_subdomain_rules_only_cover_their_hosts(monkeypatch):
     monkeypatch.setattr(
         config, "BLOCKED_PROVIDERS", ("vm.tiktok.com", "music.youtube.com")

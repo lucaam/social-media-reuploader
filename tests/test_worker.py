@@ -599,6 +599,19 @@ def test_server_side_fetch_refused_falls_back_to_a_local_upload(env):
     assert row["status"] == "done"
 
 
+def test_extractor_refused_by_the_policy_is_not_downloaded(env, monkeypatch):
+    # The link matched Reddit, but yt-dlp extracted an embedded YouTube video
+    # and YouTube is blocked by the administrator.
+    monkeypatch.setattr(config, "BLOCKED_PROVIDERS", ("youtube",))
+    env.site.extractor_key = "Youtube"
+    result, row = process_new(provider="Reddit")
+    assert result.outcome == pipeline.Outcome.FAILED
+    assert (row["status"], row["error_code"]) == ("failed", "blocked")
+    assert env.site.downloads == [] and env.tg.uploads() == []
+    assert env.tg.texts() == [messages.failure("blocked")]
+    assert env.tg.reactions()[-1] == "🍌"
+
+
 def test_server_side_fetch_is_claimed_before_the_send(env, monkeypatch):
     env.site.items = [make_item(1, direct_url=DIRECT, filesize=5 * MIB)]
     request_id = new_request()

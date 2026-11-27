@@ -57,7 +57,7 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from typing import Any
 
-from . import config, db, downloader, media, messages, telegram_api
+from . import config, db, downloader, media, messages, providers, telegram_api
 from .downloader import DownloadedFile, DownloadError, MediaInfo, MediaItem, NoMedia
 
 logger = logging.getLogger(__name__)
@@ -314,6 +314,12 @@ UNKNOWN_DELIVERY = Delivery(None, None, {}, 0, None, None, None)
 # ---------------------------------------------------------------------------
 # Errors raised by the pipeline itself
 # ---------------------------------------------------------------------------
+class ProviderBlocked(DownloadError):
+    """yt-dlp ended up in an extractor the provider policy refuses."""
+
+    code = "blocked"
+
+
 class SlideshowNotSupported(NoMedia):
     """A TikTok photo post: only its background music is downloadable."""
 
@@ -695,6 +701,13 @@ class RequestProcessor:
         workdir = await self._workdir()
         self._stage(Stage.EXTRACTING)
         info = await downloader.fetch_info(self.request.url, workdir)
+        if not await asyncio.to_thread(
+            providers.extractor_allowed, info.extractor_key, self.request.url
+        ):
+            raise ProviderBlocked(
+                f"yt-dlp used the {info.extractor_key} extractor, which the"
+                " provider policy refuses"
+            )
         if is_tiktok_slideshow(info, self.request.provider):
             raise SlideshowNotSupported(
                 "TikTok photo slideshow: only the background music is downloadable"

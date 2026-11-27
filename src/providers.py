@@ -1076,6 +1076,31 @@ def _collections_allowed() -> bool:
     return bool(getattr(config, "ALLOW_COLLECTION_LINKS", False))
 
 
+def extractor_allowed(extractor_key: str | None, url: str | None = None) -> bool:
+    """Whether the extractor yt-dlp actually used passes the provider policy.
+
+    A second check after the extraction: the link matched an allowed
+    provider, but yt-dlp may have ended up in another extractor (an embedded
+    or redirected video, e.g. a YouTube video inside a Reddit post), which
+    ``BLOCKED_PROVIDERS``/``ALLOWED_PROVIDERS`` must also cover. The generic
+    extractor is never allowed. Unknown keys keep the link-level decision.
+    """
+    if not extractor_key:
+        return True
+    if extractor_key.casefold() == "generic":
+        return False
+    entry = _registry().by_key.get(extractor_key)
+    if entry is None:
+        return True
+    host = ""
+    if url:
+        try:
+            host = (urlsplit(url).hostname or "").lower()
+        except ValueError:
+            host = ""
+    return _provider_allowed(entry, host)
+
+
 # ---------------------------------------------------------------------------
 # Matching
 # ---------------------------------------------------------------------------

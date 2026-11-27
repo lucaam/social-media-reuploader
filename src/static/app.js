@@ -43,6 +43,7 @@
   const ERROR_LABELS = {
     failed: 'Errore generico',
     unsupported: 'Link non supportato',
+    blocked: 'Sito disattivato dall\'amministratore',
     auth_required: 'Accesso o cookie richiesti',
     unavailable: 'Contenuto non disponibile',
     geo_blocked: 'Bloccato nel paese del server',

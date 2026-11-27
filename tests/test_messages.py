@@ -132,6 +132,7 @@ CODES = [
     "too_large",
     "no_media",
     "unsupported",
+    "blocked",
     "timeout",
     "conversion_failed",
     "conversion_timeout",
