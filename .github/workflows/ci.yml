@@ -1,18 +1,21 @@
 name: CI
 
+# Every check a change must pass, defined once:
+#   - on pull requests: the job names are required status checks of the
+#     `main` ruleset (rename a job only together with the ruleset);
+#   - on every push to main, called by release.yml as the release gate.
+# On pull requests the jobs of the areas a change does not touch are skipped
+# (a skipped job counts as passed); called from release.yml every job runs.
 on:
   pull_request:
-  push:
-    branches: [main]
-  # Also dispatched by "Manual Version Bump" on the bump branch: pull requests
-  # opened with GITHUB_TOKEN do not trigger workflows by themselves.
-  workflow_dispatch:
+  workflow_call:
 
-permissions:
-  contents: read
+permissions: {}
 
 concurrency:
-  group: ci-${{ github.ref }}
+  # A new push to a pull request cancels the run of the previous one. Called
+  # from release.yml: one group per run (release.yml serializes releases).
+  group: ci-${{ github.event.pull_request.number || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 defaults:
@@ -20,13 +23,69 @@ defaults:
     # bash -eo pipefail
     shell: bash
 
+env:
+  PYTHON_VERSION: "3.14"
+  # renovate: datasource=github-releases depName=helm/helm
+  HELM_VERSION: v4.3.2
+  # renovate: datasource=github-releases depName=helm-unittest/helm-unittest extractVersion=^v(?<version>.+)$
+  HELM_UNITTEST_VERSION: 1.2.1
+  # renovate: datasource=github-releases depName=yannh/kubeconform
+  KUBECONFORM_VERSION: v0.8.0
+
 jobs:
-  # The job id is the required status check "build": keep it.
+  changes:
+    name: Determine changed areas
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: read # list the files of the pull request
+    outputs:
+      # Outside pull requests (the release gate) every area counts as changed.
+      docker: ${{ github.event_name != 'pull_request' || steps.filter.outputs.docker == 'true' }}
+      helm: ${{ github.event_name != 'pull_request' || steps.filter.outputs.helm == 'true' }}
+      workflows: ${{ github.event_name != 'pull_request' || steps.filter.outputs.workflows == 'true' }}
+      docs: ${{ github.event_name != 'pull_request' || steps.filter.outputs.docs == 'true' }}
+    steps:
+      # Pull requests: the changed files come from the API, no checkout.
+      - name: Filter changes
+        id: filter
+        if: github.event_name == 'pull_request'
+        uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+        with:
+          filters: |
+            docker:
+              - Dockerfile
+              - .dockerignore
+              - requirements.txt
+              - 'src/**'
+              - scripts/smoke_test_image.sh
+              - .github/workflows/ci.yml
+            helm:
+              - 'charts/**'
+              - .github/workflows/ci.yml
+            workflows:
+              - '.github/workflows/**'
+              - .pre-commit-config.yaml
+            docs:
+              - 'docs/**'
+              - mkdocs.yml
+              - README.md
+              - scripts/mkdocs_hooks.py
+              - requirements-dev.txt
+              - .github/workflows/ci.yml
+
+  # Required status check "build": the test suite.
   build:
+    name: build
     runs-on: ubuntu-latest
     timeout-minutes: 30
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v7
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
 
       - name: Install ffmpeg (the media tests need ffmpeg/ffprobe)
         run: |
@@ -34,9 +93,9 @@ jobs:
           sudo apt-get install -y --no-install-recommends ffmpeg
 
       - name: Set up Python
-        uses: actions/setup-python@v6.3.0
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
         with:
-          python-version: '3.14'
+          python-version: ${{ env.PYTHON_VERSION }}
           cache: pip
           cache-dependency-path: |
             requirements.txt
@@ -55,3 +114,211 @@ jobs:
         env:
           REQUESTS_DB: ${{ runner.temp }}/requests.db
         run: python -m pytest -q
+
+  python-lint:
+    name: Python linters
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        id: python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dev dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Cache pre-commit environments
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-${{ steps.python.outputs.python-version }}-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      # Every hook of .pre-commit-config.yaml (all pinned there) except the
+      # ones the jobs below run: helm-lint ("Helm chart lint", needs helm) and
+      # the workflow checks ("GitHub Actions linter (actionlint)").
+      - name: Pre-commit hooks (all files)
+        env:
+          SKIP: helm-lint,actionlint,check-github-workflows,check-github-workflows-require-timeout,zizmor
+        run: pre-commit run --all-files --show-diff-on-failure
+
+      - name: Every setting is documented (README, Helm values)
+        run: python scripts/check_docs.py
+
+  helm-lint:
+    name: Helm chart lint
+    needs: changes
+    if: needs.changes.outputs.helm == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    env:
+      CHART: charts/social-media-reuploader
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Helm
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Helm lint (default and CI values)
+        run: |
+          helm lint "$CHART" --strict
+          for values in "$CHART"/ci/*-values.yaml; do
+            helm lint "$CHART" --strict -f "$values"
+          done
+
+      - name: Helm unit tests (helm-unittest)
+        run: |
+          # Helm 4 cannot verify plugins installed from git (see the
+          # helm-unittest README).
+          helm plugin install https://github.com/helm-unittest/helm-unittest.git \
+            --version "$HELM_UNITTEST_VERSION" --verify=false
+          helm unittest "$CHART"
+
+      - name: Validate the rendered manifests (kubeconform)
+        run: |
+          base="https://github.com/yannh/kubeconform/releases/download/${KUBECONFORM_VERSION}"
+          cd "$RUNNER_TEMP"
+          curl -sSfL --retry 3 -o kubeconform-linux-amd64.tar.gz "$base/kubeconform-linux-amd64.tar.gz"
+          curl -sSfL --retry 3 -o CHECKSUMS "$base/CHECKSUMS"
+          grep ' kubeconform-linux-amd64.tar.gz$' CHECKSUMS | sha256sum --check --strict -
+          tar -xzf kubeconform-linux-amd64.tar.gz kubeconform
+          cd "$GITHUB_WORKSPACE"
+          for values in "$CHART"/ci/*-values.yaml; do
+            echo "::group::$values"
+            helm template smr "$CHART" -f "$values" \
+              | "$RUNNER_TEMP/kubeconform" -strict -summary -ignore-missing-schemas \
+                  -schema-location default \
+                  -schema-location 'https://raw.githubusercontent.com/datreeio/CRDs-catalog/main/{{.Group}}/{{.ResourceKind}}_{{.ResourceAPIVersion}}.json'
+            echo "::endgroup::"
+          done
+
+      # The release workflow publishes the chart packaged with the release
+      # version: the package must deploy the image of that same version.
+      - name: Package the chart as the release does
+        run: |
+          helm package "$CHART" --version 0.0.1-ci --app-version 0.0.1-ci --destination "$RUNNER_TEMP/chart"
+          helm template smr "$RUNNER_TEMP/chart/social-media-reuploader-0.0.1-ci.tgz" \
+            --set secret.name=smr-bot > "$RUNNER_TEMP/rendered.yaml"
+          grep 'image: "ghcr.io/lucaam/social-media-reuploader:0.0.1-ci"' "$RUNNER_TEMP/rendered.yaml"
+
+  workflows-lint:
+    name: GitHub Actions linter (actionlint)
+    needs: changes
+    if: needs.changes.outputs.workflows == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        id: python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dev dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Cache pre-commit environments
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/pre-commit
+          key: pre-commit-${{ runner.os }}-${{ steps.python.outputs.python-version }}-${{ hashFiles('.pre-commit-config.yaml') }}
+
+      # Pinned in .pre-commit-config.yaml: actionlint (with shellcheck for the
+      # run: scripts), the workflow JSON schema, a timeout on every job and
+      # the zizmor security audits.
+      - name: actionlint, workflow schema and zizmor
+        run: |
+          for hook in actionlint check-github-workflows check-github-workflows-require-timeout zizmor; do
+            pre-commit run "$hook" --all-files --show-diff-on-failure
+          done
+
+  docs-build:
+    name: Docs build (mkdocs --strict)
+    needs: changes
+    if: needs.changes.outputs.docs == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+          cache: pip
+          cache-dependency-path: requirements-dev.txt
+
+      - name: Install dev dependencies
+        run: python -m pip install -r requirements-dev.txt
+
+      - name: Build the documentation
+        run: mkdocs build --strict
+
+  docker:
+    name: Build Docker image (test)
+    needs: changes
+    if: needs.changes.outputs.docker == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    env:
+      IMAGE: smr-ci:${{ github.sha }}
+      VERSION: 0.0.0-ci
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build (linux/amd64, no push)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          load: true
+          push: false
+          provenance: false
+          tags: ${{ env.IMAGE }}
+          build-args: VERSION=${{ env.VERSION }}
+          cache-from: |
+            type=gha,scope=ci
+            type=gha,scope=release
+          # Written on main only; pull requests read the cache of main.
+          cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,mode=max,scope=ci' || '' }}
+
+      - name: Smoke test the image
+        run: scripts/smoke_test_image.sh "$IMAGE" "$VERSION"

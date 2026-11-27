@@ -106,9 +106,10 @@ def release_repo(tmp_path):
 def run_prepare_release(repo: Path, tools: list[str], skip: str | None = None):
     """Run the script with only git, cat and the fake ``tools`` on PATH.
 
-    The fake pre-commit records SKIP and, like the real one, fails when a
-    hook whose executable is missing is not skipped. pytest is not on PATH,
-    so the test suite is not run recursively.
+    The fake pre-commit records SKIP and, like the real one, fails when the
+    helm-lint hook (the only one that needs a tool from PATH: the others are
+    pinned and installed by pre-commit) is not skipped without helm. pytest
+    and python3 are not on PATH, so the test suite is not run recursively.
     """
     bin_dir = repo.parent / "bin"
     bin_dir.mkdir()
@@ -119,12 +120,9 @@ def run_prepare_release(repo: Path, tools: list[str], skip: str | None = None):
         bin_dir / "pre-commit",
         "#!/bin/sh\n"
         f'printf "%s" "$SKIP" > "{record}"\n'
-        "for pair in helm-lint:helm actionlint:actionlint; do\n"
-        '  hook="${pair%%:*}"; tool="${pair#*:}"\n'
-        '  case ",$SKIP," in *",$hook,"*) continue ;; esac\n'
-        '  command -v "$tool" >/dev/null 2>&1 || {\n'
-        '    echo "Executable \\`$tool\\` not found"; exit 1; }\n'
-        "done\n",
+        'case ",$SKIP," in *",helm-lint,"*) exit 0 ;; esac\n'
+        "command -v helm >/dev/null 2>&1 || {\n"
+        '  echo "Executable \\`helm\\` not found"; exit 1; }\n',
     )
     for tool in tools:
         write_executable(bin_dir / tool, "#!/bin/sh\nexit 0\n")
@@ -152,11 +150,10 @@ def run_prepare_release(repo: Path, tools: list[str], skip: str | None = None):
 @pytest.mark.parametrize(
     ("tools", "skip", "expected"),
     [
-        ([], None, "helm-lint,actionlint"),
-        (["helm"], None, "actionlint"),
-        (["actionlint"], None, "helm-lint"),
-        (["helm", "actionlint"], None, ""),
-        ([], "commitlint", "commitlint,helm-lint,actionlint"),
+        ([], None, "helm-lint"),
+        (["helm"], None, ""),
+        ([], "commitlint", "commitlint,helm-lint"),
+        (["helm"], "commitlint", "commitlint"),
     ],
 )
 def test_prepare_release_skips_hooks_whose_tool_is_missing(
@@ -168,3 +165,5 @@ def test_prepare_release_skips_hooks_whose_tool_is_missing(
     assert skipped == expected
     assert "pre-commit checks failed" not in result.stderr
     assert "Local checks passed" in result.stdout
+    # Without python3 on PATH the release preview is skipped, not an error.
+    assert "skipping the preview" in result.stdout

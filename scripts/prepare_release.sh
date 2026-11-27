@@ -2,16 +2,18 @@
 set -euo pipefail
 
 # prepare_release.sh
-# Run the local checks before a release and print the release steps.
-# The release flow is: "Manual Version Bump" workflow -> bump PR -> merge ->
-# "Publish Release on Bump PR Merge" (tag + GitHub release + Docker image).
+# Run locally the checks CI runs before a merge to main, and preview the
+# release that the merge would cut. Releases are automatic: on every push to
+# main the "Release" workflow (.github/workflows/release.yml) runs the same
+# checks, computes the version from the Conventional Commits since the last
+# tag and publishes image, chart, tag and GitHub release (see RELEASE.md).
 
 BRANCH_DEFAULT=main
 CHECK_COMMITS_FROM=HEAD~15
 
 die() { echo "ERROR: $*" >&2; exit 1; }
 
-echo "Preparing release checks..."
+echo "Running the pre-merge checks..."
 
 if [ ! -e .git ]; then
   die "must be run from the repository root"
@@ -19,13 +21,13 @@ fi
 
 branch=$(git rev-parse --abbrev-ref HEAD)
 echo "Current branch: $branch"
-if [ "$branch" != "$BRANCH_DEFAULT" ]; then
-  echo "Warning: you are not on '$BRANCH_DEFAULT'; releases are cut from '$BRANCH_DEFAULT'."
+if [ "$branch" = "$BRANCH_DEFAULT" ]; then
+  echo "Note: you are on '$BRANCH_DEFAULT'; changes reach it through pull requests."
 fi
 
 echo "Checking working tree is clean..."
 if ! git diff-index --quiet HEAD --; then
-  die "working tree is dirty; commit or stash changes before preparing a release"
+  die "working tree is dirty; commit or stash changes first"
 fi
 
 echo "Running Python tests (pytest)..."
@@ -37,18 +39,14 @@ fi
 
 echo "Running pre-commit hooks..."
 if command -v pre-commit >/dev/null 2>&1; then
-  # The helm-lint and actionlint hooks need helm / actionlint on PATH (both
-  # optional locally; CI runs them in dedicated jobs): skip the ones whose tool
-  # is missing, on top of any SKIP already set.
+  # The helm-lint hook needs helm on PATH (optional locally; CI runs it in
+  # "Helm chart lint"): skip it when helm is missing, on top of any SKIP
+  # already set. Every other hook is pinned and installed by pre-commit.
   skip="${SKIP:-}"
-  for hook_tool in helm-lint:helm actionlint:actionlint; do
-    hook="${hook_tool%%:*}"
-    tool="${hook_tool#*:}"
-    if ! command -v "$tool" >/dev/null 2>&1; then
-      echo "$tool not found: skipping the $hook hook"
-      skip="${skip:+$skip,}$hook"
-    fi
-  done
+  if ! command -v helm >/dev/null 2>&1; then
+    echo "helm not found: skipping the helm-lint hook"
+    skip="${skip:+$skip,}helm-lint"
+  fi
   SKIP="$skip" pre-commit run --all-files || die "pre-commit checks failed"
 else
   echo "pre-commit not found: skipping hook run"
@@ -66,32 +64,27 @@ if command -v helm >/dev/null 2>&1; then
   helm lint charts/social-media-reuploader --strict || die "helm lint failed"
 fi
 
-echo "Checking release workflows..."
-for wf in manual-version-bump.yml publish-bump-release.yml docker-publish.yml; do
-  [ -f ".github/workflows/$wf" ] || echo "Missing .github/workflows/$wf"
-done
-
-echo "Checking version metadata..."
-if [ -f src/__init__.py ]; then
-  ver=$(python3 scripts/get_version.py)
-  echo "Version (latest tag or src/__init__.py): $ver"
-fi
-if [ -f charts/social-media-reuploader/Chart.yaml ]; then
-  grep -E '^(version|appVersion):' charts/social-media-reuploader/Chart.yaml
+echo "Previewing the release..."
+if [ -f scripts/release/version.py ] && command -v python3 >/dev/null 2>&1; then
+  # Needs the tags: git fetch --tags. A merge to main of these commits as one
+  # squashed commit releases what its pull request title says (the PR title
+  # check shows it).
+  python3 scripts/release/version.py plan --ref HEAD || echo "release preview not available"
+else
+  echo "python3 or scripts/release/version.py not found: skipping the preview"
 fi
 
 cat <<'EOF'
 
-Local checks passed. To publish a release:
-  1) Run the "Manual Version Bump" workflow (Actions tab, or:
-       gh workflow run manual-version-bump.yml --ref main)
-     It computes the next version from the Conventional Commits since the last
-     tag, bumps src/__init__.py and the chart, opens the bump PR and runs CI on it.
-  2) Review and merge the bump PR "chore(release): bump versions to vX.Y.Z".
-  3) "Publish Release on Bump PR Merge" creates the tag and the GitHub release
-     and publishes ghcr.io/<owner>/social-media-reuploader:X.Y.Z (and :latest).
-  To rebuild the image of an existing tag: run "Manual Docker build and publish
-  to GHCR" with that tag.
+Local checks passed. Releases need no manual step:
+  1) Open a pull request with a Conventional Commits title (feat: minor,
+     fix/perf: patch, `!` or BREAKING CHANGE: major, minor while 0.y.z).
+  2) Squash-merge it once the checks are green.
+  3) The "Release" workflow tests main again, publishes
+     ghcr.io/<owner>/social-media-reuploader:X.Y.Z (and latest) and
+     oci://ghcr.io/<owner>/charts/social-media-reuploader X.Y.Z, signs both
+     and creates the tag vX.Y.Z and the GitHub release.
+  To publish an existing tag again: Actions > Release > Run workflow, tag=vX.Y.Z.
 EOF
 
 echo "Done."
