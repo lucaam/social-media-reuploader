@@ -342,18 +342,39 @@ class WorkerPool:
         await self._sweep_workdirs(startup=True)
 
     async def _clear_stale_reactions(self, rows: list[dict[str, Any]]) -> None:
-        """Remove the 👀 of interrupted rows the recovery settled for good
-        (failed or aborted): nothing would ever replace it. Requeued rows
-        keep it; they are processed again."""
+        """Settle the feedback of interrupted rows the recovery closed for good.
+
+        Failed or aborted: their 👀 is removed (nothing would replace it). An
+        upload interrupted by a crash is never resent (the post may exist),
+        but its user gets the same 🤷 (plus, in private chats, how to get the
+        media anyway) as after a graceful stop. Requeued rows keep the 👀;
+        they are processed again.
+        """
         for row in rows:
             current = await db.aio(db.get_request, int(row["id"]))
             if current is None or current["status"] not in db.TERMINAL_STATUSES:
                 continue
             chat_id, message_id = current["chat_id"], current["original_message_id"]
-            if isinstance(chat_id, int) and isinstance(message_id, int):
+            if not (isinstance(chat_id, int) and isinstance(message_id, int)):
+                continue
+            if current.get("error_code") == "interrupted_while_sending":
+                self._spawn(
+                    self._notify_interrupted_upload(current), f"shrug-{chat_id}"
+                )
+            else:
                 self._spawn(
                     self._clear_reaction(chat_id, message_id), f"unreact-{chat_id}"
                 )
+
+    async def _notify_interrupted_upload(self, row: dict[str, Any]) -> None:
+        try:
+            request = pipeline.Request.from_row(row)
+        except ValueError:
+            return
+        feedback = pipeline.Feedback(self.token, request)
+        reacted = await feedback.finish(pipeline.REACTION_UNKNOWN)
+        if request.is_private or not reacted:
+            await feedback.reply(messages.INTERRUPTED_WHILE_SENDING)
 
     async def _clear_reaction(self, chat_id: int, message_id: int) -> None:
         result = await telegram_api.set_message_reaction(

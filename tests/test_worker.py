@@ -2131,16 +2131,28 @@ def test_start_removes_the_eyes_of_requests_the_recovery_failed(env):
             if call[2][1] is None
         )
 
+    def shrugged():
+        return [
+            (call[1], call[2][0])
+            for call in env.tg.of("set_message_reaction")
+            if call[2][1] == "🤷"
+        ]
+
     async def scenario():
         pool = await started_pool()
         try:
             await wait_until(lambda: status(requeued) == "done")
-            await wait_until(lambda: len(cleared()) == 2)
+            await wait_until(lambda: len(cleared()) == 1 and len(shrugged()) == 1)
         finally:
             await pool.stop()
 
     run(scenario())
-    assert cleared() == [(43, 2), (44, 3)]  # the requeued one got 👀 then 🏆
+    # the exhausted one loses its 👀; the requeued one got 👀 then 🏆
+    assert cleared() == [(44, 3)]
+    # the upload interrupted by the crash is not resent, but not silent either
+    assert shrugged() == [(43, 2)]
+    notices = [(c[1], c[2][0]) for c in env.tg.of("send_message")]
+    assert notices == [(43, messages.INTERRUPTED_WHILE_SENDING)]
     assert [call[1] for call in env.tg.uploads()] == [42]
 
 
