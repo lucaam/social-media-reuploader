@@ -1,0 +1,13 @@
+# Not part of the packaged chart.
+tests/
+ci/
+.DS_Store
+*.swp
+*.bak
+*.tmp
+*.orig
+*~
+.git/
+.gitignore
+.idea/
+.vscode/

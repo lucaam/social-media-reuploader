@@ -1,0 +1,61 @@
+name: PR title
+
+# Pull requests are squash-merged: their title becomes the commit on main,
+# and that commit decides what the release workflow publishes (feat: minor,
+# fix: patch, ...). The title is linted with the commitlint configuration
+# used for local commits (commitlint.config.mjs), and the job summary tells
+# what merging the pull request releases.
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+
+permissions: {}
+
+concurrency:
+  group: pr-title-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    # bash -eo pipefail
+    shell: bash
+
+jobs:
+  # Required status check "commitlint": keep the name.
+  commitlint:
+    name: commitlint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Node.js
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+
+      - name: Install commitlint (package-lock.json)
+        run: npm ci --ignore-scripts --no-audit --no-fund
+
+      - name: Lint the title (Conventional Commits)
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: printf '%s\n' "$TITLE" | npx --no-install commitlint --verbose
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: "3.14"
+
+      - name: What merging releases
+        env:
+          TITLE: ${{ github.event.pull_request.title }}
+        run: |
+          impact="$(python scripts/release/version.py check-title "$TITLE")"
+          echo "$impact"
+          echo "$impact" >> "$GITHUB_STEP_SUMMARY"

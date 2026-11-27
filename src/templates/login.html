@@ -1,0 +1,29 @@
+<!doctype html>
+<html lang="it">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Accesso — Social media reuploader</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet" href="$bootstrap_css" integrity="$bootstrap_sri" crossorigin="anonymous">
+    <link rel="stylesheet" href="static/app.css?v=$asset_version">
+  </head>
+  <body class="page-center">
+    <main class="login-card">
+      <h1 class="brand h5 mb-1">Social media reuploader</h1>
+      <p class="text-body-secondary small mb-3">Accesso amministratore con token</p>
+      $error_block
+      <form method="post" action="login">
+        <input class="d-none" type="text" name="username" value="admin"
+               autocomplete="username" tabindex="-1" aria-hidden="true">
+        <label class="form-label" for="token">Token amministratore</label>
+        <input class="form-control" id="token" name="token" type="password"
+               autocomplete="current-password" required autofocus>
+        <button class="btn btn-primary w-100 mt-3" type="submit">Accedi</button>
+      </form>
+      <p class="small text-body-secondary mt-3 mb-0">
+        Dopo l'accesso verrai portato alla <a href="./">console di amministrazione</a>.
+      </p>
+    </main>
+  </body>
+</html>

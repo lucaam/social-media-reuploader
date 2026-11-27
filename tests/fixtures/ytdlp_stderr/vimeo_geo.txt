@@ -1,0 +1,2 @@
+WARNING: [vimeo] C3xYz12AbCd: Main webpage is locked behind the login page. Use --cookies or --cookies-from-browser to pass cookies for the authentication.
+ERROR: [vimeo] 123456789: This video is not available from your location due to geo restriction. You might want to use a VPN or a proxy server (with --proxy) to workaround.

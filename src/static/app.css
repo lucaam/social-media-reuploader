@@ -1,0 +1,160 @@
+/* Admin console styles (served from /static: no inline styles anywhere). */
+
+/* Bootstrap's reboot has the same rule; repeated here so that hidden elements
+   (#boot, the overlays, the modal) stay hidden when its CDN stylesheet does not
+   load, since author rules such as .page-center { display: flex } beat the
+   browser's own [hidden] rule. */
+[hidden] {
+  display: none !important;
+}
+
+body {
+  background: #f6f7f9;
+  font-size: 0.95rem;
+}
+
+.brand {
+  font-weight: 700;
+  color: #0d6efd;
+}
+
+.page-center {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100vh;
+  padding: 2rem 1rem;
+}
+
+.app-header {
+  position: sticky;
+  top: 0;
+  z-index: 1000;
+}
+
+.overlay {
+  position: fixed;
+  inset: 0;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+  background: rgba(15, 23, 42, 0.45);
+  z-index: 2000;
+}
+
+.login-card {
+  width: 100%;
+  max-width: 480px;
+  background: #fff;
+  padding: 1.5rem;
+  border-radius: 0.75rem;
+  border: 1px solid rgba(0, 0, 0, 0.08);
+  box-shadow: 0 10px 30px rgba(0, 0, 0, 0.08);
+}
+
+.card {
+  border-color: rgba(0, 0, 0, 0.07);
+}
+
+.stat-card .card-body {
+  padding: 0.75rem 1rem;
+}
+
+.stat-label {
+  color: #6c757d;
+  font-size: 0.8rem;
+}
+
+.stat-value {
+  font-size: 1.35rem;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+
+.stat-sub {
+  color: #6c757d;
+  font-size: 0.78rem;
+  min-height: 1.1em;
+}
+
+.chart-box {
+  position: relative;
+  height: 240px;
+}
+
+.chart-unavailable {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100%;
+  color: #6c757d;
+  font-size: 0.85rem;
+  text-align: center;
+}
+
+.mono {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Roboto Mono", monospace;
+}
+
+.text-truncate-link {
+  display: inline-block;
+  max-width: 30ch;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  vertical-align: bottom;
+}
+
+.table td,
+.table th {
+  white-space: nowrap;
+}
+
+.table td.wrap {
+  white-space: normal;
+  min-width: 9rem;
+  max-width: 22rem;
+}
+
+.badge {
+  font-weight: 500;
+}
+
+.list-group-item .item-meta {
+  color: #6c757d;
+  font-size: 0.8rem;
+}
+
+.empty-note {
+  color: #6c757d;
+  font-size: 0.85rem;
+  padding: 0.5rem 0;
+}
+
+.pre-wrap {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.detail-grid dt {
+  color: #6c757d;
+  font-weight: 500;
+}
+
+.detail-grid dd {
+  word-break: break-word;
+}
+
+.toast-container {
+  z-index: 3000;
+}
+
+.page-link {
+  cursor: pointer;
+}
+
+/* Sessions table: keep long user agents on one line */
+.session-agent {
+  max-width: 28rem;
+}

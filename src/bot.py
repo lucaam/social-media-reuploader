@@ -1,519 +1,746 @@
+"""Bot process entrypoint: ``python -m src`` (also ``python -m src.bot``).
+
+One code path for both ways of receiving updates (``config.MODE``):
+
+* ``polling`` (default): ``deleteWebhook`` first (a leftover webhook makes
+  every getUpdates fail with 409 Conflict), then aiogram long polling with an
+  explicit ``allowed_updates`` list.
+* ``webhook`` (only when ``WEBHOOK_URL`` is set, otherwise the bot logs a
+  warning and polls): aiogram ``SimpleRequestHandler`` on
+  ``config.WEBHOOK_PATH`` with a secret token, registered with
+  ``setWebhook`` at startup. ``python -m src.main`` starts this mode.
+
+Both modes serve /health, /ready and /metrics on ``config.HOST:config.PORT``
+(see :mod:`src.http_server`) and use the same handlers (:mod:`src.handlers`).
+
+Startup: logging -> configuration problems and summary -> token format and
+webhook settings checks -> ``db.init_db()`` -> HTTP server -> getMe (token
+check) -> ``providers.warm_up()`` (in a thread) -> ``WorkerPool.start()`` ->
+receive updates.
+
+Shutdown on SIGTERM/SIGINT (a second signal forces it): stop receiving
+updates -> wait for running update handlers -> ``WorkerPool.stop()`` -> close
+the aiogram and shared HTTP client sessions -> stop the HTTP server. A signal
+during startup cancels a pending getMe/deleteWebhook/setWebhook call (they
+retry for minutes when the Bot API does not answer) and exits with 0.
+
+Exit codes: 0 after a normal shutdown, 1 on runtime failures, 2 on
+configuration errors (missing or rejected ``BOT_TOKEN``, invalid webhook
+secret). The bot token and the webhook URL are never logged.
+"""
+
+from __future__ import annotations
+
 import asyncio
+import json
 import logging
 import os
 import re
+import signal
+from collections.abc import Awaitable, Callable
+from dataclasses import dataclass
+from logging.handlers import RotatingFileHandler
+from typing import Any, TypeVar
+from urllib.parse import urlsplit, urlunsplit
 
-from aiogram import Bot, Dispatcher
-from aiogram.types import ChatMemberUpdated, Message, Update
+import aiohttp
+from aiogram import BaseMiddleware, Bot, Dispatcher
+from aiogram.exceptions import TelegramUnauthorizedError
+from aiogram.types import TelegramObject
+from aiogram.utils.token import TokenValidationError
 from aiohttp import web
 
-from . import __version__, config, db, http_client, telegram_api, telegram_client
-from .link_utils import find_links, is_supported
+from . import (
+    __version__,
+    config,
+    db,
+    handlers,
+    http_client,
+    http_server,
+    providers,
+    telegram_api,
+    telegram_client,
+)
+from .handlers import ALLOWED_UPDATES
 from .worker import WorkerPool
-
-TELEGRAM_URL_RE = re.compile(r"https?://(?:t\.me|telegram\.me)/", re.IGNORECASE)
 
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    "ALLOWED_UPDATES",
+    "EXIT_CONFIG",
+    "EXIT_FAILURE",
+    "EXIT_OK",
+    "BotApp",
+    "StartupError",
+    "UpdateTracker",
+    "WebhookSettings",
+    "create_dispatcher",
+    "main",
+    "run",
+    "select_mode",
+    "setup_logging",
+    "webhook_settings",
+    "webhook_target",
+]
 
-async def handle_message(message: Message):
-    try:
-        # Log a detailed dump for debugging (entities, caption, media)
+EXIT_OK = 0
+EXIT_FAILURE = 1
+EXIT_CONFIG = 2
+
+POLLING_TIMEOUT = 10  # getUpdates long-poll seconds
+HANDLER_CONCURRENCY = 32  # update handlers running at the same time (polling)
+HANDLER_DRAIN_SECONDS = 10.0  # wait for running handlers at shutdown
+POLLING_STOP_SECONDS = 15.0
+TRACKER_KEY = "update_tracker"
+MISSING_TOKEN_MESSAGE = (
+    "BOT_TOKEN is not set: create a bot with @BotFather and start the bot with "
+    "the BOT_TOKEN environment variable set to its token"
+)
+_SECRET_RE = re.compile(r"[A-Za-z0-9_-]{1,256}")
+_LOG_FORMAT = "%(asctime)s %(levelname)s %(name)s: %(message)s"
+_T = TypeVar("_T")
+# Handlers installed by setup_logging (replaced, never duplicated, on a new call).
+_installed_handlers: list[logging.Handler] = []
+
+
+class StartupError(Exception):
+    """The bot cannot start; ``exit_code`` is the process exit status."""
+
+    def __init__(self, message: str, exit_code: int = EXIT_FAILURE) -> None:
+        super().__init__(message)
+        self.exit_code = exit_code
+
+
+# ---------------------------------------------------------------------------
+# Dispatcher
+# ---------------------------------------------------------------------------
+class UpdateTracker(BaseMiddleware):
+    """Outer update middleware counting running handlers (graceful drain)."""
+
+    def __init__(self) -> None:
+        self.active = 0
+        self.handled = 0
+        self._idle = asyncio.Event()
+        self._idle.set()
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        self.active += 1
+        self._idle.clear()
         try:
-            dump = (
-                message.model_dump()
-                if hasattr(message, "model_dump")
-                else repr(message)
-            )
-            logger.debug("Message dump: %s", dump)
-        except Exception:
-            logger.debug("Could not dump message object")
+            return await handler(event, data)
+        finally:
+            self.active -= 1
+            self.handled += 1
+            if self.active == 0:
+                self._idle.set()
 
-        # Extract text from common fields
-        text = ""
-        if getattr(message, "text", None):
-            text = message.text or ""
-        elif getattr(message, "caption", None):
-            text = message.caption or ""
-
-        chat = message.chat
-        chat_id = chat.id if chat else None
-        message_id = getattr(message, "message_id", None)
-        # deduplicate: skip processing if we've already handled this message
+    async def wait_idle(self, seconds: float) -> bool:
+        """Wait until no handler runs; False if still busy after ``seconds``."""
+        if self._idle.is_set():
+            return True
         try:
-            if chat_id and message_id and db.is_message_processed(chat_id, message_id):
-                logger.info(
-                    "Skipping already-processed message chat=%s id=%s",
-                    chat_id,
-                    message_id,
+            await asyncio.wait_for(self._idle.wait(), seconds)
+        except TimeoutError:
+            return False
+        return True
+
+
+class ChatOrder(BaseMiddleware):
+    """Outer update middleware: one chat's updates are handled in arrival order.
+
+    aiogram handles the updates of a batch concurrently and link checks run in
+    threads, so a later message of a chat could be queued first (and the
+    earlier one deferred by the rate limits). The per-chat lock is acquired
+    before any other await, and asyncio locks wake their waiters in FIFO
+    order, so updates of a chat run one at a time in the order they arrived;
+    different chats still run concurrently. Idle locks are dropped.
+    """
+
+    def __init__(self) -> None:
+        self._locks: dict[int, tuple[asyncio.Lock, int]] = {}
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        chat_id = _update_chat_id(event)
+        if chat_id is None:
+            return await handler(event, data)
+        lock, users = self._locks.get(chat_id) or (asyncio.Lock(), 0)
+        self._locks[chat_id] = (lock, users + 1)
+        try:
+            async with lock:
+                return await handler(event, data)
+        finally:
+            lock, users = self._locks[chat_id]
+            if users <= 1:
+                del self._locks[chat_id]
+            else:
+                self._locks[chat_id] = (lock, users - 1)
+
+    @property
+    def chats(self) -> int:
+        """Chats with an update running or waiting (for tests and debugging)."""
+        return len(self._locks)
+
+
+def _update_chat_id(update: TelegramObject) -> int | None:
+    inner = getattr(update, "event", None)
+    chat = getattr(inner, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    return chat_id if isinstance(chat_id, int) else None
+
+
+def create_dispatcher(
+    pool: handlers.SubmitPool, *, bot_info: dict[str, Any] | None = None
+) -> Dispatcher:
+    """The aiogram dispatcher used in both modes.
+
+    Handlers get ``pool`` (the :class:`~src.worker.WorkerPool`) and
+    ``bot_info`` (the getMe result, set at startup) from the workflow data.
+    """
+    dispatcher = Dispatcher(disable_fsm=True, pool=pool, bot_info=bot_info)
+    tracker = UpdateTracker()
+    dispatcher.update.outer_middleware(tracker)
+    dispatcher.update.outer_middleware(ChatOrder())
+    dispatcher[TRACKER_KEY] = tracker
+    dispatcher.include_router(handlers.create_router())
+    return dispatcher
+
+
+# ---------------------------------------------------------------------------
+# Logging and configuration
+# ---------------------------------------------------------------------------
+def setup_logging() -> None:
+    """Configure the root logger from config (idempotent) and redact tokens.
+
+    ``LOG_LEVEL``, optional rotating file (``LOG_TO_FILE``, ``LOG_FILE``,
+    ``LOG_MAX_BYTES``, ``LOG_BACKUP_COUNT``). Calling it again replaces the
+    handlers it installed before instead of adding duplicates.
+    """
+    root = logging.getLogger()
+    while _installed_handlers:
+        old = _installed_handlers.pop()
+        root.removeHandler(old)
+        old.close()
+
+    problems: list[str] = []
+    level_name = str(getattr(config, "LOG_LEVEL", "INFO") or "INFO").upper()
+    level = logging.getLevelNamesMapping().get(level_name)
+    if level is None:
+        problems.append(f"LOG_LEVEL={level_name!r} is not a log level; using INFO")
+        level = logging.INFO
+
+    new_handlers: list[logging.Handler] = [logging.StreamHandler()]
+    if getattr(config, "LOG_TO_FILE", False):
+        path = str(getattr(config, "LOG_FILE", "") or "telegram_downloader.log")
+        try:
+            directory = os.path.dirname(path)
+            if directory:
+                os.makedirs(directory, exist_ok=True)
+            new_handlers.append(
+                RotatingFileHandler(
+                    path,
+                    maxBytes=int(getattr(config, "LOG_MAX_BYTES", 5 * 1024 * 1024)),
+                    backupCount=int(getattr(config, "LOG_BACKUP_COUNT", 5)),
+                    encoding="utf-8",
                 )
-                return
-            if chat_id and message_id:
-                db.mark_message_processed(chat_id, message_id)
-        except Exception:
-            # don't fail if DB dedup check fails
-            pass
+            )
+        except OSError as exc:
+            problems.append(f"Cannot write the log file ({exc}); logging to stderr")
 
+    formatter = logging.Formatter(_LOG_FORMAT)
+    for handler in new_handlers:
+        handler.setFormatter(formatter)
+        root.addHandler(handler)
+        _installed_handlers.append(handler)
+    root.setLevel(level)
+    # aiogram logs one INFO line per update: keep that for DEBUG.
+    logging.getLogger("aiogram.event").setLevel(
+        logging.DEBUG if level <= logging.DEBUG else logging.WARNING
+    )
+    telegram_api.install_log_redaction()
+    for problem in problems:
+        logger.warning(problem)
+
+
+def log_startup(mode: str) -> None:
+    """Banner, every configuration problem and the non-secret settings."""
+    logger.info(
+        "Social Media Reuploader v%s starting (mode %s, pid %s)",
+        __version__,
+        mode,
+        os.getpid(),
+    )
+    for problem in (*config.validate(), *providers.config_problems()):
+        logger.warning("Configuration: %s", problem)
+    logger.info(
+        "Configuration: %s", json.dumps(config.summary(), sort_keys=True, default=str)
+    )
+
+
+def select_mode(requested: str | None = None) -> str:
+    """``"webhook"`` only when asked for and ``WEBHOOK_URL`` is set."""
+    configured = str(getattr(config, "MODE", "polling") or "polling").lower()
+    mode = (requested or configured).lower()
+    if mode not in ("polling", "webhook"):
+        logger.warning("Unknown mode %r: using polling", mode)
+        return "polling"
+    if mode == "webhook" and not getattr(config, "WEBHOOK_URL", None):
+        if configured != "webhook":  # config.validate() reports the other case
+            logger.warning("Webhook mode needs WEBHOOK_URL: falling back to polling")
+        return "polling"
+    return mode
+
+
+@dataclass(frozen=True)
+class WebhookSettings:
+    url: str  # registered with Telegram (never logged)
+    path: str  # served locally
+    secret: str
+    token_in_url: bool  # legacy WEBHOOK_URL containing the bot token
+
+
+def webhook_target(url: str, token: str, path: str) -> tuple[str, bool]:
+    """``(URL to register, contains the token)`` for a ``WEBHOOK_URL``.
+
+    Legacy values with ``{token}`` or the token itself are kept (the
+    deprecated ``/webhook/{token}`` route serves them); a URL without a path
+    gets ``path`` appended; anything else is used as it is.
+    """
+    if "{token}" in url:
+        return url.replace("{token}", token), True
+    if token in url:
+        return url, True
+    parts = urlsplit(url)
+    if parts.path in ("", "/"):
+        return urlunsplit(parts._replace(path=path)), False
+    return url, False
+
+
+def _webhook_path() -> str:
+    path = str(getattr(config, "WEBHOOK_PATH", "/webhook") or "/webhook").strip()
+    return path if path.startswith("/") else "/" + path
+
+
+def webhook_settings(token: str) -> WebhookSettings:
+    """Validated webhook settings (StartupError with exit code 2 if invalid)."""
+    url = getattr(config, "WEBHOOK_URL", None)
+    if not url:
+        raise StartupError("WEBHOOK_URL is not set", EXIT_CONFIG)
+    secret = config.webhook_secret()
+    if not secret or not _SECRET_RE.fullmatch(secret):
+        raise StartupError(
+            "WEBHOOK_SECRET must be 1-256 characters among A-Z, a-z, 0-9, '_' "
+            "and '-'",
+            EXIT_CONFIG,
+        )
+    path = _webhook_path()
+    if "{" in path or "}" in path:
+        raise StartupError(
+            "WEBHOOK_PATH must be a fixed path such as /webhook (no {placeholders})",
+            EXIT_CONFIG,
+        )
+    target, token_in_url = webhook_target(url, token, path)
+    if token_in_url:
+        logger.warning(
+            "WEBHOOK_URL contains the bot token, which ends up in proxy and "
+            "access logs. This is deprecated: set WEBHOOK_URL to the public URL "
+            "of WEBHOOK_PATH; requests are authenticated with a secret token."
+        )
+    elif urlsplit(target).path.rstrip("/") != path.rstrip("/"):
         logger.info(
-            "Incoming message: chat=%s type=%s from=%s text=%s",
-            getattr(chat, "id", None),
-            getattr(chat, "type", None),
-            getattr(getattr(message, "from_user", None), "id", None),
-            (text or "")[:200],
+            "The path of WEBHOOK_URL differs from WEBHOOK_PATH: the reverse "
+            "proxy must forward webhook requests to WEBHOOK_PATH"
         )
+    return WebhookSettings(target, path, secret, token_in_url)
 
-        # extract links from text and from entities (text_link, url)
-        links = []
-        if text:
-            links.extend(find_links(text))
+
+# ---------------------------------------------------------------------------
+# Lifecycle
+# ---------------------------------------------------------------------------
+BotFactory = Callable[[str], Bot]
+PoolFactory = Callable[[str], Any]
+
+
+class BotApp:
+    """One bot process: HTTP server, worker pool and update receiver."""
+
+    def __init__(
+        self,
+        token: str,
+        *,
+        mode: str = "polling",
+        host: str | None = None,
+        port: int | None = None,
+        bot_factory: BotFactory | None = None,
+        pool_factory: PoolFactory | None = None,
+    ) -> None:
+        self.token = token
+        self.mode = mode
+        self.host = host or config.HOST
+        self.port = config.PORT if port is None else port
+        self.state = http_server.HealthState(mode=mode)
+        self.exit_code = EXIT_OK
+        self._bot_factory = bot_factory or telegram_client.get_bot
+        self._pool_factory = pool_factory or WorkerPool
+        self._stop = asyncio.Event()
+        self._task: asyncio.Task[Any] | None = None
+        self._signals: list[signal.Signals] = []
+        self._bot: Bot | None = None
+        self._pool: Any = None
+        self._pool_start_attempted = False
+        self._dispatcher: Dispatcher | None = None
+        self._runner: web.AppRunner | None = None
+        self._webhook: WebhookSettings | None = None
+        self._polling_task: asyncio.Task[None] | None = None
+        self._shutdown_started = False
+
+    # -- public -------------------------------------------------------------
+    @property
+    def dispatcher(self) -> Dispatcher | None:
+        return self._dispatcher
+
+    @property
+    def http_port(self) -> int | None:
+        """The bound HTTP port (useful with ``port=0``)."""
+        if self._runner is None or not self._runner.addresses:
+            return None
+        return int(self._runner.addresses[0][1])
+
+    def request_stop(self) -> None:
+        """Start a graceful shutdown (what SIGTERM does)."""
+        self._stop.set()
+
+    async def run(self) -> int:
+        """Start, serve until stopped, shut down; returns the exit code."""
+        self._task = asyncio.current_task()
+        self._install_signal_handlers()
         try:
-            entities = getattr(message, "entities", None) or getattr(
-                message, "caption_entities", None
-            )
-            if entities:
-                for ent in entities:
-                    t = getattr(ent, "type", None)
-                    if t == "text_link":
-                        url = getattr(ent, "url", None)
-                        if url:
-                            links.append(url)
-                    elif t == "url":
-                        # extract substring from message text
-                        try:
-                            off = int(getattr(ent, "offset", 0))
-                            ln = int(getattr(ent, "length", 0))
-                            src = text or ""
-                            url = src[off : off + ln]
-                            if url:
-                                links.append(url)
-                        except Exception:
-                            pass
+            await self._start()
+            if not self._stop.is_set():
+                await self._serve()
+        except StartupError as exc:
+            logger.error("%s", exc)
+            self.exit_code = exc.exit_code
         except Exception:
-            logger.debug("Could not parse message entities")
-
-        # deduplicate links preserving order
-        if links:
-            seen = set()
-            deduped = []
-            for link in links:
-                if link not in seen:
-                    seen.add(link)
-                    deduped.append(link)
-            links = deduped
-
-        # also detect any other http(s) URLs so we can handle unsupported sites
-        url_pattern = re.compile(r"https?://[^\s)\]\>]+", re.IGNORECASE)
-        all_urls = []
-        if text:
-            for m in url_pattern.finditer(text):
-                all_urls.append(m.group(0))
-        if all_urls:
-            seen2 = set()
-            deduped2 = []
-            for u in all_urls:
-                if u not in seen2:
-                    seen2.add(u)
-                    deduped2.append(u)
-            all_urls = deduped2
-
-        if (links or all_urls) and chat_id:
-            # persist the update as well (defensive)
+            logger.exception("The bot failed")
+            self.exit_code = EXIT_FAILURE
+        finally:
             try:
-                db.add_update(str({"chat_id": chat_id, "links": links or all_urls}))
-            except Exception:
-                logger.debug("Could not persist link update")
+                await self._shutdown()
+            finally:
+                self._remove_signal_handlers()
+        return self.exit_code
 
-            # build a short description by removing urls from message text
-            description = ""
-            try:
-                description = text or ""
-                for link in links or all_urls:
-                    description = description.replace(link, "")
-                description = description.strip()
-            except Exception:
-                description = ""
+    # -- startup ------------------------------------------------------------
+    async def _start(self) -> None:
+        if self.mode == "webhook":
+            self._webhook = webhook_settings(self.token)
+        try:
+            bot = self._bot = self._bot_factory(self.token)
+        except TokenValidationError as exc:
+            raise StartupError(
+                "BOT_TOKEN is not a valid bot token", EXIT_CONFIG
+            ) from exc
+        await db.aio(db.init_db)
+        if self.mode == "polling":
+            self.state.polling = http_server.PollingMonitor()
+            bot.session.middleware(self.state.polling)
+        self._pool = self._pool_factory(self.token)
+        # The worker heartbeat must report the mode the bot really runs in
+        # (python -m src.main forces webhook mode whatever config.MODE says).
+        self._pool.mode = self.mode
+        dispatcher = self._dispatcher = create_dispatcher(self._pool)
 
-            # pass chat type so worker can decide whether to reply on errors
-            ctype = getattr(chat, "type", "private")
-
-            # handle supported links (enqueue)
-            for url in links:
-                try:
-                    # ignore internal Telegram links (t.me) for enqueue (not processed)
-                    if TELEGRAM_URL_RE.search(url):
-                        logger.info("Ignoring telegram internal link: %s", url)
-                        continue
-                    try:
-                        app_worker.enqueue(
-                            chat_id,
-                            url,
-                            description=description,
-                            original_message_id=message_id,
-                            chat_type=ctype,
-                        )
-                    except Exception:
-                        logger.exception(
-                            "Failed to enqueue link %s for chat=%s", url, chat_id
-                        )
-                except Exception:
-                    logger.exception(
-                        "Failed to enqueue link %s for chat=%s", url, chat_id
-                    )
-
-            # handle unsupported urls: ignore in groups, notify in private
-            supported_sites = "YouTube, TikTok, Instagram, Facebook"
-            for url in all_urls:
-                try:
-                    # skip urls that are supported/handled already
-                    if url in links:
-                        continue
-                    if is_supported(url):
-                        continue
-                    # internal telegram links: ignore in groups, notify in private
-                    if TELEGRAM_URL_RE.search(url):
-                        if ctype and ctype.lower() in (
-                            "group",
-                            "supergroup",
-                            "channel",
-                        ):
-                            logger.info(
-                                "Ignoring telegram internal URL (no action): %s", url
-                            )
-                            continue
-                        try:
-                            if (
-                                app_worker
-                                and getattr(app_worker, "token", None)
-                                and message_id
-                            ):
-                                await telegram_api.set_message_reaction(
-                                    app_worker.token, chat_id, message_id, "👎"
-                                )
-                        except Exception:
-                            logger.debug(
-                                "Could not add 👎 reaction for telegram internal link"
-                            )
-                        try:
-                            await telegram_api.send_message(
-                                app_worker.token,
-                                chat_id,
-                                f"Link non valido. Supporto solo i seguenti siti: {supported_sites}",
-                                reply_to_message_id=message_id,
-                            )
-                        except Exception:
-                            logger.debug("Could not send unsupported link notice")
-                        continue
-
-                    # general unsupported: ignore in groups, notify in private
-                    if ctype and ctype.lower() in ("group", "supergroup", "channel"):
-                        continue
-                    try:
-                        if (
-                            app_worker
-                            and getattr(app_worker, "token", None)
-                            and message_id
-                        ):
-                            await telegram_api.set_message_reaction(
-                                app_worker.token, chat_id, message_id, "👎"
-                            )
-                    except Exception:
-                        logger.debug("Could not add 👎 reaction for unsupported link")
-                    try:
-                        await telegram_api.send_message(
-                            app_worker.token,
-                            chat_id,
-                            f"Link non valido. Supporto solo i seguenti siti: {supported_sites}",
-                            reply_to_message_id=message_id,
-                        )
-                    except Exception:
-                        logger.debug("Could not send unsupported link notice")
-                except Exception:
-                    logger.exception("Error handling unsupported url %s", url)
-    except Exception:
-        logger.exception("Error handling incoming message")
-
-
-async def log_update(update: Update):
-    try:
-        # pydantic model -> json
-        j = update.json()
-    except Exception:
-        j = repr(update)
-    logger.info("Raw update received: %s", j)
-    try:
-        # ensure DB exists and persist update for remote debugging
-        db.init_db()
-        db.add_update(j)
-    except Exception:
-        logger.debug("Could not persist update to DB")
-
-
-async def main():
-    # allow overriding log level with env LOG_LEVEL for diagnostics
-    log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-    log_level_val = getattr(logging, log_level, logging.INFO)
-
-    # configure logging with rotating file handler for persistent debug logs
-    log_dir = os.path.join(os.getcwd(), "data")
-    try:
-        os.makedirs(log_dir, exist_ok=True)
-    except Exception:
-        pass
-    log_file = os.environ.get(
-        "LOG_FILE", os.path.join(log_dir, "telegram_downloader.log")
-    )
-
-    # Configure root logger so all module loggers propagate here
-    root_logger = logging.getLogger()
-    root_logger.setLevel(log_level_val)
-    # console handler
-    ch = logging.StreamHandler()
-    ch.setLevel(log_level_val)
-    ch.setFormatter(
-        logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-    )
-    root_logger.addHandler(ch)
-
-    # rotating file handler (only if enabled via LOG_TO_FILE)
-    try:
-        log_to_file = getattr(config, "LOG_TO_FILE", False)
-        if log_to_file:
-            from logging.handlers import RotatingFileHandler
-
-            fh = RotatingFileHandler(
-                log_file,
-                maxBytes=int(os.environ.get("LOG_MAX_BYTES", 5 * 1024 * 1024)),
-                backupCount=int(os.environ.get("LOG_BACKUP_COUNT", 5)),
+        app = http_server.create_app(self.state)
+        if self._webhook is not None:
+            http_server.add_webhook_routes(
+                app,
+                dispatcher=dispatcher,
+                bot=bot,
+                state=self.state,
+                path=self._webhook.path,
+                secret_token=self._webhook.secret,
+                token=self.token,
             )
-            fh.setLevel(logging.DEBUG)
-            fh.setFormatter(
-                logging.Formatter("%(asctime)s %(levelname)s %(name)s: %(message)s")
-            )
-            root_logger.addHandler(fh)
+        await self._start_http(app)
+
+        me = await self._unless_stopped(self._get_me())
+        if me is None or self._stop.is_set():
+            return
+        dispatcher["bot_info"] = me
+        await asyncio.to_thread(providers.warm_up)
+        if self._stop.is_set():
+            return
+        self._pool_start_attempted = True
+        await self._pool.start()
+        self.state.pool_started = True
+        if self._stop.is_set():
+            return
+        if self.mode == "webhook":
+            await self._start_webhook()
         else:
-            root_logger.debug(
-                "File logging disabled by LOG_TO_FILE (logging to stdout only)"
-            )
-    except Exception:
-        root_logger.debug("Could not create RotatingFileHandler")
-    # Install a lightweight filter to suppress noisy access logs for
-    # Kubernetes liveness/readiness probes on /health unless explicitly
-    # enabled via HEALTH_DEBUG. This avoids cluttering logs with frequent
-    # kube-probe requests while keeping other access logs intact.
-    try:
+            await self._start_polling()
 
-        class _HealthProbeFilter(logging.Filter):
-            def filter(self, record):
-                try:
-                    msg = record.getMessage()
-                    if "/health" in msg:
-                        # suppress kube-probe UA or generic health GET entries
-                        if "kube-probe" in msg.lower() or "get /health" in msg.lower():
-                            return False
-                except Exception:
-                    pass
-                return True
-
-        if not getattr(config, "HEALTH_DEBUG", False):
-            logging.getLogger("aiohttp.access").addFilter(_HealthProbeFilter())
-    except Exception:
-        root_logger.debug("Could not attach health probe log filter")
-    if not config.BOT_TOKEN:
-        raise RuntimeError("BOT_TOKEN is not set in config")
-
-    # Print a concise startup banner and a short runtime configuration
-    try:
-        root_logger.info("Social Media Reuploader v%s starting", __version__)
-        root_logger.info(
-            "Mode=%s host=%s port=%s workers=%s tmp_dir=%s thumbnail=%s max_file_size=%s",
-            getattr(config, "MODE", "polling"),
-            getattr(config, "HOST", "0.0.0.0"),
-            getattr(config, "PORT", "8080"),
-            getattr(config, "WORKERS", 2),
-            getattr(config, "TMP_DIR", "/tmp/telegram_downloader"),
-            getattr(config, "WORKER_GENERATE_THUMBNAIL", True),
-            getattr(config, "TELEGRAM_MAX_FILE_SIZE", 50 * 1024 * 1024),
+    async def _start_http(self, app: web.Application) -> None:
+        try:
+            self._runner = await http_server.start_server(app, self.host, self.port)
+        except OSError as exc:
+            raise StartupError(
+                f"Cannot listen on {self.host}:{self.port}: {exc}"
+            ) from exc
+        endpoints = "/health, /ready, /metrics"
+        if self.mode == "webhook":
+            endpoints += " and the webhook"
+        logger.info(
+            "HTTP server listening on %s:%s (%s)", self.host, self.http_port, endpoints
         )
-        # Helpful operator hint when running the image in Kubernetes: the
-        # container's default command runs the polling bot (python -m src.bot).
-        # To use webhook mode you must either run `python -m src.main` in the
-        # container or set a command override in your Deployment/Helm values.
-        if getattr(config, "MODE", "polling") == "webhook":
-            if not getattr(config, "WEBHOOK_URL", None):
-                root_logger.warning(
-                    "MODE=webhook but WEBHOOK_URL is not set; container image default runs polling unless you override the command/entrypoint"
+
+    async def _unless_stopped(self, call: Awaitable[_T]) -> _T | None:
+        """``await call``, or cancel it and return ``None`` once a stop is requested.
+
+        Startup calls to Telegram retry for minutes when the Bot API does not
+        answer (4 attempts of TELEGRAM_API_TIMEOUT): SIGTERM must not wait.
+        """
+        task = asyncio.ensure_future(call)
+        stop_waiter = asyncio.ensure_future(self._stop.wait())
+        try:
+            await asyncio.wait({task, stop_waiter}, return_when=asyncio.FIRST_COMPLETED)
+        except BaseException:
+            task.cancel()
+            raise
+        finally:
+            stop_waiter.cancel()
+        if task.done():
+            return task.result()
+        task.cancel()
+        await asyncio.wait({task})
+        return None
+
+    async def _get_me(self) -> dict[str, Any]:
+        result = await telegram_api.get_me(self.token)
+        description = telegram_api.redact(result.get("description"), self.token)
+        if not result.get("ok"):
+            if result.get("error_code") in (401, 404):
+                raise StartupError(
+                    f"Telegram rejected BOT_TOKEN ({description}): check the token "
+                    "given by @BotFather",
+                    EXIT_CONFIG,
                 )
-    except Exception:
-        root_logger.info("Social Media Reuploader starting")
+            raise StartupError(f"Cannot reach the Telegram Bot API: {description}")
+        me = result.get("result") or {}
+        logger.info("Authorized as @%s (id %s)", me.get("username"), me.get("id"))
+        if not me.get("can_read_all_group_messages"):
+            logger.warning(
+                "Group privacy mode is enabled: in groups the bot only sees links "
+                "when it is an administrator. Disable it with /setprivacy in "
+                "@BotFather to work as a plain member."
+            )
+        return me
 
-    bot = Bot(token=config.BOT_TOKEN)
-    # register bot instance for reuse by helper APIs
-    telegram_client.set_bot(bot)
-    dp = Dispatcher()
+    async def _start_polling(self) -> None:
+        result = await self._unless_stopped(telegram_api.delete_webhook(self.token))
+        if result is None or self._stop.is_set():
+            return
+        if not result.get("ok"):
+            logger.warning(
+                "deleteWebhook failed (%s): if a webhook is still set, polling "
+                "fails with 409 Conflict",
+                telegram_api.redact(result.get("description"), self.token),
+            )
+        if self.state.polling is not None:
+            self.state.polling.mark_started()
+        if self._dispatcher is None or self._bot is None:  # pragma: no cover
+            raise StartupError("internal error: dispatcher not created")
+        self._polling_task = asyncio.create_task(
+            self._dispatcher.start_polling(
+                self._bot,
+                polling_timeout=POLLING_TIMEOUT,
+                handle_as_tasks=True,
+                allowed_updates=list(ALLOWED_UPDATES),
+                handle_signals=False,
+                close_bot_session=False,
+                tasks_concurrency_limit=HANDLER_CONCURRENCY,
+            ),
+            name="telegram-polling",
+        )
+        self.state.polling_task = self._polling_task
+        logger.info("Receiving updates with long polling")
 
-    # create a WorkerPool instance that handlers will use
-    global app_worker
-    app_worker = WorkerPool(config.BOT_TOKEN, workers=config.WORKERS)
+    async def _start_webhook(self) -> None:
+        settings = self._webhook
+        if settings is None:  # pragma: no cover
+            raise StartupError("internal error: webhook settings missing")
+        self.state.accepting_updates = True
+        result = await self._unless_stopped(
+            telegram_api.set_webhook(
+                self.token,
+                settings.url,
+                secret_token=settings.secret,
+                allowed_updates=list(ALLOWED_UPDATES),
+            )
+        )
+        if result is None:
+            return
+        if not result.get("ok"):
+            raise StartupError(
+                "Telegram refused the webhook: "
+                + telegram_api.redact(result.get("description"), self.token)
+            )
+        self.state.webhook_registered = True
+        logger.info("Webhook registered with Telegram; receiving updates")
 
-    # Provide a lightweight HTTP health endpoint so Kubernetes
-    # liveness/readiness probes don't kill the process while
-    # long-running downloads/transcodes are in progress.
-    # Start the health endpoint unless we're running in webhook
-    # mode with a configured `WEBHOOK_URL` (in that case another
-    # HTTP server will be serving webhooks/health).
-    health_runner = None
-    mode = getattr(config, "MODE", "polling")
-    webhook_url = getattr(config, "WEBHOOK_URL", None)
-    if not (mode == "webhook" and webhook_url):
+    # -- running ------------------------------------------------------------
+    async def _serve(self) -> None:
+        stop_waiter = asyncio.create_task(self._stop.wait(), name="stop-waiter")
+        waiters: set[asyncio.Task[Any]] = {stop_waiter}
+        if self._polling_task is not None:
+            waiters.add(self._polling_task)
         try:
+            done, _ = await asyncio.wait(waiters, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            stop_waiter.cancel()
+        if self._polling_task is not None and self._polling_task in done:
+            self._polling_ended(self._polling_task)
 
-            async def _health(request: web.Request):
-                # Minimal response for probes to keep Kubernetes happy.
-                # Only expose diagnostic details when HEALTH_DEBUG is enabled.
-                try:
-                    if not getattr(config, "HEALTH_DEBUG", False):
-                        return web.Response(text="ok")
-                except Exception:
-                    return web.Response(text="ok")
+    def _polling_ended(self, task: asyncio.Task[Any]) -> None:
+        self.exit_code = EXIT_FAILURE
+        if task.cancelled():
+            logger.error("Polling was cancelled unexpectedly")
+            return
+        exc = task.exception()
+        if exc is None:
+            logger.error("Polling stopped unexpectedly")
+        elif isinstance(exc, TelegramUnauthorizedError):
+            logger.error("Telegram rejected BOT_TOKEN while polling")
+            self.exit_code = EXIT_CONFIG
+        else:
+            logger.error("Polling failed", exc_info=exc)
 
-                # Diagnostic payload (debug mode)
-                try:
-                    worker_tasks = 0
-                    worker_running = 0
-                    worker_slots_free = None
-                    if globals().get("app_worker"):
-                        try:
-                            tasks = getattr(app_worker, "_tasks", set()) or set()
-                            worker_tasks = len(tasks)
-                            worker_running = sum(
-                                1
-                                for t in tasks
-                                if not getattr(t, "done", lambda: True)()
-                            )
-                        except Exception:
-                            worker_tasks = len(getattr(app_worker, "_tasks", set()))
-                        try:
-                            worker_slots_free = getattr(
-                                getattr(app_worker, "_sem", None), "_value", None
-                            )
-                        except Exception:
-                            worker_slots_free = None
-                    db_ok = False
-                    try:
-                        db.init_db()
-                        db_ok = True
-                    except Exception:
-                        db_ok = False
-                    payload = {
-                        "ok": True,
-                        "mode": getattr(config, "MODE", "polling"),
-                        "worker_tasks": worker_tasks,
-                        "worker_running": worker_running,
-                        "worker_slots_free": worker_slots_free,
-                        "db_ok": db_ok,
-                    }
-                    return web.json_response(payload)
-                except Exception:
-                    return web.Response(text="ok")
+    # -- shutdown -----------------------------------------------------------
+    async def _shutdown(self) -> None:
+        if self._shutdown_started:
+            return
+        self._shutdown_started = True
+        self.state.shutting_down = True
+        logger.info("Shutting down")
+        await self._stop_receiving()
+        await self._drain_handlers()
+        await self._stop_pool()
+        await self._close_clients()
+        if self._runner is not None:
+            await self._runner.cleanup()
+            self._runner = None
+        logger.info("Shutdown complete (exit code %s)", self.exit_code)
 
-            health_app = web.Application()
-            health_app.router.add_get("/health", _health)
-            health_runner = web.AppRunner(health_app)
-            await health_runner.setup()
-            site = web.TCPSite(health_runner, host=config.HOST, port=config.PORT)
-            await site.start()
-            logger.info("Health endpoint listening on %s:%s", config.HOST, config.PORT)
+    async def _stop_receiving(self) -> None:
+        self.state.accepting_updates = False  # webhook routes answer 503
+        task = self._polling_task
+        if task is None or task.done() or self._dispatcher is None:
+            return
+        try:
+            await asyncio.wait_for(
+                self._dispatcher.stop_polling(), POLLING_STOP_SECONDS
+            )
+        except (RuntimeError, TimeoutError):
+            task.cancel()  # not started yet, or stuck
+        await asyncio.wait({task}, timeout=POLLING_STOP_SECONDS)
+        if not task.done():
+            logger.warning("Polling did not stop in %.0fs", POLLING_STOP_SECONDS)
+        elif not task.cancelled() and (exc := task.exception()) is not None:
+            logger.warning("Polling ended with an error", exc_info=exc)
+
+    async def _drain_handlers(self) -> None:
+        if self._dispatcher is None:
+            return
+        tracker = self._dispatcher.get(TRACKER_KEY)
+        if not isinstance(tracker, UpdateTracker):
+            return
+        await asyncio.sleep(0)  # let update tasks that were just created start
+        if not await tracker.wait_idle(HANDLER_DRAIN_SECONDS):
+            logger.warning(
+                "%d update handler(s) still running after %.0fs",
+                tracker.active,
+                HANDLER_DRAIN_SECONDS,
+            )
+
+    async def _stop_pool(self) -> None:
+        if self._pool is None or not self._pool_start_attempted:
+            return
+        try:
+            await self._pool.stop()
         except Exception:
-            logger.exception("Failed to start health endpoint")
+            logger.exception("Error while stopping the worker pool")
+        self.state.pool_started = False
 
-    # ensure DB exists for update storage
+    async def _close_clients(self) -> None:
+        if self._bot is not None:
+            try:
+                await self._bot.session.close()
+            except (aiohttp.ClientError, OSError, RuntimeError):
+                logger.warning("Error while closing the bot session", exc_info=True)
+        await telegram_client.close_all_bots()
+        await http_client.close_session()
+
+    # -- signals ------------------------------------------------------------
+    def _install_signal_handlers(self) -> None:
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, self._on_signal, sig)
+            except (NotImplementedError, RuntimeError, ValueError):
+                logger.debug("Cannot install a handler for %s", sig.name)
+                continue
+            self._signals.append(sig)
+
+    def _remove_signal_handlers(self) -> None:
+        loop = asyncio.get_running_loop()
+        while self._signals:
+            loop.remove_signal_handler(self._signals.pop())
+
+    def _on_signal(self, sig: signal.Signals) -> None:
+        if not self._stop.is_set():
+            logger.info("Received %s: shutting down gracefully", sig.name)
+            self._stop.set()
+            return
+        logger.warning("Received %s again: forcing the shutdown", sig.name)
+        if self._task is not None:
+            self._task.cancel()
+
+
+# ---------------------------------------------------------------------------
+# Entrypoints
+# ---------------------------------------------------------------------------
+async def run(mode: str | None = None) -> int:
+    """Run the bot until SIGTERM/SIGINT; returns the process exit code."""
+    selected = select_mode(mode)
+    log_startup(selected)
+    token = getattr(config, "BOT_TOKEN", None)
+    if not token:
+        logger.error(MISSING_TOKEN_MESSAGE)
+        return EXIT_CONFIG
+    return await BotApp(token, mode=selected).run()
+
+
+def main(mode: str | None = None) -> int:
+    """Process entrypoint (``python -m src``); ``mode`` overrides config.MODE."""
+    setup_logging()
     try:
-        db.init_db()
-    except Exception:
-        logger.debug("db.init_db() failed in bot startup")
-
-    # register diagnostic logger for all updates
-    dp.update.register(log_update)
-
-    # register handlers for different update types
-    dp.message.register(handle_message)
-    try:
-        dp.channel_post.register(handle_message)
-    except Exception:
-        # some aiogram builds may not have channel_post convenience; ignore
-        pass
-    try:
-        dp.edited_message.register(handle_message)
-    except Exception:
-        pass
-
-    # send a short welcome message when the bot is added to a group
-    async def _handle_my_chat_member(update: ChatMemberUpdated):
-        try:
-            old = getattr(update, "old_chat_member", None)
-            new = getattr(update, "new_chat_member", None)
-            old_status = getattr(old, "status", None)
-            new_status = getattr(new, "status", None)
-            # if the bot transitioned from left/kicked -> member/administrator, greet
-            if new_status in ("member", "administrator") and old_status in (
-                "left",
-                "kicked",
-                "restricted",
-                None,
-            ):
-                chat = getattr(update, "chat", None)
-                chat_id = getattr(chat, "id", None)
-                if chat_id:
-                    text = (
-                        "Ciao! 👋 Sono il bot che prova a scaricare brevi video da YouTube, TikTok, Instagram e Facebook e a condividerli qui. "
-                        "In questo gruppo rispondo solo quando qualcuno incolla un link. "
-                        "Nota: non posso scaricare contenuti che richiedono autenticazione."
-                    )
-                    try:
-                        await telegram_api.send_message(config.BOT_TOKEN, chat_id, text)
-                    except Exception:
-                        logger.debug("Could not send group welcome message")
-        except Exception:
-            logger.exception("Error in my_chat_member handler")
-
-    try:
-        dp.my_chat_member.register(_handle_my_chat_member)
-    except Exception:
-        # some aiogram versions may not expose my_chat_member convenience
-        pass
-
-    # Start long-polling and ensure graceful shutdown on cancellation
-    try:
-        await dp.start_polling(bot)
-    finally:
-        try:
-            await dp.stop_polling()
-        except Exception:
-            pass
-        # ensure workers finish before closing bots and http sessions
-        try:
-            if app_worker:
-                await app_worker.shutdown()
-        except Exception:
-            logger.debug("app_worker.shutdown() failed during bot shutdown")
-        try:
-            # close cached bot(s) and shared http session
-            await telegram_client.close_all_bots()
-        except Exception:
-            pass
-        try:
-            await http_client.close_session()
-        except Exception:
-            pass
-        try:
-            if health_runner:
-                await health_runner.cleanup()
-        except Exception:
-            pass
+        return asyncio.run(run(mode))
+    except KeyboardInterrupt:  # Ctrl+C before the signal handlers exist
+        return 130
+    except asyncio.CancelledError:  # second signal: forced shutdown
+        return EXIT_FAILURE
 
 
 if __name__ == "__main__":
-    try:
-        asyncio.run(main())
-    except (KeyboardInterrupt, SystemExit):
-        pass
+    raise SystemExit(main())

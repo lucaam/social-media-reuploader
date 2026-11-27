@@ -1,0 +1,37 @@
+suite: ServiceMonitor
+templates:
+  - templates/servicemonitor.yaml
+release:
+  name: smr
+  namespace: bots
+tests:
+  - it: is disabled by default
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: scrapes /metrics of the bot Service
+    set:
+      metrics.serviceMonitor.enabled: true
+      metrics.serviceMonitor.interval: 1m
+      metrics.serviceMonitor.labels:
+        release: prometheus
+    asserts:
+      - isKind:
+          of: ServiceMonitor
+      - isSubset:
+          path: metadata.labels
+          content:
+            release: prometheus
+      - equal:
+          path: spec.selector.matchLabels
+          value:
+            app.kubernetes.io/instance: smr
+            app.kubernetes.io/component: bot
+      - equal:
+          path: spec.endpoints
+          value:
+            - port: http
+              path: /metrics
+              interval: 1m
+              scrapeTimeout: 10s

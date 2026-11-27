@@ -1,41 +1,115 @@
-# GHCR (GitHub Container Registry) and publishing
+# Immagini, chart e release
 
-This repository includes a GitHub Actions workflow that builds and publishes the Docker image to GHCR when a release is published. It also includes a workflow to set the package visibility to `public` after publishing.
+Ogni release `vX.Y.Z` pubblica su GitHub Container Registry, con la stessa
+versione:
 
-How it works
-
-- On release publish, `.github/workflows/docker-release.yml` builds the image and pushes tags to `ghcr.io/${{ github.repository }}`.
-- After a release, `.github/workflows/ghcr-visibility.yml` attempts to set the package visibility to `public` using the GitHub API.
-
-Badges
-
-You can show the published image's latest tag using Shields.io in the README:
-
+```text
+ghcr.io/lucaam/social-media-reuploader:X.Y.Z               # immagine (linux/amd64, linux/arm64)
+ghcr.io/lucaam/social-media-reuploader:latest              # ultima release
+oci://ghcr.io/lucaam/charts/social-media-reuploader X.Y.Z  # chart Helm
 ```
+
+- Tag dell'immagine: `X.Y.Z`, `X.Y`, `X` (solo da 1.0.0 in poi), `latest` e
+  `sha-<commit>`. `X.Y`, `X` e `latest` si spostano solo sulla release più
+  alta.
+- Label e annotazioni OCI (versione, commit, data di build, sorgente), SBOM e
+  provenance SLSA (`mode=max`) di BuildKit dentro l'immagine.
+- Immagine e chart sono firmati con cosign (keyless, Sigstore) e hanno
+  un'attestazione di provenienza GitHub; il `.tgz` del chart è allegato alla
+  release GitHub.
+- La versione è scritta nell'immagine in fase di build (`--build-arg
+  VERSION=X.Y.Z` → `SMR_VERSION`): compare nei log di avvio, nello stato del
+  worker nella GUI e in `/health` con `HEALTH_DEBUG=true`.
+
+## Flusso di release
+
+Automatico, a ogni push su `main` (workflow *Release*,
+`.github/workflows/release.yml`; dettagli in
+[RELEASE.md](https://github.com/lucaam/social-media-reuploader/blob/main/RELEASE.md)):
+
+1. **gate**: gli stessi controlli delle pull request (`ci.yml`).
+2. **version**: la versione successiva dai Conventional Commits dall'ultimo
+   tag (`feat` → minor; `fix`, `perf`, `revert`, `fix(deps)`, `build(deps)` →
+   patch; breaking → major, minor finché la versione è `0.y.z`; gli altri
+   tipi non rilasciano). Senza commit rilasciabili il workflow si ferma: non
+   esistono immagini `edge` o di sviluppo.
+3. **image**: una build per piattaforma sul suo runner nativo (amd64 e
+   arm64), senza cache, push solo per digest e smoke test dell'immagine
+   scaricata.
+4. **index**: l'indice delle due piattaforme, anch'esso senza tag, con
+   attestazione e firma.
+5. **chart** (in parallelo all'immagine): pacchetto con la versione della
+   release e attestazione del `.tgz`.
+6. **publish**, solo se tutto il resto è riuscito: i tag dell'immagine, che
+   puntano all'indice firmato, poi il chart OCI (attestato e firmato), infine
+   il tag `vX.Y.Z` e la release GitHub con le note raggruppate per tipo.
+   Prima di questo job nulla è pubblico, a parte digest senza tag.
+
+Nel repository le versioni restano segnaposto (`Chart.yaml` `0.0.0`, codice
+`0.0.0-dev`): il tag è l'unica fonte della versione, nessun commit di bump.
+
+## Verificare firme e provenienza
+
+Firme (cosign 3 o successivo):
+
+```bash
+IDENTITY=https://github.com/lucaam/social-media-reuploader/.github/workflows/release.yml@refs/heads/main
+ISSUER=https://token.actions.githubusercontent.com
+
+cosign verify ghcr.io/lucaam/social-media-reuploader:X.Y.Z \
+  --certificate-identity "$IDENTITY" --certificate-oidc-issuer "$ISSUER"
+cosign verify ghcr.io/lucaam/charts/social-media-reuploader:X.Y.Z \
+  --certificate-identity "$IDENTITY" --certificate-oidc-issuer "$ISSUER"
+```
+
+Attestazioni di provenienza (GitHub CLI):
+
+```bash
+gh attestation verify oci://ghcr.io/lucaam/social-media-reuploader:X.Y.Z \
+  --repo lucaam/social-media-reuploader \
+  --signer-workflow lucaam/social-media-reuploader/.github/workflows/release.yml
+gh attestation verify oci://ghcr.io/lucaam/charts/social-media-reuploader:X.Y.Z \
+  --repo lucaam/social-media-reuploader
+gh release download vX.Y.Z --repo lucaam/social-media-reuploader --pattern '*.tgz'
+gh attestation verify social-media-reuploader-X.Y.Z.tgz --repo lucaam/social-media-reuploader
+```
+
+SBOM e provenance di BuildKit:
+
+```bash
+docker buildx imagetools inspect ghcr.io/lucaam/social-media-reuploader:X.Y.Z \
+  --format '{{ json .SBOM }}'
+docker buildx imagetools inspect ghcr.io/lucaam/social-media-reuploader:X.Y.Z \
+  --format '{{ json .Provenance }}'
+```
+
+Con Flux la firma del chart si verifica nell'`OCIRepository` (`spec.verify`):
+vedi `examples/flux/` e [Deploy](deploy.md#flux).
+
+## Workflow
+
+| Workflow | Quando | Cosa |
+|---|---|---|
+| `ci.yml` | pull request; richiamato da `release.yml` | test, lint, chart, documentazione, build e smoke test dell'immagine; sulle PR anche la prova della release (piano, chart, immagine amd64 e arm64) |
+| `pr-title.yml` | pull request | titolo della PR in formato Conventional Commits e release che produrrà |
+| `release.yml` | push su `main`; avvio manuale | versione, immagine, indice firmato, chart; poi un solo job pubblica tag dell'immagine, chart, tag e release |
+| `docs-deploy.yml` | push su `main` che tocca la documentazione | sito su GitHub Pages |
+
+Tutti i workflow usano solo `GITHUB_TOKEN`, con permessi minimi per job, e
+azioni fissate per commit SHA (aggiornate da Renovate).
+
+## Badge
+
+```markdown
 [![GHCR Image Version](https://img.shields.io/docker/v/ghcr.io/lucaam/social-media-reuploader?label=ghcr.io&sort=semver)](https://github.com/lucaam/social-media-reuploader/pkgs/container/social-media-reuploader)
 ```
 
-Publishing notes
-
-- The GitHub runner uses the `GITHUB_TOKEN` to push the image. For private repositories, ensure the token has `packages: write` permissions in the workflow `permissions` block (already set).
-- Making the package public requires additional repository/org permissions; the `ghcr-visibility` workflow attempts both org and user package endpoints.
-
-Repository secrets and PAT (optional)
-
-If the `ghcr-visibility` workflow fails due to insufficient permissions, create a Personal Access Token (PAT) with the `write:packages` (and `repo` if needed) scopes and add it to the repository Secrets as `GHCR_PAT`:
-
-1. Create a PAT in GitHub (Settings → Developer settings → Personal access tokens) with scopes `write:packages` and `repo` (if you need to access private repo resources).
-2. In the repository, go to Settings → Secrets and variables → Actions → New repository secret and add `GHCR_PAT` with the token value.
-
-You can then modify `.github/workflows/ghcr-visibility.yml` or other workflows to use `${{ secrets.GHCR_PAT }}` where a higher-privileged token is required.
-
-Note: keep PATs secret and rotate them regularly. For organization-wide automation, consider creating a GitHub App with limited permissions instead.
-
-Local testing of images
-
-After building locally, tag and run the image:
+## Build locale
 
 ```bash
-docker build -t ghcr.io/lucaam/social-media-reuploader:dev .
-docker run -e BOT_TOKEN="$BOT_TOKEN" -p 8080:8080 ghcr.io/lucaam/social-media-reuploader:dev
+docker build -t smr:dev --build-arg VERSION=0.0.0-dev .
+scripts/smoke_test_image.sh smr:dev 0.0.0-dev   # gli stessi controlli della CI
+docker run --rm --stop-timeout 75 -e BOT_TOKEN="$BOT_TOKEN" -p 127.0.0.1:8080:8080 smr:dev
 ```
+
+Senza `--build-arg VERSION` l'immagine riporta la versione `0.0.0-dev`.

@@ -1,29 +1,49 @@
-apiVersion: helm.toolkit.fluxcd.io/v2beta1
+apiVersion: helm.toolkit.fluxcd.io/v2
 kind: HelmRelease
 metadata:
   name: social-media-reuploader
-  namespace: default
+  namespace: smr
 spec:
-  interval: 5m
-  chart:
-    # Use the chart path inside the same repository
-    spec:
-      chart: ./charts/social-media-reuploader
-      sourceRef:
-        kind: GitRepository
-        name: social-media-reuploader-repo
-        namespace: flux-system
+  interval: 10m
+  # The OCI chart of ocirepository.yaml (same namespace).
+  chartRef:
+    kind: OCIRepository
+    name: social-media-reuploader
   install:
-    createNamespace: true
+    remediation:
+      retries: 2
   upgrade:
     remediation:
       retries: 2
   values:
-    replicaCount: 1
+    # The image tag defaults to the chart's appVersion, i.e. the image of
+    # the same release: set image.tag only to deploy a different release.
+    # Existing Secrets (create them with SealedSecrets / External Secrets /
+    # SOPS; never commit secrets):
+    #   smr-bot: BOT_TOKEN (optional WEBHOOK_SECRET)
+    #   smr-gui: SECRET_KEY and ADMIN_TOKEN, or the OAUTH_* settings
+    secret:
+      name: smr-bot
+    gui:
+      existingSecret: smr-gui
+      env:
+        SESSION_COOKIE_SECURE: true
     env:
-      BOT_TOKEN: "" # set via Kubernetes Secret / external secret
-      ADMIN_TOKEN: ""
-      SECRET_KEY: ""
-    image:
-      repository: ghcr.io/lucaam/social-media-reuploader
-      tag: "latest"
+      MODE: polling
+      MAX_PENDING_PER_CHAT: 3
+      UNSUPPORTED_LINK_REPLY: private
+    # Optional: cookies.txt for sites that need a login
+    # ytdlpCookies:
+    #   existingSecret: smr-cookies
+    # Optional: expose the GUI over HTTPS
+    # ingress:
+    #   enabled: true
+    #   className: nginx
+    #   hosts:
+    #     - host: admin.example.com
+    #       paths:
+    #         - path: /
+    #           service: gui
+    #   tls:
+    #     - secretName: admin-example-tls
+    #       hosts: [admin.example.com]

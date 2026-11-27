@@ -1,0 +1,2 @@
+WARNING: [facebook] 1234567890: Unable to extract uploader
+ERROR: [facebook] 1234567890: No video formats found!; please report this issue on  https://github.com/yt-dlp/yt-dlp/issues?q= , filling out the appropriate issue template. Confirm you are on the latest version using  yt-dlp -U

@@ -1,0 +1,50 @@
+# Webhook mode behind an Ingress (GUI on /, webhook path to the bot), OAuth
+# GUI login, cookies Secret, metrics and extra settings.
+secret:
+  botToken: "123456:ci-only-not-a-real-token"
+  webhookSecret: ci-webhook-secret
+env:
+  MODE: webhook
+  WEBHOOK_URL: https://bot.example.com/webhook
+  WEBHOOK_PATH: /webhook
+  ALLOWED_PROVIDERS:
+    - youtube
+    - tiktok
+    - instagram
+  MAX_PENDING_PER_CHAT: 5
+  WORKER_POLL_SECONDS: 0.5
+ytdlpCookies:
+  existingSecret: smr-cookies
+extraEnv:
+  - name: YTDLP_PROXY
+    valueFrom:
+      secretKeyRef:
+        name: smr-proxy
+        key: url
+gui:
+  secrets:
+    oauthClientId: ci-client
+    oauthClientSecret: ci-client-secret
+    oauthServerMetadataUrl: https://idp.example.com/.well-known/openid-configuration
+    oauthRedirectUri: https://bot.example.com/auth
+    oauthAdminGroups: admins
+  env:
+    SESSION_COOKIE_SECURE: true
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    - host: bot.example.com
+      paths:
+        - path: /
+          service: gui
+        - path: /webhook
+          service: bot
+  tls:
+    - secretName: bot-example-tls
+      hosts:
+        - bot.example.com
+metrics:
+  serviceMonitor:
+    enabled: true
+resourceProfile: large

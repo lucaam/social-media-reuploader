@@ -8,18 +8,27 @@ if [ -z "${BOT_TOKEN:-}" ]; then
   exit 1
 fi
 
+# Pretty-print JSON with jq when it is installed.
+pretty() {
+  if command -v jq >/dev/null 2>&1; then
+    jq '.'
+  else
+    cat
+  fi
+}
+
 echo "== getMe =="
-curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/getMe" | (command -v jq >/dev/null 2>&1 && jq '.' || cat)
+curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/getMe" | pretty
 
 echo
 echo "== getWebhookInfo =="
-curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/getWebhookInfo" | (command -v jq >/dev/null 2>&1 && jq '.' || cat)
+curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/getWebhookInfo" | pretty
 
 if [ "${1:-}" = "--get-updates" ]; then
   echo
   echo "== getUpdates (CAUTION: this will consume pending updates) =="
   echo "Stop any running polling bot before calling this."
-  curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?limit=10" | (command -v jq >/dev/null 2>&1 && jq '.' || cat)
+  curl -s -X POST "https://api.telegram.org/bot${BOT_TOKEN}/getUpdates?limit=10" | pretty
 fi
 
 cat <<'EOF'

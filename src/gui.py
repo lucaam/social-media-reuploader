@@ -1,2093 +1,1398 @@
+"""Admin GUI of social-media-reuploader (``uvicorn src.gui:app``).
+
+The GUI runs as a separate process (its own pod) and shares state with the
+bot ONLY through the SQLite database:
+
+* everything shown is read from the DB (:mod:`src.gui_queries`), including the
+  worker's liveness, running jobs and effective limits, which the worker
+  publishes as a heartbeat row (``db.get_worker_status()``);
+* every admin action is a DB write (``db.cancel_queued``,
+  ``db.requeue_requests``, ``db.reset_chat_limit``, ``db.prune``, ...);
+* live updates come from one background task that tails the DB event log and
+  broadcasts each event once to the WebSocket clients (:mod:`src.ws_broadcast`).
+
+Authentication (:mod:`src.gui_auth`): ``ADMIN_TOKEN`` (bearer header or
+``POST /login``) and/or OAuth/OIDC. Admin rights are re-derived on every
+request. Unsafe cookie-authenticated requests must be same-origin (CSRF).
+
+DB-bound handlers are plain ``def`` (FastAPI runs them in its threadpool), so
+the event loop serving WebSockets and ``/health`` is never blocked.
+"""
+
+from __future__ import annotations
+
 import asyncio
-import datetime
+import contextlib
+import hashlib
+import html
 import json
 import logging
-import os
+import re
+import sqlite3
+import string
 import time
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
+from contextlib import asynccontextmanager
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+from typing import Annotated, Any
+from urllib.parse import parse_qs
 
-import aiohttp
-from authlib.integrations.starlette_client import OAuth, OAuthError
-from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
+import anyio
+import fastapi
+import httpx
+from authlib.common.errors import AuthlibBaseError
+from fastapi import APIRouter, Depends, FastAPI, HTTPException, Query, Request
+from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, Response
 from fastapi.staticfiles import StaticFiles
+from joserfc.errors import JoseError
+from pydantic import BaseModel, ConfigDict, Field
+from starlette.datastructures import MutableHeaders
+from starlette.middleware import Middleware
 from starlette.middleware.sessions import SessionMiddleware
+from starlette.requests import HTTPConnection
+from starlette.types import ASGIApp, Message, Receive, Scope, Send
+from starlette.websockets import WebSocket, WebSocketDisconnect, WebSocketState
 
-from . import config, db, ws_broadcast
+from . import __version__, config, db, gui_auth, gui_queries, ws_broadcast
+from .gui_auth import AuthError, AuthMethod, AuthSettings, Principal
 
-app = FastAPI(title="Social media reuploader - Admin GUI")
+logger = logging.getLogger(__name__)
 
-# Keep strong references to background tasks to prevent garbage collection
-_background_tasks = set()
+SRC_DIR = Path(__file__).resolve().parent
+STATIC_DIR = SRC_DIR / "static"
+TEMPLATES_DIR = SRC_DIR / "templates"
 
-# Session secret for cookie storage
-SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-me")
-app.add_middleware(SessionMiddleware, secret_key=SECRET_KEY)
-
-# OAuth client registration (generic)
-oauth = OAuth()
-OAUTH_CLIENT_ID = os.environ.get("OAUTH_CLIENT_ID")
-OAUTH_CLIENT_SECRET = os.environ.get("OAUTH_CLIENT_SECRET")
-OAUTH_AUTHORIZE_URL = os.environ.get("OAUTH_AUTHORIZE_URL")
-OAUTH_TOKEN_URL = os.environ.get("OAUTH_TOKEN_URL")
-OAUTH_USERINFO_URL = os.environ.get("OAUTH_USERINFO_URL")
-OAUTH_SCOPE = os.environ.get("OAUTH_SCOPE", "openid profile email")
-OAUTH_SERVER_METADATA_URL = os.environ.get("OAUTH_SERVER_METADATA_URL")
-OAUTH_JWKS_URI = os.environ.get("OAUTH_JWKS_URI")
-
-# Optional mapping of OAuth groups to admin role. Comma-separated list.
-# Example: OAUTH_ADMIN_GROUPS="authentik Admins,admins"
-OAUTH_ADMIN_GROUPS = os.environ.get("OAUTH_ADMIN_GROUPS")
-if OAUTH_ADMIN_GROUPS:
-    OAUTH_ADMIN_GROUPS_SET = set(
-        [g.strip() for g in OAUTH_ADMIN_GROUPS.split(",") if g.strip()]
+# Pinned CDN assets (static package files, so Subresource Integrity is stable).
+BOOTSTRAP_CSS_URL = (
+    "https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css"
+)
+BOOTSTRAP_CSS_SRI = (
+    "sha384-T3c6CoIi6uLrA9TneNEoa7RxnatzjcDSCmG1MXxSR1GAsXEV/Dwwykc2MPK8M2HN"
+)
+CHART_JS_URL = "https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.js"
+CHART_JS_SRI = "sha384-FcQlsUOd0TJjROrBxhJdUhXTUgNJQxTMcxZe6nHbaEfFL1zjQ+bq/uRoBQxb0KMo"
+CONTENT_SECURITY_POLICY = "; ".join(
+    (
+        "default-src 'none'",
+        f"script-src 'self' {CHART_JS_URL}",
+        f"style-src 'self' {BOOTSTRAP_CSS_URL}",
+        "img-src 'self' data:",
+        "font-src 'self'",
+        "connect-src 'self'",
+        "base-uri 'none'",
+        "form-action 'self'",
+        "frame-ancestors 'none'",
     )
-    OAUTH_ADMIN_GROUPS_LOWER = set(g.lower() for g in OAUTH_ADMIN_GROUPS_SET)
-else:
-    OAUTH_ADMIN_GROUPS_SET = set()
-    OAUTH_ADMIN_GROUPS_LOWER = set()
-if (
-    OAUTH_CLIENT_ID
-    and OAUTH_CLIENT_SECRET
-    and ((OAUTH_AUTHORIZE_URL and OAUTH_TOKEN_URL) or OAUTH_SERVER_METADATA_URL)
-):
-    # Register provider. Support either explicit authorize/token endpoints
-    # OR a discovery `server_metadata_url` for OIDC providers.
-    register_kwargs = dict(
-        name="provider",
-        client_id=OAUTH_CLIENT_ID,
-        client_secret=OAUTH_CLIENT_SECRET,
-        client_kwargs={"scope": OAUTH_SCOPE},
+)
+ASSET_VERSION_PLACEHOLDER = "__ASSET_VERSION__"
+
+MAX_PAGE_SIZE = 200
+MAX_LOGIN_BODY = 4096
+MAX_REQUEUE_IDS = 1000
+FILTER_REQUEUE_LIMIT = 500
+DEFAULT_REQUEUE_MAX_AGE = 86400.0
+WS_RECHECK_SECONDS = 30.0
+WS_CLOSE_GOING_AWAY = 1001
+WS_CLOSE_POLICY = 1008
+WS_CLOSE_INTERNAL = 1011
+WS_CLOSE_TRY_AGAIN = 1013
+_EMAIL_RE = re.compile(r"^[^@\s]{1,64}@[^@\s]{1,255}$")
+_STATUS_RE = re.compile(r"^[a-z_]{1,32}$")
+
+
+# ---------------------------------------------------------------------------
+# Application state
+# ---------------------------------------------------------------------------
+@dataclass
+class GuiState:
+    settings: AuthSettings
+    oauth: Any  # authlib OAuth registry (or a test double)
+    hub: ws_broadcast.Hub
+    tailer: ws_broadcast.EventTailer
+    limiter: gui_auth.FailureLimiter
+    index_html: str
+    asset_version: str
+    ws_recheck_seconds: float
+    requeue_max_age: float
+
+    @property
+    def oauth_client(self) -> Any | None:
+        return gui_auth.get_oauth_client(self.oauth)
+
+
+def _state(conn: HTTPConnection) -> GuiState:
+    return conn.app.state.gui
+
+
+def _resolve(conn: HTTPConnection) -> Principal:
+    """The admin check (raises ``AuthError``); sync, may query the DB."""
+    state = _state(conn)
+    principal = gui_auth.resolve_principal(
+        conn,
+        state.settings,
+        oauth_enabled=state.oauth_client is not None,
+        limiter=state.limiter,
     )
-    if OAUTH_SERVER_METADATA_URL:
-        register_kwargs["server_metadata_url"] = OAUTH_SERVER_METADATA_URL
-    else:
-        register_kwargs["authorize_url"] = OAUTH_AUTHORIZE_URL
-        register_kwargs["access_token_url"] = OAUTH_TOKEN_URL
-    oauth.register(**register_kwargs)
-
-# static SPA directory
-STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
-app.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    if not principal.authenticated:
+        _drop_stale_session(conn)
+    return principal
 
 
-def _check_admin(request: Request) -> bool:
-    # Admin token allowed only when OAuth is not configured
-    admin_token = os.environ.get("ADMIN_TOKEN")
-    if admin_token and not _oauth_enabled():
-        auth = request.headers.get("Authorization")
-        if auth and auth.lower().startswith("bearer "):
-            token = auth.split(" ", 1)[1].strip()
-            if token == admin_token:
-                return True
-        q = request.query_params.get("token")
-        if q and q == admin_token:
-            return True
+def _drop_stale_session(conn: HTTPConnection) -> None:
+    """Forget an invalid/expired identity (ours or the old GUI's) in the cookie.
 
-    # OAuth session fallback: check DB for user role
-    session = request.session
-    # Session-level admin override: allow granting admin for the current
-    # session after a successful OAuth login (see /api/session/grant_admin).
-    try:
-        if session and session.get("is_admin"):
-            return True
-    except Exception:
-        pass
-    # Do NOT treat a generic authenticated session as admin. Admin access
-    # must be explicitly granted via `session['is_admin']`, OAuth admin
-    # groups or a DB role mapping.
-    # If a user is present in the session, check both configured OAuth
-    # admin groups (when set) and the persistent DB role. The DB role
-    # lookup must be performed regardless of whether admin groups are
-    # configured so operators can assign local admin mappings.
-    if session and session.get("user"):
-        try:
-            user = session.get("user")
-            # check groups if configured
-            if OAUTH_ADMIN_GROUPS_SET and isinstance(user, dict):
-                groups = (
-                    user.get("groups") or user.get("memberOf") or user.get("member_of")
-                )
-                if groups:
-                    if isinstance(groups, str):
-                        groups_list = [
-                            g.strip() for g in groups.split(",") if g.strip()
-                        ]
-                    elif isinstance(groups, (list, tuple)):
-                        groups_list = list(groups)
-                    else:
-                        groups_list = [str(groups)]
-                    for g in groups_list:
-                        if (
-                            g in OAUTH_ADMIN_GROUPS_SET
-                            or g.lower() in OAUTH_ADMIN_GROUPS_LOWER
-                        ):
-                            return True
-            # check DB role by email (always check DB mapping when user present)
-            email = None
-            if isinstance(user, dict):
-                email = (
-                    user.get("email")
-                    or user.get("preferred_username")
-                    or user.get("sub")
-                )
-            if email:
-                try:
-                    u = db.get_user_by_email(email)
-                    if u and u[3] == "admin":
-                        return True
-                except Exception:
-                    # If DB is not available (tests/CI), do not raise here.
-                    pass
-        except Exception:
-            pass
-
-    return False
-
-
-def _get_oauth_provider():
-    """Return a provider client in a way that works across authlib versions.
-
-    Some authlib versions expose registered clients as attribute access
-    (e.g. ``oauth.provider``). Newer versions encourage using
-    ``oauth.create_client(name)``. Tests may also monkeypatch
-    ``oauth.provider`` directly. Try several fallbacks and return the
-    first callable-like provider.
+    authlib's in-flight OAuth state (``_state_*`` keys) is kept.
     """
-    # prefer attribute access if present
-    try:
-        if hasattr(oauth, "provider") and getattr(oauth, "provider") is not None:
-            return getattr(oauth, "provider")
-    except Exception:
-        pass
-    # try authlib factory method
-    try:
-        if hasattr(oauth, "create_client"):
-            client = oauth.create_client("provider")
-            if client is not None:
-                return client
-    except Exception:
-        pass
-    # finally, fall back to raw _clients dict (used in some tests)
-    try:
-        raw = getattr(oauth, "_clients", None)
-        if raw and "provider" in raw:
-            # Some authlib versions store client instances directly in the
-            # internal _clients dict (e.g. authlib 1.7.x). Return the stored
-            # client rather than attempting attribute access which may not
-            # be present.
-            try:
-                return raw["provider"]
-            except Exception:
-                return getattr(oauth, "provider", None)
-    except Exception:
-        pass
-    return None
-
-
-def _oauth_enabled() -> bool:
-    """Return True when an OAuth provider is configured and usable."""
-    # Determine OAuth availability from configuration environment variables
-    try:
-        client_ok = bool(OAUTH_CLIENT_ID and OAUTH_CLIENT_SECRET)
-        # Either explicit authorize/token URLs or discovery URL must be present
-        endpoints_ok = bool(
-            (OAUTH_AUTHORIZE_URL and OAUTH_TOKEN_URL) or OAUTH_SERVER_METADATA_URL
-        )
-        return bool(client_ok and endpoints_ok)
-    except Exception:
-        return False
-
-
-def _check_admin_ws(websocket: WebSocket) -> bool:
-    # same as _check_admin but for WebSocket scope
-    admin_token = os.environ.get("ADMIN_TOKEN")
-    if admin_token and not _oauth_enabled():
-        q = websocket.query_params.get("token")
-        auth = websocket.headers.get("authorization")
-        if auth and auth.lower().startswith("bearer "):
-            token = auth.split(" ", 1)[1].strip()
-            if token == admin_token:
-                return True
-        if q and q == admin_token:
-            return True
-    # session via scope
-    session = websocket.session if hasattr(websocket, "session") else None
-    # Session-level admin override (for WebSocket scope as well)
-    try:
-        if session and session.get("is_admin"):
-            return True
-    except Exception:
-        pass
-    # Do NOT treat a generic authenticated websocket session as admin.
-    # Admin via WebSocket must be explicitly granted.
-    # Optional: map OAuth groups to admin role when configured (WebSocket)
-    if OAUTH_ADMIN_GROUPS_SET and session and session.get("user"):
-        try:
-            user = session.get("user")
-            if isinstance(user, dict):
-                groups = (
-                    user.get("groups") or user.get("memberOf") or user.get("member_of")
-                )
-                if groups:
-                    if isinstance(groups, str):
-                        groups_list = [
-                            g.strip() for g in groups.split(",") if g.strip()
-                        ]
-                    elif isinstance(groups, (list, tuple)):
-                        groups_list = list(groups)
-                    else:
-                        groups_list = [str(groups)]
-                    for g in groups_list:
-                        if (
-                            g in OAUTH_ADMIN_GROUPS_SET
-                            or g.lower() in OAUTH_ADMIN_GROUPS_LOWER
-                        ):
-                            return True
-        except Exception:
-            pass
-
-    if session and session.get("user"):
-        user = session.get("user")
-        email = None
-        if isinstance(user, dict):
-            email = (
-                user.get("email") or user.get("preferred_username") or user.get("sub")
-            )
-        if email:
-            try:
-                u = db.get_user_by_email(email)
-                if u and u[3] == "admin":
-                    return True
-            except Exception:
-                # If DB is not available (tests/CI), do not raise here.
-                pass
-    return False
-
-
-def _session_has_persistent_entitlement(session) -> bool:
-    """Return True if the given session's user is persistently entitled to admin
-
-    This checks OAuth group membership (when configured) and the DB role for
-    the user's email. It deliberately does NOT consider the transient
-    `session['is_admin']` flag.
-    """
-    if not session or not session.get("user"):
-        return False
-    try:
-        user = session.get("user")
-        # check groups if configured
-        if OAUTH_ADMIN_GROUPS_SET and isinstance(user, dict):
-            groups = user.get("groups") or user.get("memberOf") or user.get("member_of")
-            if groups:
-                if isinstance(groups, str):
-                    groups_list = [g.strip() for g in groups.split(",") if g.strip()]
-                elif isinstance(groups, (list, tuple)):
-                    groups_list = list(groups)
-                else:
-                    groups_list = [str(groups)]
-                for g in groups_list:
-                    if (
-                        g in OAUTH_ADMIN_GROUPS_SET
-                        or g.lower() in OAUTH_ADMIN_GROUPS_LOWER
-                    ):
-                        return True
-        # check DB role by email
-        email = None
-        if isinstance(user, dict):
-            email = (
-                user.get("email") or user.get("preferred_username") or user.get("sub")
-            )
-        if email:
-            try:
-                u = db.get_user_by_email(email)
-                if u and u[3] == "admin":
-                    return True
-            except Exception:
-                pass
-    except Exception:
-        pass
-    return False
-
-
-@app.on_event("startup")
-async def startup_event():
-    # ensure DB exists
-    try:
-        db.init_db()
-    except Exception:
-        pass
-    # set ws_broadcast loop
-    try:
-        ws_broadcast.loop = asyncio.get_event_loop()
-    except Exception:
-        pass
-
-    # Start a background poller that watches the DB `updates` table for
-    # new rows inserted by other processes and re-broadcasts them to
-    # connected websocket clients. This enables real-time UI updates when
-    # the worker runs in a separate process from the GUI.
-    async def _db_updates_poller(poll_interval: float = 1.0):
-        last_id = 0
-        try:
-            conn = db._connect()
-            cur = conn.cursor()
-            cur.execute("SELECT MAX(id) FROM updates")
-            r = cur.fetchone()
-            try:
-                last_id = int(r[0]) if r and r[0] is not None else 0
-            except Exception:
-                last_id = 0
-            try:
-                conn.close()
-            except Exception:
-                pass
-        except Exception:
-            last_id = 0
-
-        while True:
-            try:
-                await asyncio.sleep(poll_interval)
-            except asyncio.CancelledError:
-                break
-            except Exception:
-                pass
-
-            try:
-                conn = db._connect()
-                cur = conn.cursor()
-                cur.execute(
-                    "SELECT id, raw, created_at FROM updates WHERE id > ? ORDER BY id ASC",
-                    (last_id,),
-                )
-                rows = cur.fetchall()
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            except Exception:
-                rows = []
-
-            for r in rows:
-                try:
-                    uid, raw, created = r
-                except Exception:
-                    continue
-                try:
-                    last_id = int(uid)
-                except Exception:
-                    pass
-                # try to decode JSON payloads to re-emit structured events
-                parsed = None
-                try:
-                    parsed = json.loads(raw)
-                except Exception:
-                    parsed = None
-                try:
-                    if isinstance(parsed, dict) and parsed.get("type"):
-                        try:
-                            await ws_broadcast.broadcast(parsed)
-                        except Exception:
-                            pass
-                    else:
-                        try:
-                            await ws_broadcast.broadcast(
-                                {
-                                    "type": "update_created",
-                                    "id": uid,
-                                    "raw": raw,
-                                    "created_at": created,
-                                }
-                            )
-                        except Exception:
-                            pass
-                except Exception:
-                    pass
-
-    try:
-        asyncio.create_task(
-            _db_updates_poller(float(getattr(config, "GUI_DB_POLL_SECONDS", 1.0)))
-        )
-    except Exception:
-        pass
-    # suppress uvicorn access logs for frequent /health probes unless debug enabled
-    try:
-
-        class _HealthProbeFilter(logging.Filter):
-            def filter(self, record):
-                try:
-                    msg = record.getMessage()
-                    if "/health" in msg:
-                        if "kube-probe" in msg.lower() or "get /health" in msg.lower():
-                            return False
-                except Exception:
-                    pass
-                return True
-
-        if not getattr(config, "HEALTH_DEBUG", False):
-            logging.getLogger("uvicorn.access").addFilter(_HealthProbeFilter())
-    except Exception:
-        pass
-
-    # Enforce that at least one authentication method is configured. If
-    # neither OAuth nor ADMIN_TOKEN are available, fail fast to avoid
-    # starting an unsecured admin GUI.
-    try:
-        if not _oauth_enabled() and not os.environ.get("ADMIN_TOKEN"):
-            logging.error(
-                "No authentication configured for GUI: set OAuth variables or ADMIN_TOKEN"
-            )
-            raise RuntimeError(
-                "Admin GUI requires OAuth or ADMIN_TOKEN to be configured"
-            )
-    except Exception:
-        # propagate to stop startup
-        raise
-
-
-@app.get("/")
-async def index(request: Request):
-    # serve SPA index (static)
-    index_path = os.path.join(STATIC_DIR, "index.html")
-    if os.path.exists(index_path):
-        try:
-            with open(index_path, "r", encoding="utf-8") as f:
-                content = f.read()
-            # Content Security Policy: restrict external connections to avoid
-            # third-party injected requests (e.g. extension CDNs). Allow our
-            # own CDN used for scripts/styles (cdn.jsdelivr.net). Also permit
-            # HTTPS connections for resources like source-maps from CDNs so
-            # devtools can fetch them without CSP violations.
-            csp = "default-src 'self' https://cdn.jsdelivr.net; script-src 'self' https://cdn.jsdelivr.net; style-src 'self' 'unsafe-inline' https://cdn.jsdelivr.net; img-src 'self' data:; connect-src 'self' https://cdn.jsdelivr.net https:; object-src 'none'; base-uri 'self'"
-            return HTMLResponse(
-                content,
-                media_type="text/html",
-                headers={"Content-Security-Policy": csp},
-            )
-        except Exception:
-            return FileResponse(index_path, media_type="text/html")
-    # fallback minimal page
-    html = "<html><body><h1>Admin GUI</h1><p>Static UI missing.</p></body></html>"
-    return HTMLResponse(html)
-
-
-@app.get("/api/me")
-async def api_me(request: Request):
-    # returns the session user if logged in via OAuth
-    session = request.session
-    user = session.get("user") if session else None
-    is_admin = False
-    try:
-        is_admin = bool(session.get("is_admin")) if session else False
-    except Exception:
-        is_admin = False
-    return JSONResponse({"user": user, "is_admin": is_admin})
-
-
-@app.get("/health")
-async def health(request: Request):
-    # Minimal probe response by default. Expose diagnostics only when enabled.
-    try:
-        if not getattr(config, "HEALTH_DEBUG", False):
-            return JSONResponse({"ok": True})
-    except Exception:
-        return JSONResponse({"ok": True})
-
-    # Diagnostic payload
-    try:
-        try:
-            db.init_db()
-            total_requests = db.count_requests()
-            db_ok = True
-        except Exception:
-            total_requests = None
-            db_ok = False
-        ws_conns = getattr(ws_broadcast, "_connections", None)
-        ws_count = len(ws_conns) if ws_conns is not None else 0
-        payload = {
-            "ok": True,
-            "db_ok": db_ok,
-            "total_requests": total_requests,
-            "ws_clients": ws_count,
-        }
-        return JSONResponse(payload)
-    except Exception:
-        return JSONResponse({"ok": True})
-
-
-@app.get("/login")
-async def login(request: Request):
-    # Prefer a live provider client if available (tests may monkeypatch
-    # `oauth.provider`). This allows provider-based flows even when the
-    # environment variables are not set. If OAuth was intended via env
-    # but no provider instance is present, return an error.
-    provider = _get_oauth_provider()
-    if provider:
-        redirect_uri = request.url_for("auth")
-        return await provider.authorize_redirect(request, redirect_uri)
-    if _oauth_enabled():
-        # OAuth configured via env but provider instance unavailable
-        raise HTTPException(status_code=400, detail="OAuth provider not available")
-
-    # Otherwise, if ADMIN_TOKEN is configured, show a simple token form.
-    admin_token = os.environ.get("ADMIN_TOKEN")
-    if admin_token:
-        html = """
-        <!doctype html>
-        <html lang="it">
-            <head>
-                <meta charset="utf-8" />
-                <meta name="viewport" content="width=device-width, initial-scale=1" />
-                <title>Login Admin — Social media reuploader</title>
-                <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
-                <style>
-                    body { background:#f8f9fa; }
-                    .overlay { display:flex; align-items:center; justify-content:center; min-height:100vh; padding:2rem; }
-                    .login-card { max-width:520px; width:100%; background:#fff; padding:1.5rem; border-radius:12px; box-shadow:0 8px 30px rgba(0,0,0,0.08); }
-                    .brand { font-weight:700; color:#0d6efd; }
-                    .small-muted { color:#6c757d; font-size:0.95rem; }
-                </style>
-            </head>
-            <body>
-                <div class="overlay">
-                    <div class="login-card">
-                        <div class="d-flex justify-content-between align-items-start mb-3">
-                            <div>
-                                <div class="brand">Social media reuploader</div>
-                                <div class="small-muted">Local admin token login</div>
-                            </div>
-                            <div><small class="small-muted">Secured</small></div>
-                        </div>
-                        <p class="text-muted">Inserisci il token amministrativo locale per autenticarti e accedere alla console di amministrazione.</p>
-                        <form method="post" action="/login" class="mb-2">
-                            <div class="mb-3">
-                                <label class="form-label">Admin token</label>
-                                <input autofocus class="form-control form-control-lg" type="password" name="token" />
-                            </div>
-                            <div class="d-grid">
-                                <button class="btn btn-primary btn-lg" type="submit">Accedi</button>
-                            </div>
-                        </form>
-                        <div class="mt-3 small-muted">Se preferisci usare OAuth, configura le variabili OAUTH_* e riavvia il servizio.</div>
-                    </div>
-                </div>
-            </body>
-        </html>
-        """
-        return HTMLResponse(html)
-
-    raise HTTPException(status_code=400, detail="No login method available")
-
-
-@app.post("/login")
-async def login_post(request: Request):
-    """Process local admin token login when OAuth is not available.
-
-    This endpoint accepts a form field `token` and, if it matches the
-    configured `ADMIN_TOKEN`, grants `session['is_admin'] = True` for the
-    ongoing session and redirects to the index.
-    """
-    admin_token = os.environ.get("ADMIN_TOKEN")
-    if not admin_token or _oauth_enabled():
-        raise HTTPException(status_code=400, detail="Local admin login not available")
-    # Parse form without relying on python-multipart (might not be installed).
-    token = None
-    try:
-        ct = (request.headers.get("content-type") or "").lower()
-        body = await request.body()
-        if b"=" in body and ("application/x-www-form-urlencoded" in ct or ct == ""):
-            # parse urlencoded body
-            from urllib.parse import parse_qs
-
-            parsed = parse_qs(body.decode("utf-8", errors="ignore"))
-            token = parsed.get("token", [None])[0]
-        else:
-            # try json fallback
-            try:
-                j = await request.json()
-                token = j.get("token")
-            except Exception:
-                token = None
-    except Exception:
-        token = None
-    if token and token == admin_token:
-        try:
-            request.session["is_admin"] = True
-        except Exception:
-            pass
-        return RedirectResponse(url="/", status_code=303)
-        html = """
-        <!doctype html>
-        <html lang="it">
-            <head>
-                <meta charset="utf-8" />
-                <meta name="viewport" content="width=device-width, initial-scale=1" />
-                <title>Login Admin — Social media reuploader</title>
-                <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
-                <style>
-                    body { background:#f8f9fa; }
-                    .overlay { display:flex; align-items:center; justify-content:center; min-height:100vh; padding:2rem; }
-                    .login-card { max-width:520px; width:100%; background:#fff; padding:1.5rem; border-radius:12px; box-shadow:0 8px 30px rgba(0,0,0,0.08); }
-                    .brand { font-weight:700; color:#0d6efd; }
-                    .small-muted { color:#6c757d; font-size:0.95rem; }
-                </style>
-            </head>
-            <body>
-                <div class="overlay">
-                    <div class="login-card">
-                        <div class="d-flex justify-content-between align-items-start mb-3">
-                            <div>
-                                <div class="brand">Social media reuploader</div>
-                                <div class="small-muted">Local admin token login</div>
-                            </div>
-                            <div><small class="small-muted">Secured</small></div>
-                        </div>
-                        <p class="text-danger">Token non valido</p>
-                        <form method="post" action="/login" class="mb-2">
-                            <div class="mb-3">
-                                <label class="form-label">Admin token</label>
-                                <input autofocus class="form-control form-control-lg" type="password" name="token" />
-                            </div>
-                            <div class="d-grid">
-                                <button class="btn btn-primary btn-lg" type="submit">Accedi</button>
-                            </div>
-                        </form>
-                        <div class="mt-3 small-muted">Se preferisci usare OAuth, configura le variabili OAUTH_* e riavvia il servizio.</div>
-                    </div>
-                </div>
-            </body>
-        </html>
-        """
-        return HTMLResponse(html, status_code=403)
-
-
-@app.get("/auth")
-async def auth(request: Request):
-    provider = _get_oauth_provider()
-    if not provider:
-        raise HTTPException(status_code=400, detail="OAuth provider not configured")
-    try:
-        token = await provider.authorize_access_token(request)
-    except OAuthError as err:
-        raise HTTPException(status_code=400, detail=str(err))
-
-    # Try to obtain userinfo. Prefer fetching from configured userinfo URL,
-    # otherwise fall back to any userinfo returned in the token payload.
-    access_token = token.get("access_token")
-    userinfo = None
-    if OAUTH_USERINFO_URL and access_token:
-        async with aiohttp.ClientSession() as session:
-            headers = {"Authorization": f"Bearer {access_token}"}
-            async with session.get(OAUTH_USERINFO_URL, headers=headers) as resp:
-                try:
-                    userinfo = await resp.json()
-                except Exception:
-                    userinfo = None
-
-    if userinfo is None:
-        # Some providers return user info in the token response under
-        # various keys; accept a few common fallbacks.
-        userinfo = (
-            token.get("userinfo") or token.get("user") or token.get("id_token_claims")
-        )
-
-    # Save user in session only when we have meaningful identity information.
-    # Avoid storing a placeholder like {'sub': None} which makes the UI
-    # mistakenly treat the session as authenticated.
-    try:
-        if (
-            userinfo
-            and isinstance(userinfo, dict)
-            and (
-                userinfo.get("email")
-                or userinfo.get("preferred_username")
-                or userinfo.get("sub")
-                or userinfo.get("name")
-            )
-        ):
-            request.session["user"] = userinfo
-        else:
-            # ensure we don't leave a stale/placeholder user in session
-            request.session.pop("user", None)
-    except Exception:
-        # fallback: avoid breaking the auth flow
-        request.session.pop("user", None)
-
-    # Auto-grant session admin when the authenticated user belongs to one of
-    # the configured OAuth admin groups, or when their email maps to an
-    # admin user in the local DB. This is intentionally session-scoped.
-    try:
-        user = request.session.get("user")
-        if user and isinstance(user, dict):
-            groups = user.get("groups") or user.get("memberOf") or user.get("member_of")
-            if groups:
-                if isinstance(groups, str):
-                    groups_list = [g.strip() for g in groups.split(",") if g.strip()]
-                elif isinstance(groups, (list, tuple)):
-                    groups_list = list(groups)
-                else:
-                    groups_list = [str(groups)]
-                for g in groups_list:
-                    if (
-                        g in OAUTH_ADMIN_GROUPS_SET
-                        or g.lower() in OAUTH_ADMIN_GROUPS_LOWER
-                    ):
-                        request.session["is_admin"] = True
-                        break
-        # fallback: map email to DB role
-        if not request.session.get("is_admin") and user and isinstance(user, dict):
-            email = (
-                user.get("email") or user.get("preferred_username") or user.get("sub")
-            )
-            if email:
-                u = db.get_user_by_email(email)
-                if u and u[3] == "admin":
-                    request.session["is_admin"] = True
-    except Exception:
-        # don't fail the auth flow if admin mapping fails
-        pass
-
-    return RedirectResponse(url="/")
-
-
-@app.get("/logout")
-async def logout(request: Request):
-    request.session.clear()
-    return RedirectResponse(url="/")
-
-
-@app.get("/requests")
-async def get_requests(
-    request: Request, limit: int = 50, offset: int = 0, status: str = None
-):
-    # JSON API for requests (protected) with server-side pagination and optional status filter
-    if not _check_admin(request):
-        raise HTTPException(status_code=403, detail="forbidden")
-    conn = db._connect()
-    cur = conn.cursor()
-    try:
-        if status:
-            cur.execute("SELECT COUNT(*) FROM requests WHERE status = ?", (status,))
-        else:
-            cur.execute("SELECT COUNT(*) FROM requests")
-        total = int(cur.fetchone()[0] or 0)
-    finally:
-        conn.close()
-    rows = db.list_requests(limit=limit, offset=offset) if not status else None
-    if status:
-        # perform filtered query when status provided
-        conn = db._connect()
-        cur = conn.cursor()
-        cur.execute(
-            """SELECT id, chat_id, url, status, created_at, description,
-                       original_message_id, original_size, final_size, compressed,
-                       processing_started_at, processing_finished_at, processing_duration_seconds
-                       FROM requests WHERE status = ? ORDER BY id DESC LIMIT ? OFFSET ?""",
-            (status, limit, offset),
-        )
-        rows = cur.fetchall()
-        conn.close()
-    results = []
-    for r in rows:
-        # id, chat_id, url, status, created_at, description,
-        # original_message_id, original_size, final_size, compressed,
-        # processing_started_at, processing_finished_at, processing_duration_seconds
-        (
-            rid,
-            chat_id,
-            url,
-            status,
-            created_at,
-            description,
-            original_message_id,
-            original_size,
-            final_size,
-            compressed,
-            processing_started_at,
-            processing_finished_at,
-            processing_duration_seconds,
-        ) = r
-
-        def _mb(b):
-            try:
-                return round(float(b) / (1024 * 1024), 1)
-            except Exception:
-                return None
-
-        events = []
-        try:
-            ev_rows = db.get_request_events(rid, limit=20)
-            for ev in ev_rows:
-                events.append(
-                    {
-                        "id": ev[0],
-                        "type": ev[1],
-                        "details": ev[2],
-                        "duration_seconds": ev[3],
-                        "created_at": ev[4],
-                    }
-                )
-        except Exception:
-            events = []
-        results.append(
-            {
-                "id": rid,
-                "chat_id": chat_id,
-                "url": url,
-                "status": status,
-                "created_at": created_at,
-                "description": description,
-                "original_message_id": original_message_id,
-                "original_size_bytes": original_size,
-                "original_size_mb": _mb(original_size),
-                "final_size_bytes": final_size,
-                "final_size_mb": _mb(final_size),
-                "compressed": bool(compressed) if compressed is not None else None,
-                "processing_started_at": processing_started_at,
-                "processing_finished_at": processing_finished_at,
-                "processing_duration_seconds": processing_duration_seconds,
-                "events": events,
-            }
-        )
-    return JSONResponse(
-        {"total": total, "offset": offset, "limit": limit, "items": results}
-    )
-
-
-@app.get("/stats")
-async def api_stats(request: Request):
-    if not _check_admin(request):
-        raise HTTPException(status_code=403, detail="forbidden")
-    # compute simple aggregates: averages and counts
-    conn = db._connect()
-    cur = conn.cursor()
-
-    def _safe_avg(col):
-        try:
-            cur.execute(f"SELECT AVG({col}) FROM requests WHERE {col} IS NOT NULL")
-            r = cur.fetchone()
-            return float(r[0]) if r and r[0] is not None else None
-        except Exception:
-            return None
-
-    total = db.count_requests()
-    avg_orig = _safe_avg("original_size")
-    avg_final = _safe_avg("final_size")
-    avg_proc = _safe_avg("processing_duration_seconds")
-    # how many requests had compress/redownload events
-    try:
-        cur.execute(
-            "SELECT COUNT(DISTINCT request_id) FROM request_events WHERE event_type IN ('compress','redownload')"
-        )
-        need_proc = int(cur.fetchone()[0] or 0)
-    except Exception:
-        need_proc = 0
-    # additional totals
-    try:
-        cur = conn.cursor()
-        # total downloads started
-        cur.execute(
-            "SELECT COUNT(*) FROM requests WHERE processing_started_at IS NOT NULL"
-        )
-        total_downloaded = int(cur.fetchone()[0] or 0)
-    except Exception:
-        total_downloaded = 0
-    try:
-        # total successfully sent/completed
-        cur.execute(
-            "SELECT COUNT(*) FROM requests WHERE status IN ('done','finished','completed')"
-        )
-        total_sent = int(cur.fetchone()[0] or 0)
-    except Exception:
-        total_sent = 0
-    try:
-        # total rate_limited files
-        cur.execute("SELECT COUNT(*) FROM requests WHERE status = 'rate_limited'")
-        total_rate_limited = int(cur.fetchone()[0] or 0)
-    except Exception:
-        total_rate_limited = 0
-    try:
-        # total distinct chats that have persisted rate_limited rows
-        cur.execute(
-            "SELECT COUNT(DISTINCT chat_id) FROM requests WHERE status = 'rate_limited'"
-        )
-        total_chats_rate_limited = int(cur.fetchone()[0] or 0)
-    except Exception:
-        total_chats_rate_limited = 0
-    try:
-        # total duplicates captured
-        cur.execute("SELECT COUNT(*) FROM requests WHERE status = 'duplicate'")
-        total_duplicates = int(cur.fetchone()[0] or 0)
-    except Exception:
-        total_duplicates = 0
-
-    # total bytes (downloaded/uploaded/processed)
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT SUM(original_size) FROM requests WHERE original_size IS NOT NULL"
-        )
-        total_original_bytes = int(cur.fetchone()[0] or 0)
-    except Exception:
-        total_original_bytes = 0
-    try:
-        cur = conn.cursor()
-        cur.execute("SELECT SUM(final_size) FROM requests WHERE final_size IS NOT NULL")
-        total_final_bytes = int(cur.fetchone()[0] or 0)
-    except Exception:
-        total_final_bytes = 0
-    try:
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT SUM(original_size) FROM requests WHERE processing_started_at IS NOT NULL AND original_size IS NOT NULL"
-        )
-        total_processed_bytes = int(cur.fetchone()[0] or 0)
-    except Exception:
-        total_processed_bytes = 0
-
-    conn.close()
-
-    # format and return simple stats
-    def mb(v):
-        try:
-            return round(float(v) / (1024 * 1024), 2) if v is not None else None
-        except Exception:
-            return None
-
-    # compute currently limited chats from in-process worker when available
-    current_limited = []
-    try:
-        from . import worker as worker_mod
-
-        w = getattr(worker_mod, "active_worker", None)
-        now = time.time()
-        if w:
-            try:
-                for cid, next_ts in getattr(w, "_last_rate_limited_next", {}).items():
-                    try:
-                        if next_ts and float(next_ts) > now:
-                            current_limited.append(
-                                {
-                                    "chat_id": cid,
-                                    "next_in_seconds": int(
-                                        max(0, float(next_ts) - now)
-                                    ),
-                                }
-                            )
-                    except Exception:
-                        pass
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    return JSONResponse(
-        {
-            "total_requests": total,
-            "avg_original_size_bytes": avg_orig,
-            "avg_original_size_mb": mb(avg_orig),
-            "avg_final_size_bytes": avg_final,
-            "avg_final_size_mb": mb(avg_final),
-            "avg_processing_seconds": avg_proc,
-            "requests_need_processing": need_proc,
-            "total_downloaded": total_downloaded,
-            "total_sent": total_sent,
-            "total_original_bytes": total_original_bytes,
-            "total_final_bytes": total_final_bytes,
-            "total_processed_bytes": total_processed_bytes,
-            "total_original_mb": mb(total_original_bytes),
-            "total_final_mb": mb(total_final_bytes),
-            "total_processed_mb": mb(total_processed_bytes),
-            "total_rate_limited_files": total_rate_limited,
-            "total_chats_rate_limited": total_chats_rate_limited,
-            "total_duplicates": total_duplicates,
-            "currently_limited": current_limited,
-        }
-    )
-
-
-@app.post("/api/db/clear")
-async def api_db_clear(request: Request):
-    if not _check_admin(request):
-        raise HTTPException(status_code=403, detail="forbidden")
-    try:
-        db.clear_history()
-    except Exception as e:
-        logging.exception("Failed to clear database: %s", e)
-        raise HTTPException(status_code=500, detail=f"failed to clear database: {e}")
-
-    # persist audit row
-    try:
-        db.add_update(json.dumps({"type": "db_cleared"}))
-    except Exception:
-        pass
-
-    # broadcast event so GUIs refresh
-    try:
-        if getattr(ws_broadcast, "loop", None):
-            import asyncio as _asyncio
-
-            _asyncio.run_coroutine_threadsafe(
-                ws_broadcast.broadcast({"type": "db_cleared"}),
-                ws_broadcast.loop,
-            )
-    except Exception:
-        pass
-
-    return JSONResponse({"ok": True})
-
-
-@app.get("/config")
-async def api_config(request: Request):
-    # lightweight view of runtime configuration for the SPA
-    try:
-        cfg = {
-            "oauth_configured": _oauth_enabled(),
-            "admin_token_set": bool(os.environ.get("ADMIN_TOKEN")),
-            "MAX_PENDING_PER_CHAT": getattr(config, "MAX_PENDING_PER_CHAT", None),
-            "DUPLICATE_WINDOW_SECONDS": getattr(
-                config, "DUPLICATE_WINDOW_SECONDS", None
-            ),
-            "TELEGRAM_MAX_FILE_SIZE": getattr(config, "TELEGRAM_MAX_FILE_SIZE", None),
-            "WORKERS": getattr(config, "WORKERS", None),
-            "SIMPLE_YTDLP_ONLY": getattr(config, "SIMPLE_YTDLP_ONLY", None),
-            "WORKER_GENERATE_THUMBNAIL": getattr(
-                config, "WORKER_GENERATE_THUMBNAIL", None
-            ),
-            "TMP_DIR": getattr(config, "TMP_DIR", None),
-        }
-    except Exception:
-        cfg = {}
-    # include in-memory worker details when available
-    try:
-        from . import worker as worker_mod
-
-        w = getattr(worker_mod, "active_worker", None)
-        if w:
-            try:
-                cfg["rate_limits"] = list(getattr(w, "_rate_limits", []))
-                cfg["in_memory_queue_length"] = len(
-                    list(getattr(w._queue, "_queue", []))
-                )
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    return JSONResponse(cfg)
-
-
-@app.post("/api/unlimit_chat")
-async def api_unlimit_chat(request: Request):
-    if not _check_admin(request):
-        raise HTTPException(status_code=403, detail="forbidden")
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    chat_id = body.get("chat_id")
-    requeue = bool(body.get("requeue", False))
-    if chat_id is None:
-        raise HTTPException(status_code=400, detail="chat_id required")
-
-    updated = 0
-    try:
-        # clear in-memory markers when worker present
-        from . import worker as worker_mod
-
-        w = getattr(worker_mod, "active_worker", None)
-        if w:
-            try:
-                w._last_rate_limited.pop(chat_id, None)
-            except Exception:
-                pass
-            try:
-                w._last_rate_limited_next.pop(chat_id, None)
-            except Exception:
-                pass
-            try:
-                w._last_rate_warning.pop(chat_id, None)
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    # optionally requeue persisted requests
-    try:
-        conn = db._connect()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT id, url, description, original_message_id FROM requests WHERE chat_id = ? AND status = 'rate_limited' ORDER BY created_at ASC",
-            (chat_id,),
-        )
-        rows = cur.fetchall()
-        for rid, url, desc, orig_msg in rows:
-            try:
-                if requeue:
-                    db.update_request_status(rid, "queued")
-                    try:
-                        db.add_request_event(
-                            rid, "unlimited", details="unlimited by admin (requeued)"
-                        )
-                    except Exception:
-                        pass
-                    # push into in-memory queue if worker available
-                    try:
-                        from . import worker as worker_mod2
-
-                        w2 = getattr(worker_mod2, "active_worker", None)
-                        if w2:
-                            item = {
-                                "chat_id": chat_id,
-                                "url": url,
-                                "description": desc,
-                                "original_message_id": orig_msg,
-                                "enqueued_at": time.time(),
-                                "request_id": rid,
-                            }
-                            try:
-                                w2._queue.put_nowait(item)
-                            except Exception:
-                                try:
-                                    asyncio.create_task(w2._queue.put(item))
-                                except Exception:
-                                    pass
-                            # If worker supports a trigger method, ask it to pick up
-                            # persisted queued items immediately. This is a noop
-                            # when GUI/worker are different processes but helps
-                            # when they run together.
-                            try:
-                                if getattr(
-                                    config, "WORKER_REHYDRATE_ON_UNLIMIT", False
-                                ):
-                                    try:
-                                        getattr(w2, "trigger_rehydrate", lambda: None)()
-                                    except Exception:
-                                        pass
-                            except Exception:
-                                pass
-                    except Exception:
-                        pass
-                else:
-                    # mark event for operator visibility
-                    try:
-                        # mark status to indicate the rate limit was cleared
-                        try:
-                            db.update_request_status(rid, "unlimited")
-                        except Exception:
-                            pass
-                        db.add_request_event(
-                            rid, "unlimited", details="unlimited by admin (no requeue)"
-                        )
-                    except Exception:
-                        pass
-                updated += 1
-            except Exception:
-                pass
-        try:
-            conn.commit()
-        except Exception:
-            pass
-        try:
-            conn.close()
-        except Exception:
-            pass
-    except Exception:
-        pass
-
-    # notify websocket clients to refresh
-    try:
-        from . import ws_broadcast
-
-        if getattr(ws_broadcast, "loop", None):
-            import asyncio as _asyncio
-
-            _asyncio.run_coroutine_threadsafe(
-                ws_broadcast.broadcast({"type": "unlimited", "chat_id": chat_id}),
-                ws_broadcast.loop,
-            )
-    except Exception:
-        pass
-
-    # persist a DB-level update so other processes (worker) pick up the
-    # unlimit event even when GUI and worker run separately.
-    try:
-        db.add_update(json.dumps({"type": "unlimited", "chat_id": chat_id}))
-    except Exception:
-        pass
-
-    return JSONResponse({"ok": True, "updated": updated})
-
-
-@app.post("/api/unlimit_all")
-async def api_unlimit_all(request: Request):
-    """Clear rate-limit markers for all chats. Optional JSON body: {"requeue": true} to requeue persisted items."""
-    if not _check_admin(request):
-        raise HTTPException(status_code=403, detail="forbidden")
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    requeue = bool(body.get("requeue", False))
-
-    updated = 0
-    try:
-        # clear in-memory markers when worker present
-        from . import worker as worker_mod
-
-        w = getattr(worker_mod, "active_worker", None)
-        if w:
-            try:
-                w._last_rate_limited.clear()
-            except Exception:
-                pass
-            try:
-                w._last_rate_limited_next.clear()
-            except Exception:
-                pass
-            try:
-                w._last_rate_warning.clear()
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    # optionally requeue persisted requests (or just mark as unlimited)
-    try:
-        conn = db._connect()
-        cur = conn.cursor()
-        cur.execute(
-            "SELECT id, chat_id, url, description, original_message_id FROM requests WHERE status = 'rate_limited' ORDER BY created_at ASC"
-        )
-        rows = cur.fetchall()
-        for rid, chat_id, url, desc, orig_msg in rows:
-            try:
-                if requeue:
-                    db.update_request_status(rid, "queued")
-                    try:
-                        db.add_request_event(
-                            rid,
-                            "unlimited",
-                            details="unlimited by admin (requeued all)",
-                        )
-                    except Exception:
-                        pass
-                    # push into in-memory queue if worker available
-                    try:
-                        from . import worker as worker_mod2
-
-                        w2 = getattr(worker_mod2, "active_worker", None)
-                        if w2:
-                            item = {
-                                "chat_id": chat_id,
-                                "url": url,
-                                "description": desc,
-                                "original_message_id": orig_msg,
-                                "enqueued_at": time.time(),
-                                "request_id": rid,
-                            }
-                            try:
-                                w2._queue.put_nowait(item)
-                            except Exception:
-                                try:
-                                    asyncio.create_task(w2._queue.put(item))
-                                except Exception:
-                                    pass
-                    except Exception:
-                        pass
-                else:
-                    try:
-                        try:
-                            db.update_request_status(rid, "unlimited")
-                        except Exception:
-                            pass
-                        db.add_request_event(
-                            rid, "unlimited", details="unlimited by admin (no requeue)"
-                        )
-                    except Exception:
-                        pass
-                updated += 1
-            except Exception:
-                pass
-        try:
-            conn.commit()
-        except Exception:
-            pass
-        try:
-            conn.close()
-        except Exception:
-            pass
-    except Exception:
-        pass
-
-    # notify websocket clients to refresh
-    try:
-        from . import ws_broadcast
-
-        if getattr(ws_broadcast, "loop", None):
-            import asyncio as _asyncio
-
-            _asyncio.run_coroutine_threadsafe(
-                ws_broadcast.broadcast({"type": "unlimited_all"}), ws_broadcast.loop
-            )
-    except Exception:
-        pass
-
-    # persist a DB-level update so other processes (worker) pick up the
-    # unlimit_all event even when GUI and worker run separately.
-    try:
-        db.add_update(json.dumps({"type": "unlimited_all"}))
-    except Exception:
-        pass
-
-    return JSONResponse({"ok": True, "updated": updated})
-
-
-@app.post("/api/clear_queue")
-async def api_clear_queue(request: Request):
-    if not _check_admin(request):
-        raise HTTPException(status_code=403, detail="forbidden")
-    body = {}
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    only_chat = body.get("chat_id")
-
-    # Run the heavy clear operation in a background thread to avoid
-    # blocking the main event loop (which causes the SPA to hang/white-screen).
-    def _clear_queue_sync(only_chat_local):
-        cleared_local = 0
-        try:
-            # clear in-memory queue when worker present
-            from . import worker as worker_mod
-
-            w = getattr(worker_mod, "active_worker", None)
-            if w:
-                try:
-                    q = getattr(w._queue, "_queue", None)
-                    if q is not None:
-                        if only_chat_local is None:
-                            cleared_local += len(q)
-                            q.clear()
-                        else:
-                            remaining = []
-                            for it in list(q):
-                                try:
-                                    if it.get("chat_id") == only_chat_local:
-                                        cleared_local += 1
-                                    else:
-                                        remaining.append(it)
-                                except Exception:
-                                    remaining.append(it)
-                            q.clear()
-                            for it in remaining:
-                                q.append(it)
-                except Exception:
-                    pass
-        except Exception:
-            pass
-
-        # update DB: mark queued requests as 'cancelled' for visibility
-        try:
-            conn = db._connect()
-            cur = conn.cursor()
-            if only_chat_local is None:
-                cur.execute("SELECT id FROM requests WHERE status = 'queued'")
-            else:
-                cur.execute(
-                    "SELECT id FROM requests WHERE status = 'queued' AND chat_id = ?",
-                    (only_chat_local,),
-                )
-            rows = cur.fetchall()
-            ids = [r[0] for r in rows]
-            for rid in ids:
-                try:
-                    cur.execute(
-                        "UPDATE requests SET status = ? WHERE id = ?",
-                        ("cancelled", rid),
-                    )
-                    try:
-                        db.add_request_event(
-                            rid, "cancelled", details="cancelled by admin clear_queue"
-                        )
-                    except Exception:
-                        pass
-                    cleared_local += 1
-                except Exception:
-                    pass
-            conn.commit()
-            try:
-                conn.close()
-            except Exception:
-                pass
-        except Exception:
-            pass
-
-        # broadcast event so GUIs refresh
-        try:
-            from . import ws_broadcast
-
-            if getattr(ws_broadcast, "loop", None):
-                ws_broadcast.publish_sync({"type": "queue_cleared"})
-        except Exception:
-            pass
-
-        return cleared_local
-
-    # schedule the blocking work on a thread and return immediately
-    try:
-        task = asyncio.create_task(asyncio.to_thread(_clear_queue_sync, only_chat))
-        _background_tasks.add(task)
-
-        def _task_done_callback(t):
-            _background_tasks.discard(t)
-            try:
-                exc = t.exception()
-                if exc:
-                    logging.exception(
-                        "Background clear_queue task raised exception: %s", exc
-                    )
-            except Exception:
-                pass
-
-        task.add_done_callback(_task_done_callback)
-    except Exception:
-        # fallback: run synchronously if scheduling fails (best-effort)
-        try:
-            cleared_now = _clear_queue_sync(only_chat)
-            return JSONResponse({"ok": True, "cleared": cleared_now})
-        except Exception:
-            return JSONResponse({"ok": False, "cleared": 0})
-
-    return JSONResponse({"ok": True, "cleared": "scheduled"})
-
-
-@app.post("/api/queue/start")
-async def api_queue_start(request: Request):
-    """Manually trigger the worker to ingest/process persisted queued items.
-
-    Optional JSON body: { "rehydrate": true } (default true).
-    """
-    if not _check_admin(request):
-        raise HTTPException(status_code=403, detail="forbidden")
-    try:
-        body = await request.json()
-    except Exception:
-        body = {}
-    rehydrate = bool(body.get("rehydrate", True))
-
-    try:
-        from . import worker as worker_mod
-
-        w = getattr(worker_mod, "active_worker", None)
-        if w and rehydrate:
-            try:
-                getattr(w, "trigger_rehydrate", lambda: None)()
-            except Exception:
-                pass
-    except Exception:
-        pass
-
-    return JSONResponse({"ok": True})
-
-    # also expose richer aggregates via a single endpoint
-
-
-@app.get("/api/aggregates")
-async def api_aggregates(request: Request, top_limit: int = 10):
-    if not _check_admin(request):
-        raise HTTPException(status_code=403, detail="forbidden")
-    conn = db._connect()
-    cur = conn.cursor()
-    # status counts
-    status_counts = {}
-    try:
-        cur.execute("SELECT status, COUNT(*) FROM requests GROUP BY status")
-        for s, c in cur.fetchall():
-            status_counts[s or "unknown"] = int(c or 0)
-    except Exception:
-        pass
-
-    # top chats
-    top_chats = []
-    try:
-        cur.execute(
-            "SELECT chat_id, COUNT(*) as cnt FROM requests GROUP BY chat_id ORDER BY cnt DESC LIMIT ?",
-            (top_limit,),
-        )
-        for chat_id, cnt in cur.fetchall():
-            top_chats.append({"chat_id": chat_id, "count": int(cnt or 0)})
-    except Exception:
-        pass
-
-    # processing duration histogram buckets
-    buckets = [(0, 1), (1, 5), (5, 10), (10, 30), (30, 60), (60, None)]
-    labels = ["0-1s", "1-5s", "5-10s", "10-30s", "30-60s", "60s+"]
-    counts = []
-    try:
-        for low, high in buckets:
-            if high is None:
-                cur.execute(
-                    "SELECT COUNT(*) FROM requests WHERE processing_duration_seconds IS NOT NULL AND processing_duration_seconds >= ?",
-                    (low,),
-                )
-            else:
-                cur.execute(
-                    "SELECT COUNT(*) FROM requests WHERE processing_duration_seconds IS NOT NULL AND processing_duration_seconds >= ? AND processing_duration_seconds < ?",
-                    (low, high),
-                )
-            counts.append(int(cur.fetchone()[0] or 0))
-    except Exception:
-        counts = [0] * len(labels)
-
-    conn.close()
-    return JSONResponse(
-        {
-            "status_counts": status_counts,
-            "top_chats": top_chats,
-            "duration_histogram": {"labels": labels, "counts": counts},
-        }
-    )
-
-
-@app.get("/api/queue")
-async def api_queue(request: Request, limit: int = 50):
-    """Return a snapshot of the current WorkerPool queue and running tasks."""
-    if not _check_admin(request):
-        raise HTTPException(status_code=403, detail="forbidden")
-    try:
-        # import worker module lazily to avoid startup import cycles
-        from . import worker as worker_mod
-
-        w = getattr(worker_mod, "active_worker", None)
-        if not w:
-            # No in-process worker: fall back to persisted requests in DB
-            try:
-                conn = db._connect()
-                cur = conn.cursor()
-                # queued items
-                cur.execute(
-                    "SELECT id, chat_id, url, status, created_at FROM requests WHERE status = 'queued' ORDER BY created_at ASC LIMIT ?",
-                    (limit,),
-                )
-                queued_rows = cur.fetchall()
-                # running items: only treat as running if processing_started_at is recent
-                window = int(os.environ.get("GUI_PROCESSING_WINDOW_SECONDS", "1800"))
-                cutoff = (
-                    datetime.datetime.utcnow() - datetime.timedelta(seconds=window)
-                ).isoformat()
-                cur.execute(
-                    "SELECT id, chat_id, url, status, processing_started_at FROM requests WHERE status IN ('processing','sending') AND processing_started_at >= ? ORDER BY processing_started_at DESC LIMIT ?",
-                    (cutoff, limit),
-                )
-                running_rows = cur.fetchall()
-                try:
-                    conn.close()
-                except Exception:
-                    pass
-            except Exception:
-                queued_rows = []
-                running_rows = []
-
-            queued = []
-            running = []
-            for r in queued_rows:
-                try:
-                    rid, chat_id, url, status, created_at = r
-                    queued.append(
-                        {
-                            "request_id": rid,
-                            "chat_id": chat_id,
-                            "url": url,
-                            "enqueued_at": created_at,
-                        }
-                    )
-                except Exception:
-                    pass
-            for r in running_rows:
-                try:
-                    rid, chat_id, url, status, started_at = r
-                    running.append(
-                        {
-                            "request_id": rid,
-                            "chat_id": chat_id,
-                            "url": url,
-                            "enqueued_at": started_at,
-                        }
-                    )
-                except Exception:
-                    pass
-
-            return JSONResponse(
-                {
-                    "queue_length": len(queued_rows) + len(running_rows),
-                    "queued": queued,
-                    "running": running,
-                }
-            )
-
-        # queued items (internal asyncio.Queue deque)
-        try:
-            queued_raw = list(getattr(w._queue, "_queue", []))
-        except Exception:
-            queued_raw = []
-        queued = []
-        for it in queued_raw[:limit]:
-            try:
-                queued.append(
-                    {
-                        "chat_id": it.get("chat_id"),
-                        "url": it.get("url"),
-                        "enqueued_at": it.get("enqueued_at"),
-                    }
-                )
-            except Exception:
-                pass
-
-        running = []
-        try:
-            tasks = list(getattr(w, "_tasks", set()))
-            for t in tasks:
-                try:
-                    if t.done():
-                        continue
-                except Exception:
-                    pass
-                item = getattr(t, "_item", None)
-                if item:
-                    running.append(
-                        {
-                            "chat_id": item.get("chat_id"),
-                            "url": item.get("url"),
-                            "enqueued_at": item.get("enqueued_at"),
-                        }
-                    )
-        except Exception:
-            running = []
-
-        return JSONResponse(
-            {
-                "queue_length": len(queued_raw),
-                "queued": queued,
-                "running": running,
-            }
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/api/rate_limits")
-async def api_rate_limits(request: Request, per_chat_limit: int = 200):
-    """Return current in-memory rate-limit state and recent rate-limited requests.
-
-    Exposes per-chat counters for configured windows and lists recent
-    `requests` rows that were persisted with status='rate_limited'.
-    """
-    if not _check_admin(request):
-        raise HTTPException(status_code=403, detail="forbidden")
-    try:
-        from . import worker as worker_mod
-
-        w = getattr(worker_mod, "active_worker", None)
-
-        # If no active worker is present (GUI running as a separate process),
-        # still return persisted recent rate_limited/duplicate rows from DB.
-        if not w:
-            limits = []
-            per_chat = []
-        else:
-            limits = list(getattr(w, "_rate_limits", []))
-            now = time.time()
-
-            # collect chat ids known in memory
-            chat_ids = set()
-            try:
-                chat_ids.update(getattr(w, "_chat_timestamps", {}).keys())
-            except Exception:
-                pass
-            try:
-                chat_ids.update(getattr(w, "_last_rate_limited", {}).keys())
-            except Exception:
-                pass
-            try:
-                chat_ids.update(getattr(w, "_last_rate_warning", {}).keys())
-            except Exception:
-                pass
-
-            per_chat = []
-            for cid in list(chat_ids)[:per_chat_limit]:
-                try:
-                    ts = list(getattr(w, "_chat_timestamps", {}).get(cid, []))
-                except Exception:
-                    ts = []
-                counters = []
-                next_available_seconds = None
-                try:
-                    for limit, window in limits:
-                        cnt = sum(1 for t in ts if t >= now - window)
-                        # compute next free slot if limit reached
-                        next_in = 0
-                        if cnt >= limit:
-                            relevant = [t for t in ts if t >= now - window]
-                            if relevant:
-                                oldest = min(relevant)
-                                next_in = int(max(0, (oldest + window) - now))
-                        counters.append(
-                            {
-                                "limit": limit,
-                                "window_seconds": window,
-                                "count": int(cnt),
-                                "next_in_seconds": next_in,
-                            }
-                        )
-                        if next_in and (
-                            next_available_seconds is None
-                            or next_in > next_available_seconds
-                        ):
-                            next_available_seconds = next_in
-                except Exception:
-                    counters = []
-
-                last_l = None
-                try:
-                    last_l = getattr(w, "_last_rate_limited", {}).get(cid)
-                except Exception:
-                    last_l = None
-                last_next = None
-                try:
-                    last_next = getattr(w, "_last_rate_limited_next", {}).get(cid)
-                except Exception:
-                    last_next = None
-                last_warn = None
-                try:
-                    last_warn = getattr(w, "_last_rate_warning", {}).get(cid)
-                except Exception:
-                    last_warn = None
-
-                per_chat.append(
-                    {
-                        "chat_id": cid,
-                        "counters": counters,
-                        "next_available_seconds": next_available_seconds,
-                        "last_rate_limited_at": last_l,
-                        "last_rate_limited_next": last_next,
-                        "last_rate_warning_at": last_warn,
-                    }
-                )
-
-        # recent persisted rate_limited or duplicate requests
-        recent = []
-        try:
-            conn = db._connect()
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT id, chat_id, url, status, created_at FROM requests WHERE status IN ('rate_limited','duplicate') ORDER BY created_at DESC LIMIT ?",
-                (per_chat_limit,),
-            )
-            for r in cur.fetchall():
-                recent.append(
-                    {
-                        "id": r[0],
-                        "chat_id": r[1],
-                        "url": r[2],
-                        "status": r[3],
-                        "created_at": r[4],
-                    }
-                )
-            conn.close()
-        except Exception:
-            recent = []
-
-        # persisted limited chats: distinct chat ids that have persisted
-        # rate_limited rows. This allows the GUI to show a concise list of
-        # blocked chats that can be unblocked individually.
-        persisted_limited = []
-        try:
-            conn = db._connect()
-            cur = conn.cursor()
-            cur.execute(
-                "SELECT chat_id, COUNT(*) as cnt FROM requests WHERE status = 'rate_limited' GROUP BY chat_id ORDER BY cnt DESC LIMIT ?",
-                (per_chat_limit,),
-            )
-            for cid, cnt in cur.fetchall():
-                persisted_limited.append({"chat_id": cid, "count": int(cnt or 0)})
-            conn.close()
-        except Exception:
-            persisted_limited = []
-
-        # compute currently limited chats from worker memory when available
-        currently_limited = []
-        try:
-            now = time.time()
-            for cid in list(getattr(w, "_last_rate_limited_next", {}).keys()):
-                try:
-                    next_ts = getattr(w, "_last_rate_limited_next", {}).get(cid)
-                    if next_ts and float(next_ts) > now:
-                        currently_limited.append(
-                            {
-                                "chat_id": cid,
-                                "next_in_seconds": int(max(0, float(next_ts) - now)),
-                            }
-                        )
-                except Exception:
-                    pass
-        except Exception:
-            currently_limited = []
-
-        return JSONResponse(
-            {
-                "limits": limits,
-                "per_chat": per_chat,
-                "recent_rate_limited": recent,
-                "persisted_limited_chats": persisted_limited,
-                "currently_limited": currently_limited,
-            }
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-@app.get("/requests/{request_id}")
-async def get_request_detail(request: Request, request_id: int):
-    if not _check_admin(request):
-        raise HTTPException(status_code=403, detail="forbidden")
-    conn = db._connect()
-    cur = conn.cursor()
-    try:
-        cur.execute(
-            "SELECT id, chat_id, url, status, created_at, description, original_message_id, original_size, final_size, compressed, processing_started_at, processing_finished_at, processing_duration_seconds FROM requests WHERE id = ?",
-            (request_id,),
-        )
-        r = cur.fetchone()
-        if not r:
-            raise HTTPException(status_code=404, detail="not found")
-        (
-            rid,
-            chat_id,
-            url,
-            status,
-            created_at,
-            description,
-            original_message_id,
-            original_size,
-            final_size,
-            compressed,
-            processing_started_at,
-            processing_finished_at,
-            processing_duration_seconds,
-        ) = r
-    finally:
-        conn.close()
-    events = []
-    try:
-        evs = db.get_request_events(rid, limit=200)
-        for ev in evs:
-            events.append(
-                {
-                    "id": ev[0],
-                    "type": ev[1],
-                    "details": ev[2],
-                    "duration_seconds": ev[3],
-                    "created_at": ev[4],
-                }
-            )
-    except Exception:
-        events = []
-
-    def _mb(b):
-        try:
-            return round(float(b) / (1024 * 1024), 1)
-        except Exception:
-            return None
-
-    return JSONResponse(
-        {
-            "id": rid,
-            "chat_id": chat_id,
-            "url": url,
-            "status": status,
-            "created_at": created_at,
-            "description": description,
-            "original_size_mb": _mb(original_size),
-            "final_size_mb": _mb(final_size),
-            "compressed": bool(compressed) if compressed is not None else None,
-            "processing_started_at": processing_started_at,
-            "processing_finished_at": processing_finished_at,
-            "processing_duration_seconds": processing_duration_seconds,
-            "events": events,
-        }
-    )
-
-
-@app.get("/api/updates")
-async def api_updates(request: Request, limit: int = 50, offset: int = 0):
-    if not _check_admin(request):
-        raise HTTPException(status_code=403, detail="forbidden")
-    total = db.count_updates()
-    rows = db.list_updates(limit=limit, offset=offset)
-    results = [{"id": r[0], "raw": r[1], "created_at": r[2]} for r in rows]
-    return JSONResponse(
-        {"total": total, "offset": offset, "limit": limit, "items": results}
-    )
-
-
-@app.get("/api/users")
-async def api_list_users(request: Request, limit: int = 50, offset: int = 0):
-    if not _check_admin(request):
-        raise HTTPException(status_code=403, detail="forbidden")
-    rows = db.list_users(limit=limit, offset=offset)
-    results = [
-        {"id": r[0], "username": r[1], "email": r[2], "role": r[3], "created_at": r[4]}
-        for r in rows
-    ]
-    return JSONResponse({"items": results, "offset": offset, "limit": limit})
-
-
-@app.post("/api/session/grant_admin")
-async def api_session_grant_admin(request: Request):
-    # Allow a logged-in OAuth session to grant itself admin rights for the
-    # current session. This is intentionally session-scoped and does not
-    # modify persistent DB state.
-    session = request.session
-    if not session or not session.get("user"):
-        raise HTTPException(status_code=403, detail="not logged in")
-    # Only allow granting admin for sessions that already have a persistent
-    # entitlement (group membership or DB role). Do NOT allow any logged-in
-    # user to self-elevate.
-    if not _session_has_persistent_entitlement(session):
-        raise HTTPException(status_code=403, detail="not entitled")
-    try:
-        session["is_admin"] = True
-    except Exception:
-        raise HTTPException(status_code=500, detail="failed to set session")
-    return JSONResponse({"ok": True})
-
-
-@app.post("/api/session/revoke_admin")
-async def api_session_revoke_admin(request: Request):
-    session = request.session
-    try:
-        if session and session.get("is_admin"):
-            session.pop("is_admin", None)
-    except Exception:
-        pass
-    return JSONResponse({"ok": True})
-
-
-@app.post("/api/users")
-async def api_create_user(request: Request):
-    if not _check_admin(request):
-        raise HTTPException(status_code=403, detail="forbidden")
-    payload = await request.json()
-    username = payload.get("username")
-    email = payload.get("email")
-    role = payload.get("role", "user")
-    if not email:
-        raise HTTPException(status_code=400, detail="email required")
-    user_id = db.add_user(username=username, email=email, role=role)
-    return JSONResponse(
-        {"id": user_id, "username": username, "email": email, "role": role}
-    )
-
-
-@app.put("/api/users/{user_id}/role")
-async def api_set_user_role(user_id: int, request: Request):
-    if not _check_admin(request):
-        raise HTTPException(status_code=403, detail="forbidden")
-    payload = await request.json()
-    role = payload.get("role")
-    if role not in ("user", "admin"):
-        raise HTTPException(status_code=400, detail="invalid role")
-    db.set_user_role(user_id, role)
-    return JSONResponse({"ok": True})
-
-
-@app.delete("/api/users/{user_id}")
-async def api_delete_user(user_id: int, request: Request):
-    if not _check_admin(request):
-        raise HTTPException(status_code=403, detail="forbidden")
-    db.delete_user(user_id)
-    return JSONResponse({"ok": True})
-
-
-@app.websocket("/ws/updates")
-async def websocket_updates(websocket: WebSocket):
-    # require admin
-    await websocket.accept()
-    try:
-        if not _check_admin_ws(websocket):
-            await websocket.close(code=1008)
-            return
-    except Exception:
-        await websocket.close(code=1008)
+    session = conn.scope.get("session")
+    if not isinstance(session, dict):
         return
+    if not any(key in session for key in ("v", "is_admin", "user")):
+        return
+    for key in [key for key in session if not key.startswith("_state_")]:
+        session.pop(key, None)
 
-    q: asyncio.Queue = asyncio.Queue()
-    await ws_broadcast.register_queue(q)
+
+def current_principal(request: Request) -> Principal:
+    """FastAPI dependency (threadpool): the caller, possibly anonymous."""
     try:
-        # send initial snapshot
-        recent_requests = db.list_requests(limit=50, offset=0)
-        reqs = []
-        for r in recent_requests:
-            (
-                rid,
-                chat_id,
-                url,
-                status,
-                created_at,
-                description,
-                original_message_id,
-                original_size,
-                final_size,
-                compressed,
-                processing_started_at,
-                processing_finished_at,
-                processing_duration_seconds,
-            ) = r
+        return _resolve(request)
+    except AuthError as exc:
+        raise HTTPException(exc.status_code, exc.detail, headers=exc.headers) from exc
 
-            def _mb(b):
-                try:
-                    return round(float(b) / (1024 * 1024), 1)
-                except Exception:
-                    return None
 
-            reqs.append(
-                {
-                    "id": rid,
-                    "chat_id": chat_id,
-                    "url": url,
-                    "status": status,
-                    "created_at": created_at,
-                    "description": description,
-                    "original_message_id": original_message_id,
-                    "original_size_mb": _mb(original_size),
-                    "final_size_mb": _mb(final_size),
-                    "compressed": bool(compressed) if compressed is not None else None,
-                    "processing_started_at": processing_started_at,
-                    "processing_finished_at": processing_finished_at,
-                    "processing_duration_seconds": processing_duration_seconds,
-                }
+async def require_admin(
+    principal: Annotated[Principal, Depends(current_principal)],
+) -> Principal:
+    if not principal.authenticated:
+        raise HTTPException(
+            401, "Autenticazione richiesta", headers={"WWW-Authenticate": "Bearer"}
+        )
+    if not principal.is_admin:
+        raise HTTPException(403, "Privilegi di amministratore richiesti")
+    return principal
+
+
+AdminPrincipal = Annotated[Principal, Depends(require_admin)]
+
+
+# ---------------------------------------------------------------------------
+# HTML pages (no Jinja: tiny string templates, every value escaped)
+# ---------------------------------------------------------------------------
+@lru_cache(maxsize=8)
+def _template(name: str) -> string.Template:
+    return string.Template((TEMPLATES_DIR / name).read_text(encoding="utf-8"))
+
+
+def _page(state: GuiState, name: str, status_code: int, **values: str) -> HTMLResponse:
+    common = {
+        "bootstrap_css": BOOTSTRAP_CSS_URL,
+        "bootstrap_sri": BOOTSTRAP_CSS_SRI,
+        "asset_version": state.asset_version,
+    }
+    body = _template(name).substitute(common | values)
+    return HTMLResponse(body, status_code=status_code)
+
+
+def error_page(
+    conn: HTTPConnection, status_code: int, title: str, message: str
+) -> HTMLResponse:
+    state = _state(conn)
+    token_login = ""
+    if state.settings.token_enabled:
+        token_login = (
+            '<a class="btn btn-outline-primary" href="login?method=token">'
+            "Accedi con il token</a>"
+        )
+    return _page(
+        state,
+        "error.html",
+        status_code,
+        title=html.escape(title),
+        message=html.escape(message),
+        token_login=token_login,
+    )
+
+
+def login_form(
+    conn: HTTPConnection, *, error: str | None = None, status_code: int = 200
+) -> HTMLResponse:
+    block = ""
+    if error:
+        block = (
+            f'<div class="alert alert-danger" role="alert">{html.escape(error)}</div>'
+        )
+    return _page(_state(conn), "login.html", status_code, error_block=block)
+
+
+def _wants_json(request: Request) -> bool:
+    content_type = request.headers.get("content-type", "").lower()
+    accept = request.headers.get("accept", "").lower()
+    return "application/json" in content_type or (
+        "application/json" in accept and "text/html" not in accept
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public routes: shell, health, auth
+# ---------------------------------------------------------------------------
+public = APIRouter()
+
+
+@public.get("/", include_in_schema=False)
+async def index(request: Request) -> HTMLResponse:
+    return HTMLResponse(_state(request).index_html)
+
+
+@public.get("/health")
+def health(request: Request) -> JSONResponse:
+    """Readiness: the DB answers. Also reports the worker heartbeat state."""
+    state = _state(request)
+    try:
+        gui_queries.ping()
+        worker = gui_queries.load_worker()
+    except sqlite3.Error as exc:
+        logger.warning("Health check failed: database error: %s", exc)
+        return JSONResponse({"ok": False, "db": "error"}, status_code=503)
+    body: dict[str, Any] = {"ok": True, "db": "ok", "worker": worker["state"]}
+    if getattr(config, "HEALTH_DEBUG", False):
+        body.update(
+            {
+                "version": __version__,
+                "worker_age_seconds": worker["age_seconds"],
+                "ws_clients": state.hub.client_count,
+                "last_event_id": state.tailer.last_id,
+                "tailer_running": state.tailer.running,
+            }
+        )
+    return JSONResponse(body)
+
+
+@public.get("/config")
+async def public_config(request: Request) -> dict[str, Any]:
+    """Login methods, needed by the browser before authenticating."""
+    state = _state(request)
+    return {
+        "oauth_configured": state.oauth_client is not None,
+        "admin_token_set": state.settings.token_enabled,
+    }
+
+
+@public.get("/api/me")
+def api_me(
+    principal: Annotated[Principal, Depends(current_principal)],
+) -> dict[str, Any]:
+    return principal.public()
+
+
+def _oauth_timeout(state: GuiState) -> float:
+    oauth = state.settings.oauth
+    return oauth.timeout if oauth else gui_auth.DEFAULT_OAUTH_TIMEOUT
+
+
+def callback_url(conn: HTTPConnection, settings: AuthSettings) -> str:
+    if settings.oauth and settings.oauth.redirect_uri:
+        return settings.oauth.redirect_uri
+    return gui_auth.external_base_url(conn) + "/auth"
+
+
+@public.get("/login", include_in_schema=False)
+async def login_page(
+    request: Request, method: Annotated[str | None, Query(max_length=16)] = None
+) -> Response:
+    """Start the OAuth flow, or show the admin-token form.
+
+    ``?method=token`` shows the token form even when OAuth is configured (no
+    JavaScript, or the identity provider is down).
+    """
+    state = _state(request)
+    if method == "token":
+        if state.settings.token_enabled:
+            return login_form(request)
+        return error_page(
+            request,
+            400,
+            "Accesso con token non disponibile",
+            "ADMIN_TOKEN non è configurato: accedi con il provider di identità.",
+        )
+    client = state.oauth_client
+    if client is not None:
+        try:
+            async with asyncio.timeout(_oauth_timeout(state) * 2):
+                return await client.authorize_redirect(
+                    request, callback_url(request, state.settings)
+                )
+        except (
+            AuthlibBaseError,
+            httpx.HTTPError,
+            TimeoutError,
+            RuntimeError,
+            ValueError,
+        ) as exc:
+            logger.warning("Cannot start the OAuth login: %r", exc)
+            alternative = (
+                " o accedi con il token amministratore"
+                if state.settings.token_enabled
+                else ""
             )
-        await websocket.send_json({"type": "initial", "requests": reqs})
-        recent_updates = db.list_updates(limit=50, offset=0)
+            return error_page(
+                request,
+                502,
+                "Accesso non disponibile",
+                "Il provider di identità non risponde o è configurato male."
+                f" Riprova più tardi{alternative}.",
+            )
+    if state.settings.token_enabled:
+        return login_form(request)
+    raise HTTPException(400, "Nessun metodo di accesso configurato")
+
+
+async def _read_login_token(request: Request) -> str | None:
+    size = 0
+    chunks: list[bytes] = []
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > MAX_LOGIN_BODY:
+            raise HTTPException(413, "Richiesta troppo grande")
+        chunks.append(chunk)
+    body = b"".join(chunks)
+    content_type = request.headers.get("content-type", "").split(";", 1)[0]
+    content_type = content_type.strip().lower()
+    token: Any = None
+    if content_type == "application/json":
+        try:
+            data = json.loads(body or b"null")
+        except ValueError:
+            return None
+        token = data.get("token") if isinstance(data, dict) else None
+    elif content_type in ("application/x-www-form-urlencoded", ""):
+        values = parse_qs(body.decode("utf-8", "replace")).get("token")
+        token = values[0] if values else None
+    return token.strip() if isinstance(token, str) else None
+
+
+def _login_failure(
+    request: Request,
+    status_code: int,
+    detail: str,
+    *,
+    as_json: bool,
+    headers: Mapping[str, str] | None = None,
+) -> Response:
+    if as_json:
+        return JSONResponse(
+            {"detail": detail}, status_code=status_code, headers=headers
+        )
+    response = login_form(request, error=detail, status_code=status_code)
+    if headers:
+        response.headers.update(headers)
+    return response
+
+
+@public.post("/login", include_in_schema=False)
+async def login_submit(request: Request) -> Response:
+    """Admin-token login: creates a session (JSON for fetch, redirect for forms)."""
+    state = _state(request)
+    as_json = _wants_json(request)
+    if not state.settings.token_enabled:
+        return _login_failure(
+            request, 400, "Accesso con token non configurato", as_json=as_json
+        )
+    key = gui_auth.client_key(request)
+    token = await _read_login_token(request)
+    try:
+        gui_auth.check_admin_token(
+            token, state.settings, key, state.limiter, what="admin-token login"
+        )
+    except AuthError as exc:
+        if exc.status_code == 429:
+            seconds = max(1, int((exc.retry_after or 0) + 0.999))
+            return _login_failure(
+                request,
+                429,
+                f"Troppi tentativi falliti: riprova tra {seconds} secondi",
+                as_json=as_json,
+                headers={"Retry-After": str(seconds)},
+            )
+        return _login_failure(request, 401, "Token non valido", as_json=as_json)
+    session_id = await db.aio(
+        gui_auth.start_token_session,
+        request.session,
+        state.settings,
+        client=key,
+        user_agent=request.headers.get("user-agent"),
+    )
+    logger.info("Admin-token login from %s (session %s)", key, session_id)
+    plain_http = gui_auth.external_base_url(request).startswith("http://")
+    if state.settings.cookie_secure is True and plain_http:
+        logger.warning(
+            "Admin-token login from %s over plain HTTP with SESSION_COOKIE_SECURE=true:"
+            " the browser will not store the session cookie (serve the GUI over HTTPS"
+            " or check X-Forwarded-Proto behind a proxy)",
+            key,
+        )
+    if as_json:
+        principal = Principal(
+            method=AuthMethod.TOKEN, is_admin=True, session_id=session_id
+        )
+        return JSONResponse({"ok": True, "me": principal.public()})
+    return RedirectResponse("./", status_code=303)
+
+
+@public.post("/logout", include_in_schema=False)
+async def logout(request: Request) -> Response:
+    """End the session for good: the server-side record is revoked, so even
+    a copy of the cookie stops working."""
+    try:
+        principal = await db.aio(_resolve, request)
+    except AuthError:
+        principal = gui_auth.ANONYMOUS
+    await db.aio(gui_auth.end_session, request.session, actor=principal.actor)
+    if _wants_json(request):
+        return JSONResponse({"ok": True})
+    return RedirectResponse("./", status_code=303)
+
+
+class LoginFailure(Exception):
+    """An OAuth callback problem shown to the user as an error page."""
+
+    def __init__(self, status_code: int, message: str) -> None:
+        super().__init__(message)
+        self.status_code = status_code
+        self.message = message
+
+
+async def _has_userinfo_endpoint(client: Any) -> bool:
+    load = getattr(client, "load_server_metadata", None)
+    if load is None:
+        return False
+    metadata = await load()
+    return bool(isinstance(metadata, Mapping) and metadata.get("userinfo_endpoint"))
+
+
+async def _oauth_claims(
+    client: Any, token: Mapping[str, Any], settings: AuthSettings
+) -> dict[str, Any]:
+    """Identity claims: verified ID-token claims, completed by userinfo.
+
+    Userinfo is fetched through the provider client (timeout, status check)
+    when OAUTH_USERINFO_URL is set or when there is no ID token; its ``sub``
+    must match the ID token's.
+    """
+    claims = dict(token.get("userinfo") or {})
+    wants_userinfo = bool(settings.oauth and settings.oauth.userinfo_url)
+    if not wants_userinfo and not claims:
+        wants_userinfo = await _has_userinfo_endpoint(client)
+    if wants_userinfo and hasattr(client, "userinfo"):
+        raw = await client.userinfo(token=token)
+        if not isinstance(raw, Mapping):
+            raise LoginFailure(502, "Il provider ha restituito un profilo non valido.")
+        info = dict(raw)
+        sub, info_sub = claims.get("sub"), info.get("sub")
+        if sub is not None and info_sub is not None and str(sub) != str(info_sub):
+            raise LoginFailure(
+                400, "Il profilo restituito dal provider non corrisponde all'ID token."
+            )
+        info.update(claims)  # ID-token claims win
+        claims = info
+    if not claims:
+        legacy = token.get("user") or token.get("id_token_claims")
+        claims = dict(legacy) if isinstance(legacy, Mapping) else {}
+    return claims
+
+
+@public.get("/auth", include_in_schema=False)
+async def oauth_callback(request: Request) -> Response:
+    """OAuth/OIDC redirect target: verify, then start a fresh session."""
+    state = _state(request)
+    client = state.oauth_client
+    if client is None:
+        return error_page(
+            request, 400, "Accesso non disponibile", "OAuth non è configurato."
+        )
+    try:
+        async with asyncio.timeout(_oauth_timeout(state) * 2):
+            token = await client.authorize_access_token(request)
+            claims = await _oauth_claims(client, token, state.settings)
+    except LoginFailure as exc:
+        return error_page(request, exc.status_code, "Accesso non riuscito", exc.message)
+    except (AuthlibBaseError, JoseError) as exc:
+        logger.warning("OAuth callback refused: %r", exc)
+        return error_page(
+            request,
+            400,
+            "Accesso non riuscito",
+            "Il provider ha rifiutato l'accesso o la risposta non è valida"
+            " (sessione scaduta?). Riprova.",
+        )
+    except TimeoutError:
+        logger.warning("OAuth callback timed out")
+        return error_page(
+            request,
+            504,
+            "Accesso non riuscito",
+            "Il provider non ha risposto in tempo.",
+        )
+    except httpx.HTTPError as exc:
+        logger.warning("OAuth provider request failed: %r", exc)
+        return error_page(
+            request,
+            502,
+            "Accesso non riuscito",
+            "Impossibile contattare il provider di identità o risposta di errore.",
+        )
+    except RuntimeError as exc:  # e.g. 'Missing "jwks_uri" in metadata'
+        logger.error("OAuth/OIDC is misconfigured: %s", exc)
+        return error_page(
+            request,
+            500,
+            "Configurazione OAuth incompleta",
+            "Impossibile verificare l'ID token: imposta OAUTH_JWKS_URI oppure"
+            " OAUTH_SERVER_METADATA_URL.",
+        )
+    except ValueError as exc:
+        logger.warning("Invalid OAuth provider response: %r", exc)
+        return error_page(
+            request, 502, "Accesso non riuscito", "Risposta del provider non valida."
+        )
+    identity = gui_auth.OAuthIdentity.from_claims(claims)
+    if identity is None:
+        return error_page(
+            request,
+            400,
+            "Accesso non riuscito",
+            "Il provider non ha restituito un'identità utilizzabile.",
+        )
+    session_id = await db.aio(
+        gui_auth.start_oauth_session,
+        request.session,
+        identity,
+        state.settings,
+        client=gui_auth.client_key(request),
+        user_agent=request.headers.get("user-agent"),
+    )
+    logger.info(
+        "OAuth login: %s (session %s)",
+        identity.email or identity.username or identity.subject,
+        session_id,
+    )
+    _warn_unusable_email(identity, state.settings)
+    return RedirectResponse("./", status_code=302)
+
+
+def _warn_unusable_email(
+    identity: gui_auth.OAuthIdentity, settings: AuthSettings
+) -> None:
+    """Tell the operator why an OAuth e-mail will not map to its DB role."""
+    if not identity.email or settings.email_trusted(identity.email_verified):
+        return
+    if identity.email_verified is False:
+        logger.warning(
+            "OAuth login %s: the provider marks the e-mail as unverified,"
+            " so it does not map to a DB user role",
+            identity.email,
+        )
+        return
+    logger.warning(
+        "OAuth login %s: the provider sent no email_verified claim, so the e-mail"
+        " does not map to a DB user role; set OAUTH_ASSUME_EMAIL_VERIFIED=true if"
+        " the provider only returns verified addresses (e.g. GitHub)",
+        identity.email,
+    )
+
+
+# ---------------------------------------------------------------------------
+# WebSocket: live updates
+# ---------------------------------------------------------------------------
+@public.websocket("/ws/updates")
+async def ws_updates(websocket: WebSocket) -> None:
+    """Authenticated (before accept) stream of event-log batches."""
+    state = _state(websocket)
+    principal = await _ws_principal(websocket)
+    if principal is None or not principal.is_admin:
+        await websocket.close(code=WS_CLOSE_POLICY)
+        return
+    if principal.method is not AuthMethod.BEARER and not gui_auth.origin_allowed(
+        websocket.headers, state.settings
+    ):
+        logger.warning(
+            "Refused a cross-origin WebSocket (Origin=%r)",
+            websocket.headers.get("origin"),
+        )
+        await websocket.close(code=WS_CLOSE_POLICY)
+        return
+    await websocket.accept()
+    subscription = state.hub.subscribe()
+    try:
         await websocket.send_json(
             {
-                "type": "initial_updates",
-                "updates": [
-                    {"id": r[0], "raw": r[1], "created_at": r[2]}
-                    for r in recent_updates
-                ],
+                "kind": "hello",
+                "last_event_id": state.tailer.last_id,
+                "server_time": db.now_iso(),
+                "version": __version__,
             }
         )
-
-        while True:
-            try:
-                msg = await q.get()
-                await websocket.send_json(msg)
-            except WebSocketDisconnect:
-                break
-            except Exception:
-                # if sending fails, close
-                break
+        code = await _serve_ws(websocket, subscription, state)
     finally:
-        await ws_broadcast.unregister_queue(q)
+        state.hub.unsubscribe(subscription)
+    await _close_ws(websocket, code)
+
+
+async def _ws_principal(websocket: WebSocket) -> Principal | None:
+    try:
+        return await db.aio(_resolve, websocket)
+    except AuthError:
+        return None
+    except sqlite3.Error as exc:
+        logger.warning("WebSocket auth failed: database error: %s", exc)
+        return None
+
+
+async def _ws_receive(websocket: WebSocket) -> None:
+    """Read (and ignore) client frames so a disconnect is noticed at once."""
+    while True:
+        message = await websocket.receive()
+        if message["type"] == "websocket.disconnect":
+            return
+
+
+async def _ws_send(
+    websocket: WebSocket, subscription: ws_broadcast.Subscription
+) -> None:
+    while True:
+        message = await subscription.get()
+        if message is None:
+            return
+        await websocket.send_json(message)
+
+
+async def _ws_watch(websocket: WebSocket, state: GuiState) -> None:
+    """Re-check authorization periodically; return when it is gone."""
+    while True:
+        await asyncio.sleep(state.ws_recheck_seconds)
+        try:
+            principal = await db.aio(_resolve, websocket)
+        except AuthError:
+            return
+        except sqlite3.Error as exc:
+            logger.warning("WebSocket re-authorization skipped: %s", exc)
+            continue
+        if not principal.is_admin:
+            return
+
+
+async def _serve_ws(
+    websocket: WebSocket, subscription: ws_broadcast.Subscription, state: GuiState
+) -> int | None:
+    """Run receiver, sender and watcher until one ends; the close code to send.
+
+    An anyio task group (not bare asyncio tasks) so that cancellation from the
+    server (shutdown) or the client propagates through the cancel scopes.
+    """
+    finished: list[str] = []
+    async with anyio.create_task_group() as group:
+
+        async def run(
+            name: str, job: Callable[..., Awaitable[None]], *args: Any
+        ) -> None:
+            try:
+                await job(*args)
+            except (WebSocketDisconnect, OSError, RuntimeError):
+                name = "gone"  # the client went away while we were talking to it
+            except Exception:  # connection boundary: log it and close with 1011
+                logger.exception("Live-update connection failed")
+                name = "error"
+            finished.append(name)
+            group.cancel_scope.cancel()
+
+        group.start_soon(run, "receiver", _ws_receive, websocket)
+        group.start_soon(run, "sender", _ws_send, websocket, subscription)
+        group.start_soon(run, "watcher", _ws_watch, websocket, state)
+    reason = finished[0] if finished else "gone"
+    if reason == "sender":
+        return WS_CLOSE_TRY_AGAIN if subscription.dropped else WS_CLOSE_GOING_AWAY
+    return {"watcher": WS_CLOSE_POLICY, "error": WS_CLOSE_INTERNAL}.get(reason)
+
+
+async def _close_ws(websocket: WebSocket, code: int | None) -> None:
+    if code is None:
+        return
+    if (
+        websocket.application_state is WebSocketState.CONNECTED
+        and websocket.client_state is WebSocketState.CONNECTED
+    ):
+        with contextlib.suppress(RuntimeError, OSError):
+            await websocket.close(code=code)
+
+
+# ---------------------------------------------------------------------------
+# Admin API (every route requires an administrator)
+# ---------------------------------------------------------------------------
+api = APIRouter(dependencies=[Depends(require_admin)])
+
+
+class _Body(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+
+# SQLite integers are 64-bit: binding a larger id raises OverflowError (a 500),
+# so every id, chat id and offset that reaches SQL is range-checked (422).
+INT64_MIN = -(2**63)
+INT64_MAX = 2**63 - 1
+DbInt = Annotated[int, Field(ge=INT64_MIN, le=INT64_MAX)]
+DbIntQuery = Annotated[int | None, Query(ge=INT64_MIN, le=INT64_MAX)]
+DbIdPath = Annotated[int, fastapi.Path(ge=INT64_MIN, le=INT64_MAX)]
+OffsetQuery = Annotated[int, Query(ge=0, le=INT64_MAX)]
+
+
+class RequeueBody(_Body):
+    ids: list[DbInt] | None = Field(default=None, max_length=MAX_REQUEUE_IDS)
+    status: str | None = Field(default=None, max_length=32)
+    q: str | None = Field(default=None, max_length=200)
+    chat_id: DbInt | None = None
+
+
+class CancelBody(_Body):
+    chat_id: DbInt | None = None
+
+
+class UnlimitBody(_Body):
+    chat_id: DbInt
+    requeue: bool = False
+
+
+class UnlimitAllBody(_Body):
+    requeue: bool = False
+
+
+class UserCreateBody(_Body):
+    email: str = Field(max_length=320)
+    username: str | None = Field(default=None, max_length=128)
+    role: str = Field(default="user", max_length=16)
+
+
+class UserRoleBody(_Body):
+    role: str = Field(max_length=16)
+
+
+def _statuses(raw: str | None) -> list[str] | None:
+    """``status`` query value (comma-separated) -> list, or None for all."""
+    if raw is None:
+        return None
+    values = [item.strip().lower() for item in raw.split(",") if item.strip()]
+    if not values or "all" in values:
+        return None
+    if len(values) > 12 or not all(_STATUS_RE.match(item) for item in values):
+        raise HTTPException(400, "Filtro di stato non valido")
+    return values
+
+
+def _query_text(raw: str | None) -> str | None:
+    text = (raw or "").strip()
+    return text or None
+
+
+@api.get("/api/requests")
+@api.get("/requests", include_in_schema=False)
+def list_requests(
+    limit: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = 50,
+    offset: OffsetQuery = 0,
+    status: Annotated[str | None, Query(max_length=400)] = None,
+    q: Annotated[str | None, Query(max_length=200)] = None,
+    chat_id: DbIntQuery = None,
+) -> dict[str, Any]:
+    """Requests, newest first; ``q`` searches URL, description and chat id."""
+    return gui_queries.requests_page(
+        limit=limit,
+        offset=offset,
+        status=_statuses(status),
+        q=_query_text(q),
+        chat_id=chat_id,
+    )
+
+
+@api.get("/api/requests/{request_id}")
+@api.get("/requests/{request_id}", include_in_schema=False)
+def request_detail(request_id: DbIdPath) -> dict[str, Any]:
+    detail = gui_queries.request_detail(request_id)
+    if detail is None:
+        raise HTTPException(404, "Richiesta non trovata")
+    return detail
+
+
+@api.post("/api/requests/requeue")
+def requeue_requests(body: RequeueBody, principal: AdminPrincipal) -> dict[str, Any]:
+    """Requeue failed/refused/cancelled requests by id, or by filter."""
+    if body.ids:
+        ids = list(dict.fromkeys(body.ids))
+    elif body.status:
+        status = body.status.strip().lower()
+        if status not in db.REQUEUEABLE_STATUSES:
+            raise HTTPException(400, "Questo stato non può essere rimesso in coda")
+        rows = db.list_requests(
+            FILTER_REQUEUE_LIMIT,
+            0,
+            status=status,
+            chat_id=body.chat_id,
+            q=_query_text(body.q),
+        )
+        ids = [int(row["id"]) for row in rows]
+    else:
+        raise HTTPException(400, "Indica gli id oppure un filtro di stato")
+    requeued = db.requeue_requests(ids, actor=principal.actor) if ids else []
+    done = set(requeued)
+    logger.info("%s requeued %d of %d request(s)", principal.actor, len(done), len(ids))
+    return {
+        "ok": True,
+        "requested": len(ids),
+        "requeued": requeued,
+        "skipped": [request_id for request_id in ids if request_id not in done],
+    }
+
+
+@api.get("/api/queue")
+def queue(limit: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = 50) -> dict[str, Any]:
+    return gui_queries.queue_view(limit)
+
+
+@api.post("/api/queue/cancel")
+def cancel_queue(
+    principal: AdminPrincipal, body: CancelBody | None = None
+) -> dict[str, Any]:
+    """Cancel every queued (and deferred) request, or those of one chat."""
+    chat_id = body.chat_id if body else None
+    ids = db.cancel_queued(chat_id=chat_id, actor=principal.actor)
+    logger.info(
+        "%s cancelled %d queued request(s) (chat %s)",
+        principal.actor,
+        len(ids),
+        chat_id,
+    )
+    return {"ok": True, "chat_id": chat_id, "cancelled": len(ids), "ids": ids}
+
+
+@api.get("/api/worker")
+def worker_status() -> dict[str, Any]:
+    return gui_queries.load_worker()
+
+
+@api.get("/api/rate_limits")
+def rate_limits(request: Request) -> dict[str, Any]:
+    view = gui_queries.rate_limit_view()
+    # How old a refusal may be for "Sblocca e rimetti in coda" to requeue it.
+    view["requeue_max_age_seconds"] = _state(request).requeue_max_age
+    return view
+
+
+def _requeue_refused(state: GuiState, *, chat_id: int | None, actor: str) -> list[int]:
+    """Requeue the latest refused request per link (recent ones only)."""
+    since = gui_queries.iso(time.time() - state.requeue_max_age) or db.now_iso()
+    ids = gui_queries.latest_refused_per_link(since_iso=since, chat_id=chat_id)
+    return db.requeue_requests(ids, actor=actor) if ids else []
+
+
+@api.post("/api/rate_limits/unlimit")
+def unlimit_chat(
+    body: UnlimitBody, request: Request, principal: AdminPrincipal
+) -> dict[str, Any]:
+    """Reset the chat's rate-limit window; optionally requeue its refusals."""
+    db.reset_chat_limit(body.chat_id, actor=principal.actor)
+    requeued = []
+    if body.requeue:
+        requeued = _requeue_refused(
+            _state(request), chat_id=body.chat_id, actor=principal.actor
+        )
+    logger.info(
+        "%s unlimited chat %s (requeued %d)",
+        principal.actor,
+        body.chat_id,
+        len(requeued),
+    )
+    return {"ok": True, "chat_id": body.chat_id, "requeued": requeued}
+
+
+@api.post("/api/rate_limits/unlimit_all")
+def unlimit_all(
+    request: Request, principal: AdminPrincipal, body: UnlimitAllBody | None = None
+) -> dict[str, Any]:
+    count = db.reset_all_chat_limits(actor=principal.actor)
+    requeued = []
+    if body is not None and body.requeue:
+        requeued = _requeue_refused(
+            _state(request), chat_id=None, actor=principal.actor
+        )
+    logger.info(
+        "%s unlimited %d chat(s) (requeued %d)", principal.actor, count, len(requeued)
+    )
+    return {"ok": True, "chats": count, "requeued": requeued}
+
+
+@api.get("/api/stats")
+@api.get("/stats", include_in_schema=False)
+def stats() -> dict[str, Any]:
+    return gui_queries.request_stats()
+
+
+@api.get("/api/aggregates")
+def aggregates(
+    hours: Annotated[int, Query(ge=1, le=168)] = 24,
+    top: Annotated[int, Query(ge=1, le=50)] = 10,
+) -> dict[str, Any]:
+    return gui_queries.aggregates(hours=hours, top=top)
+
+
+@api.get("/api/events")
+def events(
+    limit: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = 50,
+    offset: OffsetQuery = 0,
+    event_type: Annotated[str | None, Query(alias="type", max_length=64)] = None,
+    chat_id: DbIntQuery = None,
+    request_id: DbIntQuery = None,
+) -> dict[str, Any]:
+    """The event log (newest first)."""
+    return gui_queries.list_events(
+        limit=limit,
+        offset=offset,
+        event_type=_query_text(event_type),
+        chat_id=chat_id,
+        request_id=request_id,
+    )
+
+
+@api.get("/api/config")
+def runtime_config(request: Request) -> dict[str, Any]:
+    """GUI settings, effective limits and this process's configuration."""
+    state = _state(request)
+    settings = state.settings
+    worker = gui_queries.load_worker()
+    limits = gui_queries.effective_limits(worker)
+    summary = getattr(config, "summary", None)
+    validate = getattr(config, "validate", None)
+    return {
+        "version": __version__,
+        "auth": {
+            "token": settings.token_enabled,
+            "oauth": state.oauth_client is not None,
+            "oauth_admin_groups": sorted(settings.admin_groups),
+            "oauth_assume_email_verified": settings.assume_email_verified,
+            "oauth_redirect_uri": (
+                settings.oauth.redirect_uri if settings.oauth else None
+            ),
+            "session_cookie_secure": (
+                "auto" if settings.cookie_secure is None else settings.cookie_secure
+            ),
+            "session_max_age_seconds": settings.session_max_age,
+            "secret_key_ephemeral": settings.secret_key_ephemeral,
+            "trusted_origins": sorted(settings.trusted_origins),
+        },
+        "gui": {
+            "db_poll_seconds": state.tailer.poll_interval,
+            "requeue_max_age_seconds": state.requeue_max_age,
+            "history_keep_seconds": gui_queries.history_keep_seconds(limits),
+            # every request created this recently survives a clear (duplicate
+            # detection and edits of those messages need it)
+            "history_recent_seconds": float(
+                getattr(config, "DUPLICATE_WINDOW_SECONDS", 5400) or 0
+            ),
+            "ws_clients": state.hub.client_count,
+            "last_event_id": state.tailer.last_id,
+        },
+        "worker": worker,
+        "limits": limits,
+        "settings": summary() if callable(summary) else {},
+        "warnings": [*settings.warnings, *(validate() if callable(validate) else [])],
+    }
+
+
+@api.post("/api/history/clear")
+def clear_history(principal: AdminPrincipal) -> dict[str, Any]:
+    """Delete finished requests and the event log.
+
+    Active requests are kept, and so are the accepted ones (done, failed)
+    still inside the worker's largest rate-limit or duplicate window: the rate
+    limiter and the duplicate check read them, so deleting them would reset
+    every chat's quota. ``db.clear_history`` applies that protection in one
+    transaction; the window comes from the worker's heartbeat when available.
+    """
+    keep = gui_queries.history_keep_seconds(
+        gui_queries.effective_limits(gui_queries.load_worker())
+    )
+    counts = db.clear_history(actor=principal.actor, keep_accepted_seconds=keep)
+    logger.warning(
+        "%s cleared the history (accepted requests of the last %.0f s kept): %s",
+        principal.actor,
+        keep,
+        counts,
+    )
+    return {"ok": True, "deleted": counts, "kept_seconds": keep}
+
+
+# Users -----------------------------------------------------------------------
+def _valid_role(raw: str) -> str:
+    role = raw.strip().lower()
+    if role not in db.ROLES:
+        raise HTTPException(400, "Ruolo non valido: usa 'admin' oppure 'user'")
+    return role
+
+
+class LastAdminError(Exception):
+    """The change would leave no DB user with role admin."""
+
+
+def _write_user_keeping_an_admin(user_id: int, role: str | None) -> bool:
+    """Set the user's ``role`` (None = delete), never removing the last admin.
+
+    False when there is no such user; :class:`LastAdminError` when the user
+    is the only admin. The check and the change run in one ``BEGIN
+    IMMEDIATE`` transaction, so two concurrent demotions cannot both pass the
+    check (``db.set_user_role`` / ``db.delete_user`` have no guarded form).
+    """
+    with db.write() as conn:
+        row = conn.execute("SELECT role FROM users WHERE id = ?", (user_id,)).fetchone()
+        if row is None:
+            return False
+        if row["role"] == "admin" and role != "admin":
+            (others,) = conn.execute(
+                "SELECT COUNT(*) FROM users WHERE role = 'admin' AND id <> ?",
+                (user_id,),
+            ).fetchone()
+            if not others:
+                raise LastAdminError
+        if role is None:
+            conn.execute("DELETE FROM users WHERE id = ?", (user_id,))
+        else:
+            conn.execute("UPDATE users SET role = ? WHERE id = ?", (role, user_id))
+    return True
+
+
+def _change_user(state: GuiState, user_id: int, role: str | None) -> None:
+    """Set the role of (None: delete) a user; 404 if missing, 409 if last admin.
+
+    Without ADMIN_TOKEN and OAUTH_ADMIN_GROUPS only DB admins can administer
+    the GUI, so the last one is never demoted or deleted.
+    """
+    if state.settings.token_enabled or state.settings.admin_groups:
+        found = (
+            db.delete_user(user_id) if role is None else db.set_user_role(user_id, role)
+        )
+    else:
+        try:
+            found = _write_user_keeping_an_admin(user_id, role)
+        except LastAdminError as exc:
+            raise HTTPException(
+                409,
+                "È l'ultimo amministratore: aggiungine un altro prima di rimuoverlo"
+                " (oppure configura ADMIN_TOKEN o OAUTH_ADMIN_GROUPS)",
+            ) from exc
+    if not found:
+        raise HTTPException(404, "Utente non trovato")
+
+
+# Sessions ----------------------------------------------------------------------
+@api.get("/api/sessions")
+def list_sessions(principal: AdminPrincipal) -> dict[str, Any]:
+    """Active admin GUI sessions (the caller's is marked ``current``)."""
+    rows = db.list_gui_sessions()
+    return {
+        "items": [
+            gui_queries.session_view(row, current_id=principal.session_id)
+            for row in rows
+        ],
+        "current_session_id": principal.session_id,
+    }
+
+
+@api.post("/api/sessions/{session_id}/revoke")
+def revoke_session(session_id: DbIdPath, principal: AdminPrincipal) -> dict[str, Any]:
+    """End one session (it is logged out at its next request)."""
+    revoked = db.revoke_gui_sessions(session_ids=[session_id], actor=principal.actor)
+    if not revoked:
+        raise HTTPException(404, "Sessione non trovata o già terminata")
+    logger.warning("%s revoked GUI session %s", principal.actor, session_id)
+    return {
+        "ok": True,
+        "revoked": revoked,
+        "current": session_id == principal.session_id,
+    }
+
+
+@api.post("/api/sessions/revoke_others")
+def revoke_other_sessions(principal: AdminPrincipal) -> dict[str, Any]:
+    """End every session but the caller's (all of them for a bearer token)."""
+    revoked = db.revoke_gui_sessions(
+        all_except=principal.session_id or 0, actor=principal.actor
+    )
+    logger.warning("%s revoked %d other GUI session(s)", principal.actor, len(revoked))
+    return {"ok": True, "revoked": revoked}
+
+
+@api.get("/api/users")
+def list_users(
+    limit: Annotated[int, Query(ge=1, le=MAX_PAGE_SIZE)] = 100,
+    offset: OffsetQuery = 0,
+) -> dict[str, Any]:
+    rows = db.list_users(limit=limit, offset=offset)
+    return {
+        "items": [gui_queries.user_view(row) for row in rows],
+        "total": gui_queries.count_users(),
+        "admins": gui_queries.count_admins(),
+        "offset": offset,
+        "limit": limit,
+    }
+
+
+@api.post("/api/users", status_code=201)
+def create_user(body: UserCreateBody, principal: AdminPrincipal) -> dict[str, Any]:
+    email = body.email.strip()
+    if not _EMAIL_RE.match(email):
+        raise HTTPException(400, "Indirizzo e-mail non valido")
+    role = _valid_role(body.role)
+    username = _query_text(body.username)
+    if db.get_user_by_email(email) is not None:
+        raise HTTPException(409, "Esiste già un utente con questa e-mail")
+    try:
+        user_id = db.add_user(username=username, email=email, role=role)
+    except ValueError as exc:  # the role is valid: a concurrent duplicate
+        raise HTTPException(409, "Esiste già un utente con questa e-mail") from exc
+    logger.info("%s created user %s with role %s", principal.actor, email, role)
+    user = gui_queries.get_user(user_id)
+    if user is None:  # deleted in the meantime
+        raise HTTPException(404, "Utente non trovato")
+    return user
+
+
+@api.put("/api/users/{user_id}/role")
+def set_user_role(
+    user_id: DbIdPath, body: UserRoleBody, request: Request, principal: AdminPrincipal
+) -> dict[str, Any]:
+    role = _valid_role(body.role)
+    _change_user(_state(request), user_id, role)
+    logger.info("%s set the role of user %s to %s", principal.actor, user_id, role)
+    user = gui_queries.get_user(user_id)
+    if user is None:  # deleted in the meantime
+        raise HTTPException(404, "Utente non trovato")
+    return user
+
+
+@api.delete("/api/users/{user_id}")
+def delete_user(
+    user_id: DbIdPath, request: Request, principal: AdminPrincipal
+) -> dict[str, Any]:
+    _change_user(_state(request), user_id, None)
+    logger.info("%s deleted user %s", principal.actor, user_id)
+    return {"ok": True, "id": user_id}
+
+
+# ---------------------------------------------------------------------------
+# Middleware, errors, lifespan
+# ---------------------------------------------------------------------------
+class SecurityHeadersMiddleware:
+    """CSP and hardening headers on every HTTP response."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        static = str(scope.get("path", "")).startswith("/static/")
+
+        async def send_with_headers(message: Message) -> None:
+            if message["type"] == "http.response.start":
+                headers = MutableHeaders(scope=message)
+                headers.setdefault("Content-Security-Policy", CONTENT_SECURITY_POLICY)
+                headers.setdefault("X-Content-Type-Options", "nosniff")
+                headers.setdefault("X-Frame-Options", "DENY")
+                headers.setdefault("Referrer-Policy", "same-origin")
+                headers.setdefault("Cross-Origin-Opener-Policy", "same-origin")
+                if not static:
+                    headers.setdefault("Cache-Control", "no-store")
+            await send(message)
+
+        await self.app(scope, receive, send_with_headers)
+
+
+async def _database_error(request: Request, exc: Exception) -> JSONResponse:
+    busy = isinstance(exc, sqlite3.OperationalError) and "locked" in str(exc).lower()
+    logger.warning("Database error on %s %s: %s", request.method, request.url.path, exc)
+    detail = "Database occupato: riprova tra poco" if busy else "Errore del database"
+    return JSONResponse(
+        {"detail": detail}, status_code=503, headers={"Retry-After": "2"}
+    )
+
+
+_TOKEN_QUERY_RE = re.compile(r"(?i)(token=)[^&\s\"']*")
+
+
+def _redact_tokens(value: Any) -> Any:
+    if isinstance(value, str) and "token=" in value.lower():
+        return _TOKEN_QUERY_RE.sub(r"\1[REDACTED]", value)
+    return value
+
+
+class _UvicornLogFilter(logging.Filter):
+    """Redact ``token=`` query values (old bookmarks and scripts) in every
+    string argument; optionally hide the /health probe lines.
+
+    ``uvicorn.access`` logs ``(client, method, path, ...)``; ``uvicorn.error``
+    logs WebSocket handshakes as ``'%s - "WebSocket %s" 403'`` with
+    ``(client, path)``.
+    """
+
+    def __init__(self, *, hide_health: bool) -> None:
+        super().__init__()
+        self.hide_health = hide_health
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, Mapping):
+            record.args = {key: _redact_tokens(value) for key, value in args.items()}
+        elif args:
+            path = args[2] if len(args) >= 3 else None
+            if (
+                self.hide_health
+                and isinstance(path, str)
+                and path.split("?", 1)[0] == "/health"
+            ):
+                return False
+            record.args = tuple(_redact_tokens(arg) for arg in args)
+        elif isinstance(record.msg, str):  # no arguments: the text is final
+            record.msg = _redact_tokens(record.msg)
+        return True
+
+
+_LOG_FILTERS = {
+    "uvicorn.access": _UvicornLogFilter(
+        hide_health=not getattr(config, "HEALTH_DEBUG", False)
+    ),
+    "uvicorn.error": _UvicornLogFilter(hide_health=False),
+}
+
+
+def _configure_logging() -> None:
+    for name, log_filter in _LOG_FILTERS.items():
+        uvicorn_logger = logging.getLogger(name)
+        if log_filter not in uvicorn_logger.filters:
+            uvicorn_logger.addFilter(log_filter)
+    root = logging.getLogger()
+    if not root.handlers:  # plain uvicorn: give our loggers a handler
+        logging.basicConfig(
+            level=getattr(config, "LOG_LEVEL", "INFO"),
+            format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+        )
+
+
+@asynccontextmanager
+async def _lifespan(app: FastAPI) -> AsyncIterator[None]:
+    state: GuiState = app.state.gui
+    _configure_logging()
+    for warning in state.settings.warnings:
+        logger.warning("GUI configuration: %s", warning)
+    if not state.settings.token_enabled and state.oauth_client is None:
+        raise RuntimeError(
+            "The admin GUI needs ADMIN_TOKEN or a complete OAuth configuration"
+            " (OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET and OAUTH_SERVER_METADATA_URL"
+            " or OAUTH_AUTHORIZE_URL + OAUTH_TOKEN_URL)"
+        )
+    await db.aio(db.init_db)
+    await state.tailer.start()
+    logger.info(
+        "Admin GUI v%s started (token login: %s, OAuth: %s)",
+        __version__,
+        state.settings.token_enabled,
+        state.oauth_client is not None,
+    )
+    try:
+        yield
+    finally:
+        await state.tailer.stop()
+        state.hub.close_all()
+
+
+def _asset_version() -> str:
+    digest = hashlib.sha256()
+    for name in ("app.js", "app.css", "index.html"):
+        digest.update((STATIC_DIR / name).read_bytes())
+    return digest.hexdigest()[:12]
+
+
+def create_app(
+    settings: AuthSettings | None = None,
+    *,
+    oauth_registry: Any = None,
+    poll_interval: float | None = None,
+    ws_recheck_seconds: float = WS_RECHECK_SECONDS,
+) -> FastAPI:
+    """Build the GUI application (settings default to the environment)."""
+    settings = settings or AuthSettings.from_env()
+    registry = (
+        oauth_registry
+        if oauth_registry is not None
+        else gui_auth.build_oauth_registry(settings)
+    )
+    heartbeat = float(getattr(config, "WORKER_HEARTBEAT_SECONDS", 5.0))
+    hub = ws_broadcast.Hub()
+    tailer = ws_broadcast.EventTailer(
+        hub,
+        poll_interval=(
+            poll_interval
+            if poll_interval is not None
+            else float(getattr(config, "GUI_DB_POLL_SECONDS", 1.0))
+        ),
+        status_interval=max(1.0, min(5.0, heartbeat)),
+        status_source=gui_queries.load_worker,
+        shape_event=gui_queries.event_view,
+    )
+    asset_version = _asset_version()
+    index_html = (STATIC_DIR / "index.html").read_text(encoding="utf-8")
+    state = GuiState(
+        settings=settings,
+        oauth=registry,
+        hub=hub,
+        tailer=tailer,
+        limiter=gui_auth.FailureLimiter(),
+        index_html=index_html.replace(ASSET_VERSION_PLACEHOLDER, asset_version),
+        asset_version=asset_version,
+        ws_recheck_seconds=ws_recheck_seconds,
+        requeue_max_age=float(
+            getattr(config, "GUI_REQUEUE_MAX_AGE_SECONDS", DEFAULT_REQUEUE_MAX_AGE)
+        ),
+    )
+    middleware = [
+        Middleware(SecurityHeadersMiddleware),
+        Middleware(gui_auth.CSRFMiddleware, settings=settings),
+    ]
+    if settings.cookie_secure is None:  # auto: Secure on HTTPS requests
+        middleware.append(Middleware(gui_auth.SecureCookieMiddleware))
+    middleware.append(
+        Middleware(
+            SessionMiddleware,
+            secret_key=settings.secret_key,
+            session_cookie=gui_auth.SESSION_COOKIE_NAME,
+            max_age=settings.session_max_age,
+            same_site="lax",
+            https_only=settings.cookie_secure is True,
+        )
+    )
+    application = FastAPI(
+        title="Social media reuploader - Admin GUI",
+        version=__version__,
+        lifespan=_lifespan,
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
+        middleware=middleware,
+    )
+    application.state.gui = state
+    application.add_exception_handler(sqlite3.Error, _database_error)
+    application.include_router(public)
+    application.include_router(api)
+    application.mount("/static", StaticFiles(directory=STATIC_DIR), name="static")
+    return application
+
+
+app = create_app()
+# The OAuth registry of ``app`` (tests may inject a provider client on it).
+oauth = app.state.gui.oauth

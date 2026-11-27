@@ -1,0 +1,131 @@
+suite: Ingress
+templates:
+  - templates/ingress.yaml
+release:
+  name: smr
+  namespace: bots
+tests:
+  - it: is disabled by default
+    asserts:
+      - hasDocuments:
+          count: 0
+
+  - it: routes / to the GUI Service
+    set:
+      ingress.enabled: true
+    asserts:
+      - isKind:
+          of: Ingress
+      - equal:
+          path: metadata.name
+          value: smr-social-media-reuploader
+      - equal:
+          path: spec.rules[0].host
+          value: chart-example.local
+      - equal:
+          path: spec.rules[0].http.paths[0]
+          value:
+            path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: smr-social-media-reuploader-gui
+                port:
+                  number: 8081
+
+  - it: renders the class, annotations and TLS
+    set:
+      ingress.enabled: true
+      ingress.className: nginx
+      ingress.annotations:
+        cert-manager.io/cluster-issuer: letsencrypt
+      ingress.hosts:
+        - host: admin.example.com
+          paths:
+            - path: /
+      ingress.tls:
+        - secretName: admin-tls
+          hosts:
+            - admin.example.com
+    asserts:
+      - equal:
+          path: spec.ingressClassName
+          value: nginx
+      - isSubset:
+          path: metadata.annotations
+          content:
+            cert-manager.io/cluster-issuer: letsencrypt
+      - equal:
+          path: spec.tls
+          value:
+            - secretName: admin-tls
+              hosts:
+                - admin.example.com
+      - equal:
+          path: spec.rules[0].host
+          value: admin.example.com
+
+  - it: routes the webhook path to the bot Service
+    set:
+      ingress.enabled: true
+      ingress.hosts:
+        - host: bot.example.com
+          paths:
+            - path: /
+              service: gui
+            - path: /webhook
+              pathType: Exact
+              service: bot
+    asserts:
+      - equal:
+          path: spec.rules[0].http.paths[1]
+          value:
+            path: /webhook
+            pathType: Exact
+            backend:
+              service:
+                name: smr-social-media-reuploader
+                port:
+                  number: 80
+
+  - it: accepts the legacy list of path strings and host-less rules
+    set:
+      ingress.enabled: true
+      ingress.hosts:
+        - paths:
+            - /
+    asserts:
+      - notExists:
+          path: spec.rules[0].host
+      - equal:
+          path: spec.rules[0].http.paths[0].backend.service.name
+          value: smr-social-media-reuploader-gui
+
+  - it: follows a custom GUI port
+    set:
+      ingress.enabled: true
+      gui.port: 9000
+    asserts:
+      - equal:
+          path: spec.rules[0].http.paths[0].backend.service.port.number
+          value: 9000
+
+  - it: refuses a GUI route without the GUI
+    set:
+      ingress.enabled: true
+      gui.enabled: false
+    asserts:
+      - failedTemplate:
+          errorPattern: "a route targets the GUI"
+
+  - it: refuses an unknown backend
+    set:
+      ingress.enabled: true
+      ingress.hosts:
+        - host: a.example.com
+          paths:
+            - path: /
+              service: metrics
+    asserts:
+      - failedTemplate:
+          errorPattern: "unknown route service \"metrics\""

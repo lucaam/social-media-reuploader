@@ -1,0 +1,16 @@
+# Gateway API route to the GUI, existing GUI Secret, existing DB claim.
+secret:
+  name: smr-bot
+gui:
+  existingSecret: smr-gui
+  port: 9000
+db:
+  pvc:
+    existingClaim: smr-data
+gatewayApi:
+  enabled: true
+  gatewayName: shared-gateway
+  gatewayNamespace: gateway-system
+  sectionName: https
+  hosts:
+    - admin.example.com

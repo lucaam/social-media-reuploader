@@ -1,251 +1,165 @@
 {{- if .Values.gui.enabled -}}
-{{- /*
-  Reserved GUI env names that must not be shadowed by .Values.gui.env.
-  These variables are managed by the chart (secrets / runtime defaults)
-  and should not be overridden via plaintext values in `gui.env`.
-*/ -}}
-{{- $reservedEnv := dict "ADMIN_TOKEN" true "SECRET_KEY" true "REQUESTS_DB" true "MODE" true "TMP_DIR" true "TELEGRAM_MAX_FILE_SIZE" true "WORKERS" true "HEALTH_DEBUG" true "YTDLP_USER_AGENT" true "YTDLP_COOKIES_PATH" true "YTDLP_COOKIES_FROM_BROWSER" true "YTDLP_HEADERS" true "OAUTH_CLIENT_ID" true "OAUTH_CLIENT_SECRET" true "OAUTH_AUTHORIZE_URL" true "OAUTH_TOKEN_URL" true "OAUTH_USERINFO_URL" true "OAUTH_JWKS_URI" true "OAUTH_SERVER_METADATA_URL" true "OAUTH_ADMIN_GROUPS" true -}}
+{{- if not .Values.db.pvc.enabled -}}
+{{- fail "gui.enabled=true needs db.pvc.enabled=true: the GUI reads the bot's SQLite database from the shared volume (or set gui.enabled=false)" -}}
+{{- end -}}
+{{- $env := .Values.env | default dict -}}
+{{- $guiEnv := .Values.gui.env | default dict -}}
+{{- $port := .Values.gui.port | default 8081 | int64 -}}
+{{- $skip := list -}}
+{{- range $key, $value := $guiEnv -}}
+{{- if not (kindIs "invalid" $value) -}}
+{{- $skip = append $skip $key -}}
+{{- end -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "social-media-reuploader.fullname" . }}-gui
+  name: {{ include "social-media-reuploader.guiFullname" . }}
   labels:
-{{ include "social-media-reuploader.labels" . | nindent 4 }}
+    {{- include "social-media-reuploader.labels" . | nindent 4 }}
+    app.kubernetes.io/component: gui
 spec:
   replicas: 1
+  revisionHistoryLimit: 3
   selector:
     matchLabels:
-      app.kubernetes.io/instance: {{ .Release.Name }}
-      app.kubernetes.io/component: gui
+      {{- include "social-media-reuploader.selectorLabels" (list . "gui") | nindent 6 }}
   template:
     metadata:
       labels:
-{{ include "social-media-reuploader.labels" . | nindent 8 }}
+        {{- include "social-media-reuploader.labels" . | nindent 8 }}
         app.kubernetes.io/component: gui
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Restart the GUI when its credentials change (envFrom is not live).
+        checksum/gui-secret: {{ list .Values.gui.secrets .Values.gui.existingSecret .Values.gui.secretName | toJson | sha256sum }}
+        {{- with .Values.gui.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
-      serviceAccountName: '{{ if .Values.serviceAccount.name }}{{ .Values.serviceAccount.name }}{{ else if .Values.serviceAccount.create }}{{ include "social-media-reuploader.fullname" . }}-sa{{ else }}{{ "" }}{{ end }}'
+      serviceAccountName: {{ include "social-media-reuploader.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
       securityContext:
-        runAsNonRoot: true
-        fsGroup: 1000
-      {{- if .Values.terminationGracePeriodSeconds }}
-      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds }}
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ .Values.gui.terminationGracePeriodSeconds | default 30 | int64 }}
+      {{- with .Values.gui.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with (.Values.gui.tolerations | default .Values.tolerations) }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with include "social-media-reuploader.guiAffinity" . }}
+      # The DB volume is ReadWriteOnce: the GUI must run on the bot's node.
+      affinity:
+        {{- . | nindent 8 }}
       {{- end }}
       containers:
         - name: social-media-reuploader-gui
-          image: "{{ .Values.gui.image.repository }}:{{ default .Chart.AppVersion .Values.gui.image.tag }}"
-          imagePullPolicy: {{ .Values.gui.image.pullPolicy }}
+          image: {{ include "social-media-reuploader.guiImage" . | quote }}
+          imagePullPolicy: {{ .Values.gui.image.pullPolicy | default .Values.image.pullPolicy }}
           {{- if .Values.gui.command }}
           command:
-{{ toYaml .Values.gui.command | indent 12 }}
-          {{- end }}
-          {{- if .Values.gui.args }}
+            {{- range .Values.gui.command }}
+            - {{ . | toString | quote }}
+            {{- end }}
+          {{- with .Values.gui.args }}
           args:
-{{ toYaml .Values.gui.args | indent 12 }}
+            {{- range . }}
+            - {{ . | toString | quote }}
+            {{- end }}
+          {{- end }}
+          {{- else }}
+          # args (not command) keep the image entrypoint (tini) as PID 1.
+          args:
+            - uvicorn
+            - src.gui:app
+            - --host
+            - 0.0.0.0
+            - --port
+            - {{ $port | toString | quote }}
+            # Honour X-Forwarded-Proto/For/Host from the ingress (OAuth
+            # redirect URI, secure cookies, client address).
+            - --proxy-headers
+            - --forwarded-allow-ips
+            - {{ .Values.gui.forwardedAllowIps | default "127.0.0.1" | quote }}
+            {{- range .Values.gui.extraArgs }}
+            - {{ . | toString | quote }}
+            {{- end }}
           {{- end }}
           ports:
-            - containerPort: {{ .Values.gui.port | default 8081 }}
+            - name: http
+              containerPort: {{ $port }}
+              protocol: TCP
+          envFrom:
+            # SECRET_KEY, ADMIN_TOKEN and OAUTH_* (never in the pod spec).
+            - secretRef:
+                name: {{ include "social-media-reuploader.guiSecretName" . }}
+            {{- with .Values.gui.extraEnvFrom }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          env:
+            - name: REQUESTS_DB
+              value: {{ include "social-media-reuploader.dbPath" . | quote }}
+            {{- with include "social-media-reuploader.renderEnv" (dict "values" $env "source" "env" "target" "gui" "skip" $skip) }}
+            {{- . | nindent 12 }}
+            {{- end }}
+            {{- with include "social-media-reuploader.renderEnv" (dict "values" $guiEnv "source" "gui.env" "target" "gui" "skip" (list)) }}
+            {{- . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.gui.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           securityContext:
-            runAsUser: 1000
-            runAsNonRoot: true
-            allowPrivilegeEscalation: false
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            {{- with .Values.gui.probes.startup }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /health
-              port: {{ .Values.gui.port | default 8081 }}
-            initialDelaySeconds: 20
-            periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 3
+              port: http
+            {{- with .Values.gui.probes.liveness }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           readinessProbe:
             httpGet:
               path: /health
-              port: {{ .Values.gui.port | default 8081 }}
-            initialDelaySeconds: 5
-            periodSeconds: 5
-            timeoutSeconds: 3
-            failureThreshold: 3
-{{- $hasSecrets := or .Values.gui.secrets.adminToken .Values.gui.secrets.secretKey .Values.gui.secrets.oauthClientId .Values.gui.secrets.oauthClientSecret .Values.gui.secrets.oauthAuthorizeUrl .Values.gui.secrets.oauthTokenUrl .Values.gui.secrets.oauthUserinfoUrl .Values.gui.secrets.oauthJwksUri .Values.gui.secrets.oauthServerMetadataUrl .Values.gui.secrets.oauthAdminGroups -}}
-{{- if .Values.gui.useSecret }}
-          envFrom:
-            - secretRef:
-                name: {{ if .Values.gui.secretName }}{{ .Values.gui.secretName }}{{ else }}{{ include "social-media-reuploader.fullname" . }}-gui-secret{{ end }}
-          env:
-            {{- /* REQUESTS_DB and runtime defaults when using a secret */}}
-            {{- if .Values.db.pvc.enabled }}
-            - name: REQUESTS_DB
-              value: '{{ .Values.db.pvc.mountPath | default "/app/data" }}/requests.db'
-            {{- else if .Values.env.REQUESTS_DB }}
-            - name: REQUESTS_DB
-              value: '{{ .Values.env.REQUESTS_DB }}'
-            {{- else }}
-            - name: REQUESTS_DB
-              value: '/app/data/requests.db'
+              port: http
+            {{- with .Values.gui.probes.readiness }}
+            {{- toYaml . | nindent 12 }}
             {{- end }}
-            - name: MODE
-              value: '{{ .Values.env.MODE | default "webhook" }}'
-            - name: TMP_DIR
-              value: '{{ .Values.env.TMP_DIR | default "/tmp/telegram_downloader" }}'
-            - name: TELEGRAM_MAX_FILE_SIZE
-              value: '{{ .Values.env.TELEGRAM_MAX_FILE_SIZE | default 52428800 }}'
-            - name: WORKERS
-              value: '{{ .Values.env.WORKERS | default "2" }}'
-            - name: HEALTH_DEBUG
-              value: '{{ .Values.env.HEALTH_DEBUG | default "false" }}'
-            - name: YTDLP_USER_AGENT
-              value: '{{ .Values.env.YTDLP_USER_AGENT | default "" }}'
-            - name: YTDLP_COOKIES_PATH
-              value: '{{ .Values.env.YTDLP_COOKIES_PATH | default "" }}'
-            - name: YTDLP_COOKIES_FROM_BROWSER
-              value: '{{ .Values.env.YTDLP_COOKIES_FROM_BROWSER | default "" }}'
-            - name: YTDLP_HEADERS
-              value: '{{ .Values.env.YTDLP_HEADERS | default "" }}'
-            - name: OAUTH_ADMIN_GROUPS
-              value: '{{ .Values.env.OAUTH_ADMIN_GROUPS | default "" }}'
-            {{- if .Values.gui.env }}
-            {{- range $k, $v := .Values.gui.env }}
-            {{- if not (hasKey $reservedEnv $k) }}
-            - name: {{ $k }}
-              value: {{ $v | quote }}
-            {{- else }}
-            {{- /* reserved key skipped to avoid shadowing chart-managed env */ -}}
-            {{- end }}
-            {{- end }}
-            {{- end }}
-{{- else if $hasSecrets }}
-          env:
-            {{- if .Values.gui.secrets.adminToken }}
-            - name: ADMIN_TOKEN
-              value: "{{ .Values.gui.secrets.adminToken }}"
-            {{- end }}
-            {{- if .Values.gui.secrets.secretKey }}
-            - name: SECRET_KEY
-              value: "{{ .Values.gui.secrets.secretKey }}"
-            {{- end }}
-            {{- if .Values.gui.secrets.oauthClientId }}
-            - name: OAUTH_CLIENT_ID
-              value: "{{ .Values.gui.secrets.oauthClientId }}"
-            {{- end }}
-            {{- if .Values.gui.secrets.oauthClientSecret }}
-            - name: OAUTH_CLIENT_SECRET
-              value: "{{ .Values.gui.secrets.oauthClientSecret }}"
-            {{- end }}
-            {{- if .Values.gui.secrets.oauthAuthorizeUrl }}
-            - name: OAUTH_AUTHORIZE_URL
-              value: "{{ .Values.gui.secrets.oauthAuthorizeUrl }}"
-            {{- end }}
-            {{- if .Values.gui.secrets.oauthTokenUrl }}
-            - name: OAUTH_TOKEN_URL
-              value: "{{ .Values.gui.secrets.oauthTokenUrl }}"
-            {{- end }}
-            {{- if .Values.gui.secrets.oauthUserinfoUrl }}
-            - name: OAUTH_USERINFO_URL
-              value: "{{ .Values.gui.secrets.oauthUserinfoUrl }}"
-            {{- end }}
-            {{- if .Values.gui.secrets.oauthJwksUri }}
-            - name: OAUTH_JWKS_URI
-              value: "{{ .Values.gui.secrets.oauthJwksUri }}"
-            {{- end }}
-            {{- if .Values.gui.secrets.oauthServerMetadataUrl }}
-            - name: OAUTH_SERVER_METADATA_URL
-              value: "{{ .Values.gui.secrets.oauthServerMetadataUrl }}"
-            {{- end }}
-            {{- if .Values.gui.secrets.oauthAdminGroups }}
-            - name: OAUTH_ADMIN_GROUPS
-              value: "{{ .Values.gui.secrets.oauthAdminGroups }}"
-            {{- end }}
-            {{- /* append REQUESTS_DB and runtime defaults */}}
-            {{- if .Values.db.pvc.enabled }}
-            - name: REQUESTS_DB
-              value: '{{ .Values.db.pvc.mountPath | default "/app/data" }}/requests.db'
-            {{- else if .Values.env.REQUESTS_DB }}
-            - name: REQUESTS_DB
-              value: '{{ .Values.env.REQUESTS_DB }}'
-            {{- else }}
-            - name: REQUESTS_DB
-              value: '/app/data/requests.db'
-            {{- end }}
-            - name: MODE
-              value: '{{ .Values.env.MODE | default "webhook" }}'
-            - name: TMP_DIR
-              value: '{{ .Values.env.TMP_DIR | default "/tmp/telegram_downloader" }}'
-            - name: TELEGRAM_MAX_FILE_SIZE
-              value: '{{ .Values.env.TELEGRAM_MAX_FILE_SIZE | default 52428800 }}'
-            - name: WORKERS
-              value: '{{ .Values.env.WORKERS | default "2" }}'
-            - name: HEALTH_DEBUG
-              value: '{{ .Values.env.HEALTH_DEBUG | default "false" }}'
-            - name: YTDLP_USER_AGENT
-              value: '{{ .Values.env.YTDLP_USER_AGENT | default "" }}'
-            - name: YTDLP_COOKIES_PATH
-              value: '{{ .Values.env.YTDLP_COOKIES_PATH | default "" }}'
-            - name: YTDLP_COOKIES_FROM_BROWSER
-              value: '{{ .Values.env.YTDLP_COOKIES_FROM_BROWSER | default "" }}'
-            - name: YTDLP_HEADERS
-              value: '{{ .Values.env.YTDLP_HEADERS | default "" }}'
-            {{- if .Values.gui.env }}
-            {{- range $k, $v := .Values.gui.env }}
-            {{- if not (hasKey $reservedEnv $k) }}
-            - name: {{ $k }}
-              value: {{ $v | quote }}
-            {{- else }}
-            {{- /* reserved key skipped to avoid shadowing chart-managed env */ -}}
-            {{- end }}
-            {{- end }}
-            {{- end }}
-{{- else }}
-          env:
-            {{- if .Values.db.pvc.enabled }}
-            - name: REQUESTS_DB
-              value: '{{ .Values.db.pvc.mountPath | default "/app/data" }}/requests.db'
-            {{- else if .Values.env.REQUESTS_DB }}
-            - name: REQUESTS_DB
-              value: '{{ .Values.env.REQUESTS_DB }}'
-            {{- else }}
-            - name: REQUESTS_DB
-              value: '/app/data/requests.db'
-            {{- end }}
-            - name: MODE
-              value: '{{ .Values.env.MODE | default "webhook" }}'
-            - name: TMP_DIR
-              value: '{{ .Values.env.TMP_DIR | default "/tmp/telegram_downloader" }}'
-            - name: TELEGRAM_MAX_FILE_SIZE
-              value: '{{ .Values.env.TELEGRAM_MAX_FILE_SIZE | default 52428800 }}'
-            - name: WORKERS
-              value: '{{ .Values.env.WORKERS | default "2" }}'
-            - name: HEALTH_DEBUG
-              value: '{{ .Values.env.HEALTH_DEBUG | default "false" }}'
-            - name: YTDLP_USER_AGENT
-              value: '{{ .Values.env.YTDLP_USER_AGENT | default "" }}'
-            - name: YTDLP_COOKIES_PATH
-              value: '{{ .Values.env.YTDLP_COOKIES_PATH | default "" }}'
-            - name: YTDLP_COOKIES_FROM_BROWSER
-              value: '{{ .Values.env.YTDLP_COOKIES_FROM_BROWSER | default "" }}'
-            - name: YTDLP_HEADERS
-              value: '{{ .Values.env.YTDLP_HEADERS | default "" }}'
-            - name: OAUTH_ADMIN_GROUPS
-              value: '{{ .Values.env.OAUTH_ADMIN_GROUPS | default "" }}'
-            {{- if .Values.gui.env }}
-            {{- range $k, $v := .Values.gui.env }}
-            {{- if not (hasKey $reservedEnv $k) }}
-            - name: {{ $k }}
-              value: {{ $v | quote }}
-            {{- else }}
-            {{- /* reserved key skipped to avoid shadowing chart-managed env */ -}}
-            {{- end }}
-            {{- end }}
-            {{- end }}
-{{- end }}
+          {{- with .Values.guiResources }}
           resources:
-{{ toYaml .Values.guiResources | indent 12 }}
-          {{- if .Values.db.pvc.enabled }}
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
           volumeMounts:
             - name: data
               mountPath: {{ .Values.db.pvc.mountPath | default "/app/data" }}
-          {{- end }}
-      {{- if .Values.db.pvc.enabled }}
+            - name: tmp
+              mountPath: /tmp
+            {{- with .Values.gui.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
       volumes:
         - name: data
           persistentVolumeClaim:
-            claimName: {{ include "social-media-reuploader.fullname" . }}-data
-      {{- end }}
-{{- end -}}
+            claimName: {{ include "social-media-reuploader.dbClaimName" . }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.gui.tmpSizeLimit | default "256Mi" }}
+        {{- with .Values.gui.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+{{- end }}

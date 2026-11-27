@@ -1,243 +1,483 @@
 <!doctype html>
 <html lang="it">
   <head>
-    <meta charset="utf-8" />
-    <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>Social media reuploader — Admin</title>
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-    <style>
-      /* simplified, lightweight styles for a compact admin UI */
-      body { padding-top: 0.75rem; background:#f8f9fa; font-size:0.95rem }
-      .card { margin-bottom: .75rem; border-radius: .5rem; box-shadow: none; border: 1px solid rgba(0,0,0,0.06); }
-      .mono { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, "Roboto Mono", "Courier New", monospace }
-      .overlay { position:fixed; inset:0; display:flex; align-items:center; justify-content:center; background:rgba(0,0,0,0.35); z-index:2000; padding:1rem; }
-      .login-card { max-width:520px; width:100%; background:#fff; padding:1rem; border-radius:10px; box-shadow:none; border:1px solid rgba(0,0,0,0.06); }
-      .brand { font-weight:700; color:#0d6efd; font-size:1rem; }
-      .small-muted { color:#6c757d; font-size:0.9rem; }
-      .table-sm td, .table-sm th { vertical-align: middle; padding: .35rem .5rem; }
-      .chart-card { min-height:unset; }
-      .chart-card canvas { max-height:200px; width:100%; }
-      .auth-actions .btn { margin-left:.4rem; }
-      .text-truncate-link { max-width:34ch; display:inline-block; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-      .badge { font-size: .8em; }
-    </style>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Social media reuploader — Console</title>
+    <link rel="icon" href="data:,">
+    <link rel="stylesheet"
+          href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css"
+          integrity="sha384-T3c6CoIi6uLrA9TneNEoa7RxnatzjcDSCmG1MXxSR1GAsXEV/Dwwykc2MPK8M2HN"
+          crossorigin="anonymous">
+    <link rel="stylesheet" href="static/app.css?v=__ASSET_VERSION__">
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.js"
+            integrity="sha384-FcQlsUOd0TJjROrBxhJdUhXTUgNJQxTMcxZe6nHbaEfFL1zjQ+bq/uRoBQxb0KMo"
+            crossorigin="anonymous" defer></script>
+    <script src="static/app.js?v=__ASSET_VERSION__" defer></script>
   </head>
-  <body class="bg-light">
-    <div id="mainContainer" class="container">
-      <div class="d-flex justify-content-between align-items-center mb-3">
-        <div>
-          <h2 class="mb-0">Social media reuploader</h2>
-          <div class="small text-muted">Admin Console</div>
-        </div>
-        <div id="authControls" class="auth-actions"></div>
+  <body>
+    <noscript>
+      <div class="alert alert-warning m-3">
+        Questa console richiede JavaScript. Senza JavaScript puoi solo accedere
+        (<a href="login">pagina di accesso</a>, oppure <a href="login?method=token">token
+        amministratore</a> se configurato) e usare le API JSON.
       </div>
+    </noscript>
 
-      <div class="row g-3">
-        <div class="col-lg-4">
-          <div class="card p-3 mb-3">
-            <div class="d-flex gap-3 flex-wrap">
-                <div>
-                  <div class="small text-muted">Avg original</div>
-                  <div id="statAvgOrig" class="h5 mb-0 mono">—</div>
-                </div>
-                <div>
-                  <div class="small text-muted">Avg final</div>
-                  <div id="statAvgFinal" class="h5 mb-0 mono">—</div>
-                </div>
-                <div>
-                  <div class="small text-muted">Avg proc</div>
-                  <div id="statAvgProc" class="h5 mb-0 mono">—</div>
-                </div>
-              </div>
-              <div class="d-flex gap-3 mt-3 flex-wrap">
-                <div>
-                  <div class="small text-muted">Totale scaricato</div>
-                  <div id="statTotalDownloaded" class="h6 mb-0 mono">—</div>
-                </div>
-                <div>
-                  <div class="small text-muted">Totale inviato</div>
-                  <div id="statTotalSent" class="h6 mb-0 mono">—</div>
-                </div>
-                <div>
-                  <div class="small text-muted">Totale scaricato (MB)</div>
-                  <div id="statTotalDownloadedMB" class="h6 mb-0 mono">—</div>
-                </div>
-                <div>
-                  <div class="small text-muted">Totale inviato (MB)</div>
-                  <div id="statTotalUploadedMB" class="h6 mb-0 mono">—</div>
-                </div>
-                <div>
-                  <div class="small text-muted">Totale processato (MB)</div>
-                  <div id="statTotalProcessedMB" class="h6 mb-0 mono">—</div>
-                </div>
-                <div>
-                  <div class="small text-muted">File limitati</div>
-                  <div id="statTotalRateLimited" class="h6 mb-0 mono">—</div>
-                </div>
-                <div>
-                  <div class="small text-muted">Chat limitate</div>
-                  <div id="statTotalChatsLimited" class="h6 mb-0 mono">—</div>
-                </div>
-                <div>
-                  <div class="small text-muted">Duplicati</div>
-                  <div id="statTotalDuplicates" class="h6 mb-0 mono">—</div>
-                </div>
-              </div>
-          </div>
+    <div id="boot" class="page-center">
+      <div class="text-body-secondary">Caricamento…</div>
+    </div>
 
-          <div class="card chart-card p-3 mb-3">
-            <canvas id="statusChart" aria-label="Status chart" role="img"></canvas>
+    <div id="app" hidden>
+      <header class="app-header border-bottom bg-body">
+        <div class="container-xl d-flex flex-wrap align-items-center gap-2 py-2">
+          <div class="me-auto">
+            <div class="brand">Social media reuploader</div>
+            <div class="small text-body-secondary">Console di amministrazione</div>
           </div>
-
-          <div class="card chart-card p-3 mb-3">
-            <canvas id="topChatsChart" aria-label="Top chats" role="img"></canvas>
-          </div>
-
-          <div class="card chart-card p-3 mb-3">
-            <canvas id="durationChart" aria-label="Processing duration" role="img"></canvas>
-          </div>
-
-          <div class="card chart-card p-3 mb-3">
-            <canvas id="timeSeriesChart" aria-label="Requests time series" role="img"></canvas>
-          </div>
+          <span id="workerBadge" class="badge text-bg-secondary">Worker: …</span>
+          <span id="liveBadge" class="badge text-bg-secondary">Aggiornamenti: …</span>
+          <span id="userLabel" class="small text-body-secondary"></span>
+          <button id="refreshBtn" type="button" class="btn btn-sm btn-outline-secondary">Aggiorna</button>
+          <button id="logoutBtn" type="button" class="btn btn-sm btn-outline-primary">Esci</button>
         </div>
+      </header>
 
-        <div class="col-lg-8">
-          <div class="card p-3 mb-3">
-            <div class="d-flex justify-content-between mb-2">
-              <div class="d-flex gap-2 align-items-center">
-                <input id="searchInput" class="form-control form-control-sm" placeholder="Cerca URL o chat..." style="min-width:220px">
+      <main class="container-xl py-3">
+        <div id="workerAlert" class="alert alert-warning" role="status" hidden></div>
+
+        <ul class="nav nav-tabs mb-3" role="tablist">
+          <li class="nav-item" role="presentation">
+            <button class="nav-link active" type="button" role="tab" data-tab="overview" aria-selected="true">Panoramica</button>
+          </li>
+          <li class="nav-item" role="presentation">
+            <button class="nav-link" type="button" role="tab" data-tab="requests" aria-selected="false">Richieste</button>
+          </li>
+          <li class="nav-item" role="presentation">
+            <button class="nav-link" type="button" role="tab" data-tab="queue" aria-selected="false">Coda</button>
+          </li>
+          <li class="nav-item" role="presentation">
+            <button class="nav-link" type="button" role="tab" data-tab="limits" aria-selected="false">Limiti</button>
+          </li>
+          <li class="nav-item" role="presentation">
+            <button class="nav-link" type="button" role="tab" data-tab="events" aria-selected="false">Eventi</button>
+          </li>
+          <li class="nav-item" role="presentation">
+            <button class="nav-link" type="button" role="tab" data-tab="users" aria-selected="false">Utenti</button>
+          </li>
+          <li class="nav-item" role="presentation">
+            <button class="nav-link" type="button" role="tab" data-tab="system" aria-selected="false">Sistema</button>
+          </li>
+        </ul>
+
+        <!-- Panoramica -->
+        <section data-panel="overview" role="tabpanel" aria-label="Panoramica">
+          <div class="row g-3">
+            <div class="col-6 col-md-3"><div class="card stat-card"><div class="card-body">
+              <div class="stat-label">Richieste totali</div>
+              <div id="statTotal" class="stat-value">—</div>
+              <div id="statTotalSub" class="stat-sub"></div>
+            </div></div></div>
+            <div class="col-6 col-md-3"><div class="card stat-card"><div class="card-body">
+              <div class="stat-label">Completate</div>
+              <div id="statDone" class="stat-value text-success">—</div>
+              <div id="statDoneSub" class="stat-sub"></div>
+            </div></div></div>
+            <div class="col-6 col-md-3"><div class="card stat-card"><div class="card-body">
+              <div class="stat-label">Fallite</div>
+              <div id="statFailed" class="stat-value text-danger">—</div>
+              <div id="statFailedSub" class="stat-sub"></div>
+            </div></div></div>
+            <div class="col-6 col-md-3"><div class="card stat-card"><div class="card-body">
+              <div class="stat-label">In coda / in corso</div>
+              <div id="statActive" class="stat-value">—</div>
+              <div id="statActiveSub" class="stat-sub"></div>
+            </div></div></div>
+            <div class="col-6 col-md-3"><div class="card stat-card"><div class="card-body">
+              <div class="stat-label">Rifiutate</div>
+              <div id="statRefused" class="stat-value">—</div>
+              <div id="statRefusedSub" class="stat-sub"></div>
+            </div></div></div>
+            <div class="col-6 col-md-3"><div class="card stat-card"><div class="card-body">
+              <div class="stat-label">Chat limitate adesso</div>
+              <div id="statLimited" class="stat-value">—</div>
+              <div class="stat-sub">blocco temporaneo per troppi link</div>
+            </div></div></div>
+            <div class="col-6 col-md-3"><div class="card stat-card"><div class="card-body">
+              <div class="stat-label">Dati scaricati</div>
+              <div id="statBytes" class="stat-value">—</div>
+              <div id="statBytesSub" class="stat-sub"></div>
+            </div></div></div>
+            <div class="col-6 col-md-3"><div class="card stat-card"><div class="card-body">
+              <div class="stat-label">Tempo medio di elaborazione</div>
+              <div id="statAvg" class="stat-value">—</div>
+              <div id="statAvgSub" class="stat-sub"></div>
+            </div></div></div>
+          </div>
+
+          <div class="row g-3 mt-1">
+            <div class="col-lg-7"><div class="card"><div class="card-body">
+              <h2 class="card-title h6">Richieste nelle ultime 24 ore (ora locale)</h2>
+              <div class="chart-box"><canvas id="chartTimeline" role="img" aria-label="Richieste per ora"></canvas></div>
+            </div></div></div>
+            <div class="col-lg-5"><div class="card"><div class="card-body">
+              <h2 class="card-title h6">Stato delle richieste</h2>
+              <div class="chart-box"><canvas id="chartStatus" role="img" aria-label="Richieste per stato"></canvas></div>
+            </div></div></div>
+            <div class="col-lg-4"><div class="card"><div class="card-body">
+              <h2 class="card-title h6">Chat più attive</h2>
+              <div class="chart-box"><canvas id="chartChats" role="img" aria-label="Chat più attive"></canvas></div>
+            </div></div></div>
+            <div class="col-lg-4"><div class="card"><div class="card-body">
+              <h2 class="card-title h6">Siti di provenienza</h2>
+              <div class="chart-box"><canvas id="chartProviders" role="img" aria-label="Richieste per sito"></canvas></div>
+            </div></div></div>
+            <div class="col-lg-4"><div class="card"><div class="card-body">
+              <h2 class="card-title h6">Durata delle elaborazioni completate</h2>
+              <div class="chart-box"><canvas id="chartDuration" role="img" aria-label="Durata delle elaborazioni"></canvas></div>
+            </div></div></div>
+          </div>
+        </section>
+
+        <!-- Richieste -->
+        <section data-panel="requests" role="tabpanel" aria-label="Richieste" hidden>
+          <div class="card"><div class="card-body">
+            <form id="requestFilters" class="row g-2 align-items-end" role="search">
+              <div class="col-md-4">
+                <label class="form-label small" for="searchInput">Cerca</label>
+                <input id="searchInput" class="form-control form-control-sm" type="search" placeholder="URL, testo o ID chat" autocomplete="off">
+              </div>
+              <div class="col-md-3">
+                <label class="form-label small" for="statusFilter">Stato</label>
                 <select id="statusFilter" class="form-select form-select-sm">
-                  <option value="all">Tutti</option>
+                  <option value="">Tutti</option>
                 </select>
+              </div>
+              <div class="col-md-2">
+                <label class="form-label small" for="chatFilter">Chat</label>
+                <input id="chatFilter" class="form-control form-control-sm" inputmode="numeric" placeholder="ID chat" autocomplete="off">
+              </div>
+              <div class="col-md-1">
+                <label class="form-label small" for="pageSize">Righe</label>
                 <select id="pageSize" class="form-select form-select-sm">
                   <option value="10">10</option>
                   <option value="25" selected>25</option>
                   <option value="50">50</option>
+                  <option value="100">100</option>
                 </select>
               </div>
-              <div>
-                <button id="refreshBtnSidebar" class="btn btn-sm btn-outline-secondary">Refresh</button>
+              <div class="col-md-2 text-md-end">
+                <button id="bulkRequeueBtn" type="button" class="btn btn-sm btn-outline-primary" hidden>Rimetti in coda i risultati…</button>
               </div>
-            </div>
-
-            <div class="table-responsive">
-              <table class="table table-sm table-hover">
+            </form>
+            <div class="table-responsive mt-3">
+              <table class="table table-sm table-hover align-middle mb-2">
                 <thead>
                   <tr>
-                    <th>ID</th>
-                    <th>Chat</th>
-                    <th>URL</th>
-                    <th>Original</th>
-                    <th>Final</th>
-                    <th>Comp</th>
-                    <th>Status</th>
-                    <th>Proc</th>
-                    <th>Created</th>
+                    <th scope="col">ID</th>
+                    <th scope="col">Data</th>
+                    <th scope="col">Chat</th>
+                    <th scope="col">Link</th>
+                    <th scope="col">Stato</th>
+                    <th scope="col">Dimensioni</th>
+                    <th scope="col">Durata</th>
+                    <th scope="col">Errore</th>
+                    <th scope="col" class="text-end">Azioni</th>
                   </tr>
                 </thead>
-                <tbody id="requestsTable"></tbody>
+                <tbody id="requestsBody"></tbody>
               </table>
             </div>
+            <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
+              <div id="requestsSummary" class="small text-body-secondary"></div>
+              <nav aria-label="Pagine delle richieste"><ul id="requestsPager" class="pagination pagination-sm mb-0"></ul></nav>
+            </div>
+          </div></div>
+        </section>
 
-            <nav aria-label="Pagination">
-              <ul id="pagination" class="pagination pagination-sm"></ul>
-            </nav>
-          </div>
-          <div class="card p-3 mb-3">
-            <div class="d-flex justify-content-between mb-2">
-              <div>
-                <div class="small text-muted">Coda di elaborazione</div>
-                <div class="h6 mb-0">In attesa / In esecuzione</div>
+        <!-- Coda -->
+        <section data-panel="queue" role="tabpanel" aria-label="Coda" hidden>
+          <div class="row g-3">
+            <div class="col-lg-4"><div class="card"><div class="card-body">
+              <h2 class="h6">Worker</h2>
+              <dl id="workerInfo" class="row small mb-0"></dl>
+            </div></div></div>
+            <div class="col-lg-8"><div class="card"><div class="card-body">
+              <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
+                <h2 class="h6 mb-0">Coda di elaborazione</h2>
+                <div id="queueCounts" class="small text-body-secondary"></div>
+                <button id="cancelAllBtn" type="button" class="btn btn-sm btn-outline-danger">Annulla tutta la coda…</button>
               </div>
-              <div>
-                <button id="refreshQueueBtn" class="btn btn-sm btn-outline-secondary">Aggiorna coda</button>
-                <button id="startQueueBtn" class="btn btn-sm btn-primary ms-2">Avvia coda</button>
-                <button id="clearQueueBtn" class="btn btn-sm btn-outline-danger ms-2">Svuota coda</button>
+              <h3 class="h6 mt-3">In esecuzione</h3>
+              <ul id="runningList" class="list-group list-group-flush"></ul>
+              <h3 class="h6 mt-3">In coda</h3>
+              <ul id="queuedList" class="list-group list-group-flush"></ul>
+              <h3 class="h6 mt-3">Differite</h3>
+              <ul id="deferredList" class="list-group list-group-flush"></ul>
+            </div></div></div>
+            <div class="col-12"><div class="card"><div class="card-body">
+              <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
+                <h2 class="h6 mb-0">Ultime richieste fallite o rifiutate</h2>
+                <button id="requeueRetryableBtn" type="button" class="btn btn-sm btn-outline-primary">Rimetti in coda tutte…</button>
               </div>
-            </div>
-            <div>
-              <div class="small text-muted">In coda</div>
-              <ul id="queueQueued" class="list-group mb-2" style="max-height:160px; overflow:auto"></ul>
-              <div class="small text-muted mt-2">In esecuzione</div>
-              <ul id="queueRunning" class="list-group" style="max-height:120px; overflow:auto"></ul>
-            </div>
+              <ul id="retryableList" class="list-group list-group-flush mt-2"></ul>
+            </div></div></div>
           </div>
+        </section>
 
-          <div class="card p-3">
-            <div class="small text-muted">Updates</div>
-            <pre id="updates" class="mono small" style="max-height:220px; overflow:auto; background:#fff; padding:0.5rem; border-radius:6px;">—</pre>
-          </div>
-          <div class="card p-3 mb-3">
-            <div class="d-flex justify-content-between mb-2">
-              <div>
-                <div class="small text-muted">Rate limits</div>
-                <div class="h6 mb-0">Recently limited chats</div>
-              </div>
-              <div>
-                <button id="refreshRateLimitsBtn" class="btn btn-sm btn-outline-secondary">Aggiorna</button>
-              </div>
+        <!-- Limiti -->
+        <section data-panel="limits" role="tabpanel" aria-label="Limiti" hidden>
+          <div class="card mb-3"><div class="card-body">
+            <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
+              <h2 class="h6 mb-0">Limiti in vigore</h2>
+              <span id="limitsSource" class="badge text-bg-light"></span>
             </div>
-            <div id="rateLimitsList" style="max-height:220px; overflow:auto"></div>
-          </div>
-          <div class="card p-3 mb-3">
-            <div class="d-flex justify-content-between mb-2">
-              <div><div class="small text-muted">Configurazione</div><div class="h6 mb-0">Runtime config</div></div>
-              <div><button id="showConfigBtn" class="btn btn-sm btn-outline-secondary">Mostra</button></div>
+            <ul id="limitsList" class="small mb-0 mt-2"></ul>
+          </div></div>
+          <div class="card mb-3"><div class="card-body">
+            <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
+              <h2 class="h6 mb-0">Chat limitate adesso</h2>
+              <button id="unlimitAllBtn" type="button" class="btn btn-sm btn-outline-primary">Sblocca tutte le chat…</button>
             </div>
-            <pre id="configDump" class="mono small" style="max-height:180px; overflow:auto; background:#fff; padding:0.5rem; border-radius:6px;">—</pre>
+            <div class="table-responsive mt-2">
+              <table class="table table-sm align-middle mb-0">
+                <thead>
+                  <tr>
+                    <th scope="col">Chat</th>
+                    <th scope="col">Bloccata fino a</th>
+                    <th scope="col">Rifiuti (24 h)</th>
+                    <th scope="col">Ultimo link rifiutato</th>
+                    <th scope="col" class="text-end">Azioni</th>
+                  </tr>
+                </thead>
+                <tbody id="limitedBody"></tbody>
+              </table>
+            </div>
+          </div></div>
+          <div class="card"><div class="card-body">
+            <h2 class="h6">Rifiuti recenti</h2>
+            <div class="table-responsive">
+              <table class="table table-sm align-middle mb-0">
+                <thead>
+                  <tr>
+                    <th scope="col">Data</th>
+                    <th scope="col">Chat</th>
+                    <th scope="col">Link</th>
+                    <th scope="col">Motivo</th>
+                    <th scope="col" class="text-end">Azioni</th>
+                  </tr>
+                </thead>
+                <tbody id="refusedBody"></tbody>
+              </table>
+            </div>
+          </div></div>
+        </section>
+
+        <!-- Eventi -->
+        <section data-panel="events" role="tabpanel" aria-label="Eventi" hidden>
+          <div class="card"><div class="card-body">
+            <form id="eventFilters" class="row g-2 align-items-end">
+              <div class="col-md-4">
+                <label class="form-label small" for="eventType">Tipo</label>
+                <select id="eventType" class="form-select form-select-sm">
+                  <option value="">Tutti</option>
+                </select>
+              </div>
+              <div class="col-md-3">
+                <label class="form-label small" for="eventChat">Chat</label>
+                <input id="eventChat" class="form-control form-control-sm" inputmode="numeric" placeholder="ID chat" autocomplete="off">
+              </div>
+              <div class="col-md-3">
+                <label class="form-label small" for="eventRequest">Richiesta</label>
+                <input id="eventRequest" class="form-control form-control-sm" inputmode="numeric" placeholder="ID richiesta" autocomplete="off">
+              </div>
+            </form>
+            <div class="table-responsive mt-3">
+              <table class="table table-sm align-middle mb-2">
+                <thead>
+                  <tr>
+                    <th scope="col">#</th>
+                    <th scope="col">Data</th>
+                    <th scope="col">Tipo</th>
+                    <th scope="col">Chat</th>
+                    <th scope="col">Richiesta</th>
+                    <th scope="col">Dettagli</th>
+                  </tr>
+                </thead>
+                <tbody id="eventsBody"></tbody>
+              </table>
+            </div>
+            <div class="d-flex flex-wrap justify-content-between align-items-center gap-2">
+              <div id="eventsSummary" class="small text-body-secondary"></div>
+              <nav aria-label="Pagine degli eventi"><ul id="eventsPager" class="pagination pagination-sm mb-0"></ul></nav>
+            </div>
+          </div></div>
+        </section>
+
+        <!-- Utenti -->
+        <section data-panel="users" role="tabpanel" aria-label="Utenti" hidden>
+          <div class="card mb-3"><div class="card-body">
+            <h2 class="h6">Aggiungi utente</h2>
+            <p class="small text-body-secondary">
+              Chi accede con OAuth è amministratore se la sua e-mail, verificata dal provider,
+              corrisponde a un utente con ruolo "Amministratore" oppure se appartiene a un gruppo
+              indicato in OAUTH_ADMIN_GROUPS. Le e-mail di provider che non dichiarano la verifica
+              (es. GitHub) contano solo con OAUTH_ASSUME_EMAIL_VERIFIED=true.
+              Il ruolo è ricontrollato a ogni richiesta; i gruppi invece sono quelli comunicati dal
+              provider all'accesso, quindi un cambio di gruppo vale dal login successivo (o termina
+              la sessione qui sotto). Cambiare SECRET_KEY chiude subito tutte le sessioni.
+            </p>
+            <form id="userForm" class="row g-2 align-items-end">
+              <div class="col-md-5">
+                <label class="form-label small" for="userEmail">E-mail</label>
+                <input id="userEmail" class="form-control form-control-sm" type="email" required autocomplete="off">
+              </div>
+              <div class="col-md-3">
+                <label class="form-label small" for="userName">Nome utente (facoltativo)</label>
+                <input id="userName" class="form-control form-control-sm" autocomplete="off">
+              </div>
+              <div class="col-md-2">
+                <label class="form-label small" for="userRole">Ruolo</label>
+                <select id="userRole" class="form-select form-select-sm">
+                  <option value="user">Utente</option>
+                  <option value="admin">Amministratore</option>
+                </select>
+              </div>
+              <div class="col-md-2">
+                <button class="btn btn-sm btn-primary w-100" type="submit">Aggiungi</button>
+              </div>
+            </form>
+          </div></div>
+          <div class="card"><div class="card-body">
+            <div class="d-flex justify-content-between align-items-center">
+              <h2 class="h6 mb-0">Utenti</h2>
+              <div id="usersSummary" class="small text-body-secondary"></div>
+            </div>
+            <div class="table-responsive mt-2">
+              <table class="table table-sm align-middle mb-0">
+                <thead>
+                  <tr>
+                    <th scope="col">E-mail</th>
+                    <th scope="col">Nome utente</th>
+                    <th scope="col">Ruolo</th>
+                    <th scope="col">Creato</th>
+                    <th scope="col" class="text-end">Azioni</th>
+                  </tr>
+                </thead>
+                <tbody id="usersBody"></tbody>
+              </table>
+            </div>
+          </div></div>
+          <div class="card mt-3"><div class="card-body">
+            <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+              <div>
+                <h2 class="h6 mb-0">Sessioni attive</h2>
+                <div id="sessionsSummary" class="small text-body-secondary"></div>
+              </div>
+              <button id="revokeOthersBtn" class="btn btn-sm btn-outline-danger" type="button">Termina le altre sessioni</button>
+            </div>
+            <p class="small text-body-secondary mt-2 mb-0">
+              Ogni accesso crea una sessione sul server: l'uscita o la chiusura da qui la terminano
+              davvero, anche se il cookie fosse stato copiato altrove.
+            </p>
+            <div class="table-responsive mt-2">
+              <table class="table table-sm align-middle mb-0">
+                <thead>
+                  <tr>
+                    <th scope="col">Chi</th>
+                    <th scope="col">Accesso</th>
+                    <th scope="col">Indirizzo e browser</th>
+                    <th scope="col">Iniziata</th>
+                    <th scope="col">Ultima attività</th>
+                    <th scope="col" class="text-end">Azioni</th>
+                  </tr>
+                </thead>
+                <tbody id="sessionsBody"></tbody>
+              </table>
+            </div>
+          </div></div>
+        </section>
+
+        <!-- Sistema -->
+        <section data-panel="system" role="tabpanel" aria-label="Sistema" hidden>
+          <div class="row g-3">
+            <div class="col-lg-6"><div class="card"><div class="card-body">
+              <h2 class="h6">Stato del servizio</h2>
+              <dl id="healthInfo" class="row small mb-0"></dl>
+            </div></div></div>
+            <div class="col-lg-6"><div class="card border-danger-subtle"><div class="card-body">
+              <h2 class="h6 text-danger">Pulizia dello storico</h2>
+              <p class="small">
+                Elimina le richieste concluse (completate, fallite, rifiutate, annullate) con i loro
+                eventi e svuota il registro eventi. Restano le richieste in coda o in corso, tutte
+                quelle create dentro la finestra dei duplicati (servono a riconoscere i link già
+                inviati e le modifiche ai messaggi), le completate o fallite ancora dentro la
+                finestra più lunga dei limiti di frequenza, gli utenti e i limiti delle chat.
+              </p>
+              <button id="clearHistoryBtn" type="button" class="btn btn-sm btn-outline-danger">Pulisci lo storico…</button>
+            </div></div></div>
+            <div class="col-12"><div class="card"><div class="card-body">
+              <h2 class="h6">Configurazione</h2>
+              <div id="configWarnings"></div>
+              <div id="configBody" class="row g-3 small"></div>
+            </div></div></div>
+          </div>
+        </section>
+      </main>
+    </div>
+
+    <div id="loginOverlay" class="overlay" hidden>
+      <div class="login-card" role="dialog" aria-modal="true" aria-labelledby="loginTitle">
+        <h1 id="loginTitle" class="brand h5 mb-1">Accesso amministratore</h1>
+        <p class="small text-body-secondary mb-3">Autenticazione richiesta.</p>
+        <a id="oauthLoginBtn" class="btn btn-primary w-100 mb-3" href="login" hidden>Accedi con OAuth</a>
+        <form id="tokenForm" hidden>
+          <input class="d-none" type="text" name="username" value="admin" autocomplete="username" tabindex="-1" aria-hidden="true">
+          <label class="form-label" for="tokenInput">Token amministratore</label>
+          <div class="input-group">
+            <input id="tokenInput" class="form-control" type="password" autocomplete="current-password" required>
+            <button id="tokenToggle" class="btn btn-outline-secondary" type="button" aria-pressed="false">Mostra</button>
+          </div>
+          <div id="tokenError" class="text-danger small mt-2" role="alert" hidden></div>
+          <button id="tokenSubmit" class="btn btn-success w-100 mt-3" type="submit">Accedi</button>
+        </form>
+        <p id="noLoginMethod" class="text-danger small mb-0" hidden>
+          Nessun metodo di accesso è configurato sul server (ADMIN_TOKEN oppure OAuth).
+        </p>
+      </div>
+    </div>
+
+    <div id="notAdminOverlay" class="overlay" hidden>
+      <div class="login-card" role="dialog" aria-modal="true" aria-labelledby="notAdminTitle">
+        <h1 id="notAdminTitle" class="brand h5 mb-2">Privilegi insufficienti</h1>
+        <p id="notAdminText" class="mb-2">Sei autenticato ma non sei amministratore.</p>
+        <p class="small text-body-secondary">
+          Chiedi a un amministratore di assegnarti il ruolo "Amministratore" (sezione Utenti)
+          o di aggiungerti a un gruppo amministratore del provider di identità.
+        </p>
+        <div class="d-flex flex-wrap gap-2">
+          <button id="recheckBtn" type="button" class="btn btn-primary">Ricontrolla</button>
+          <button id="notAdminLogoutBtn" type="button" class="btn btn-outline-secondary">Esci</button>
+        </div>
+      </div>
+    </div>
+
+    <div id="modal" class="modal-layer" hidden>
+      <div class="modal-backdrop show"></div>
+      <div id="modalDialog" class="modal d-block" tabindex="-1" role="dialog" aria-modal="true" aria-labelledby="modalTitle">
+        <div class="modal-dialog modal-lg modal-dialog-scrollable">
+          <div class="modal-content">
+            <div class="modal-header">
+              <h2 id="modalTitle" class="modal-title h5"></h2>
+              <button id="modalClose" type="button" class="btn-close" aria-label="Chiudi"></button>
+            </div>
+            <div id="modalBody" class="modal-body"></div>
+            <div id="modalFooter" class="modal-footer"></div>
           </div>
         </div>
       </div>
     </div>
 
-    <!-- Login overlays -->
-    <div id="loginBox" style="display:none">
-      <div class="overlay" role="dialog" aria-modal="true">
-        <div class="login-card text-center">
-          <div class="d-flex justify-content-between align-items-start mb-3">
-            <div>
-              <div class="brand">Accesso amministratore</div>
-              <div class="small-muted">Autenticazione richiesta</div>
-            </div>
-            <div><a id="loginBtnLarge" class="btn btn-primary" href="/login">Login</a></div>
-          </div>
-          <div id="loginInline" style="display:none">
-            <div class="input-group mb-2">
-              <input id="adminTokenInput" class="form-control" type="password" placeholder="Inserisci token admin">
-              <button id="adminTokenPaste" class="btn btn-outline-secondary">Incolla</button>
-              <button id="adminTokenToggle" class="btn btn-outline-secondary">👁</button>
-            </div>
-            <div class="d-flex justify-content-center gap-2">
-              <button id="adminTokenSubmit" class="btn btn-success">Accedi</button>
-            </div>
-            <div id="adminTokenError" class="text-danger mt-2" style="display:none"></div>
-          </div>
-          <p class="text-muted small mt-3">Usa OAuth quando disponibile o fornisci il token con la variabile d'ambiente.</p>
-        </div>
-      </div>
-    </div>
-
-    <div id="notAdminBox" style="display:none">
-      <div class="overlay" role="dialog" aria-modal="true">
-        <div class="login-card text-center">
-          <div class="d-flex justify-content-between align-items-start mb-3">
-            <div>
-              <div class="brand">Accesso autenticato</div>
-              <div class="small-muted">Privilegi insufficienti</div>
-            </div>
-            <div><a id="notAdminLogout" class="btn btn-outline-secondary btn-sm" href="/logout">Logout</a></div>
-          </div>
-          <p id="notAdminDisplay" class="text-muted">Sei autenticato ma non hai i privilegi di amministratore.</p>
-          <div class="mt-3">
-            <button id="notAdminGrantBtn" class="btn btn-success">Richiedi privilegi</button>
-          </div>
-          <p class="text-muted small mt-2">Se pensi di dover avere privilegi admin, chiedi all'amministratore o verifica la configurazione OIDC/DB.</p>
-        </div>
-      </div>
-    </div>
-
-    <script src="/static/app.js" defer></script>
+    <div id="toasts" class="toast-container position-fixed bottom-0 end-0 p-3" aria-live="polite"></div>
   </body>
 </html>

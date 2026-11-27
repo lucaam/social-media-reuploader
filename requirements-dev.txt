@@ -1,7 +1,11 @@
-mkdocs>=1.4
-mkdocs-material>=9.0
-pytest>=7.0
-pre-commit>=4.6
+# Development and CI tools. Keep the linter pins in sync with the `rev:` of
+# the matching hooks in .pre-commit-config.yaml (ruff, black, isort).
 ruff==0.16.0
 black==26.5.1
 isort==8.0.1
+pre-commit==4.7.0
+pytest==9.2.0
+# Documentation site (mkdocs build --strict) and scripts/check_docs.py
+mkdocs==1.6.1
+mkdocs-material==9.8.2
+pyyaml==6.0.4

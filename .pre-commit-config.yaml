@@ -1,30 +1,75 @@
+# Hooks run locally (`pre-commit install`) and in CI (.github/workflows/ci.yml):
+# "Python linters" runs every hook except helm-lint (needs helm: "Helm chart
+# lint" runs it) and the GitHub Actions hooks, which "GitHub Actions linter
+# (actionlint)" runs.
+# Every hook is pinned (Renovate keeps the revs up to date). Keep the ruff /
+# black / isort revs equal to the pins in requirements-dev.txt.
+# No `language_version` pins: hooks use the default `python3` (3.14 in CI).
+minimum_pre_commit_version: "4.0.0"
+default_language_version:
+  python: python3
+
 repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.4.0
+    rev: v6.0.0
     hooks:
       - id: trailing-whitespace
+        # Fixtures are byte-exact copies of tool output.
+        exclude: ^tests/fixtures/
       - id: end-of-file-fixer
+        exclude: ^tests/fixtures/
       - id: check-yaml
-        exclude: ^charts/
+        # Helm templates are not plain YAML.
+        exclude: ^charts/social-media-reuploader/templates/
+      - id: check-json
+      - id: check-toml
+      - id: check-merge-conflict
+      - id: check-executables-have-shebangs
       - id: check-added-large-files
 
   - repo: https://github.com/astral-sh/ruff-pre-commit
-    rev: v0.15.12
+    rev: v0.16.0
     hooks:
-      - id: ruff
+      - id: ruff-check
         args: ["--fix"]
 
-  - repo: https://github.com/psf/black
-    rev: 26.3.1
+  - repo: https://github.com/psf/black-pre-commit-mirror
+    rev: 26.5.1
     hooks:
       - id: black
-        language_version: python3.12
 
-  - repo: https://github.com/pre-commit/mirrors-isort
-    rev: v5.10.1
+  - repo: https://github.com/PyCQA/isort
+    rev: 8.0.1
     hooks:
       - id: isort
-        args: ["--profile", "black"]
+
+  - repo: https://github.com/shellcheck-py/shellcheck-py
+    rev: v0.11.0.1
+    hooks:
+      - id: shellcheck
+
+  # GitHub Actions: actionlint (shellcheck checks the `run:` scripts), the
+  # workflow JSON schema, a timeout-minutes on every job and zizmor (security
+  # audits: injections, permissions, credentials, pinning).
+  - repo: https://github.com/Mateusz-Grzelinski/actionlint-py
+    rev: v1.7.12.25
+    hooks:
+      - id: actionlint
+        additional_dependencies: [shellcheck-py==0.11.0.1]
+
+  - repo: https://github.com/python-jsonschema/check-jsonschema
+    rev: 0.39.0
+    hooks:
+      - id: check-github-workflows
+      - id: check-github-workflows-require-timeout
+      - id: check-renovate
+
+  - repo: https://github.com/zizmorcore/zizmor-pre-commit
+    rev: v1.33.1
+    hooks:
+      - id: zizmor
+        # Offline audits only: the same result locally and in CI.
+        args: ["--no-progress", "--offline"]
 
   - repo: local
     hooks:
@@ -35,26 +80,18 @@ repos:
         pass_filenames: false
         stages: [pre-push]
 
-  - repo: local
-    hooks:
+      # Needs `helm` on PATH (CI runs it in "Helm chart lint" and skips it in
+      # "Python linters": SKIP=helm-lint).
       - id: helm-lint
         name: helm lint (charts)
-        entry: helm lint charts/social-media-reuploader
+        entry: helm lint charts/social-media-reuploader --strict
         language: system
+        files: ^charts/
         pass_filenames: false
 
-
-  - repo: local
-    hooks:
       - id: commitlint
         name: commitlint (Conventional Commits)
         entry: scripts/commit-msg-fix.sh
         language: script
         pass_filenames: true
         stages: [commit-msg]
-      - id: actionlint
-        name: actionlint (GitHub Actions linter)
-        entry: actionlint
-        language: system
-        pass_filenames: true
-        files: '^\\.github/workflows/.*\\.(ya?ml|yaml)$'

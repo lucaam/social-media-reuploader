@@ -1,0 +1,2 @@
+WARNING: [Instagram] C3xYz12AbCd: Main webpage is locked behind the login page. Use --cookies or --cookies-from-browser to pass cookies for the authentication.
+ERROR: [Instagram] C3xYz12AbCd: There is no video in this post

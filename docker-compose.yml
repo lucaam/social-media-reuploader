@@ -1,26 +1,120 @@
-version: '3.8'
+# Local / single-host deployment: the bot and the admin GUI run as two
+# containers of the same image and share ONE SQLite database through the
+# `data` volume (the DB is the only channel between the two processes).
+#
+#   cp examples/docker-compose.env.example .env   # then fill it in
+#   docker compose up -d --build
+#
+# Required: BOT_TOKEN and SECRET_KEY (compose refuses to start without them).
+# The GUI also needs ADMIN_TOKEN or a complete OAuth configuration (OAUTH_*):
+# without either it exits at startup.
+# Entries without a value are passed through from .env / the shell only when
+# set there; every setting of the configuration table in README.md can be
+# added the same way.
+# Ports are published on 127.0.0.1 only: put a reverse proxy with TLS in front
+# of them (BIND_ADDRESS=0.0.0.0 publishes them on every interface).
+name: social-media-reuploader
+
+x-app: &app
+  build: .
+  image: ghcr.io/lucaam/social-media-reuploader:local
+  restart: unless-stopped
+  volumes:
+    - data:/app/data
+
+# Settings read by both processes (src/config.py).
+x-app-env: &app-env
+  REQUESTS_DB: /app/data/requests.db
+  LOG_LEVEL:
+  HEALTH_DEBUG:
+  WORKERS:
+  TELEGRAM_MAX_FILE_SIZE:
+  TELEGRAM_API_BASE:
+  MAX_DOWNLOAD_BYTES:
+  MAX_DURATION_SECONDS:
+  MAX_ITEMS_PER_LINK:
+  MAX_PENDING_PER_CHAT:
+  RATE_LIMITS:
+  RATE_LIMIT_MAX_DEFER_SECONDS:
+  DUPLICATE_WINDOW_SECONDS:
+  ALLOWED_PROVIDERS:
+  BLOCKED_PROVIDERS:
+  ALLOW_COLLECTION_LINKS:
+  UNSUPPORTED_LINK_REPLY:
+  UPDATES_RETENTION_DAYS:
+  REQUESTS_RETENTION_DAYS:
+
 services:
   bot:
-    build: .
-    image: ghcr.io/lucaam/social-media-reuploader:local
+    <<: *app
+    # Docker sends SIGTERM, then SIGKILL after this grace period (default 10 s).
+    # On SIGTERM the bot waits up to WORKER_SHUTDOWN_TIMEOUT (default 30 s) for
+    # running jobs, then gives cancelled jobs 15 s to put their rows back in the
+    # queue; an upload killed midway is marked failed and never resent. Keep it
+    # at least WORKER_SHUTDOWN_TIMEOUT + 45 s (raise both together).
+    stop_grace_period: 75s
     environment:
-      - BOT_TOKEN=${BOT_TOKEN}
-    restart: unless-stopped
+      <<: *app-env
+      BOT_TOKEN: ${BOT_TOKEN:?Set BOT_TOKEN (the token from @BotFather), e.g. in .env}
+      # One bot process per token: polling (default) or webhook
+      # (webhook also needs WEBHOOK_URL and a reverse proxy to port 8080).
+      MODE: ${MODE:-polling}
+      WEBHOOK_URL:
+      WEBHOOK_PATH:
+      WEBHOOK_SECRET:
+      YTDLP_COOKIES_PATH:
+      YTDLP_PROXY:
+      YTDLP_IMPERSONATE:
+      YTDLP_USER_AGENT:
+    # Cookies for sites that need a login: mount the exported cookies.txt
+    # read-only and set YTDLP_COOKIES_PATH=/run/secrets/cookies.txt in .env.
+    # volumes:
+    #   - data:/app/data
+    #   - ./cookies.txt:/run/secrets/cookies.txt:ro
     ports:
-      - "8080:8080"
+      # /health and /metrics (and the webhook endpoint in webhook mode)
+      - "${BIND_ADDRESS:-127.0.0.1}:8080:8080"
 
   gui:
-    build: .
-    image: ghcr.io/lucaam/social-media-reuploader:local
+    <<: *app
     command: uvicorn src.gui:app --host 0.0.0.0 --port 8081
     environment:
-      - ADMIN_TOKEN=${ADMIN_TOKEN}
-      - SECRET_KEY=${SECRET_KEY}
+      <<: *app-env
+      SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY to a long random string, e.g. openssl rand -hex 32}
+      # Token login (needed unless OAuth is configured)
+      ADMIN_TOKEN:
+      # auto: the session cookie is Secure when the request arrives over HTTPS
+      # (directly or from a proxy trusted through FORWARDED_ALLOW_IPS), plain
+      # otherwise; true/false force it.
+      SESSION_COOKIE_SECURE: ${SESSION_COOKIE_SECURE:-auto}
+      # Behind a reverse proxy: the address the proxy connects from (uvicorn
+      # trusts X-Forwarded-* only from it; default 127.0.0.1, i.e. nobody here),
+      # so that client IPs (login throttling, logs) and the scheme are right.
+      FORWARDED_ALLOW_IPS:
+      # Optional OAuth2 / OpenID Connect login (docs/oauth.md)
+      OAUTH_CLIENT_ID:
+      OAUTH_CLIENT_SECRET:
+      OAUTH_SERVER_METADATA_URL:
+      OAUTH_AUTHORIZE_URL:
+      OAUTH_TOKEN_URL:
+      OAUTH_USERINFO_URL:
+      OAUTH_JWKS_URI:
+      OAUTH_SCOPE:
+      OAUTH_REDIRECT_URI:
+      OAUTH_ADMIN_GROUPS:
     ports:
-      - "8081:8081"
-    volumes:
-      - data:/app/data
+      - "${BIND_ADDRESS:-127.0.0.1}:8081:8081"
+    # The image HEALTHCHECK probes $PORT (8080, the bot): check the GUI port.
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import sys, urllib.request; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8081/health', timeout=4).status == 200 else 1)"
+      interval: 30s
+      timeout: 5s
+      start_period: 20s
+      retries: 3
 
 volumes:
-  data:
-    driver: local
+  data: {}

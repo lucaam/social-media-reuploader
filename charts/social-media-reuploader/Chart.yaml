@@ -1,6 +1,18 @@
 apiVersion: v2
 name: social-media-reuploader
-description: Helm chart for Social Media Reuploader bot
+description: Telegram bot that re-posts the media behind social-network links (every site supported by yt-dlp), with an admin GUI
 type: application
-version: 0.1.15
-appVersion: "0.8.1"
+# Placeholders, never bumped by hand: the release workflow packages the chart
+# with the release version (helm package --version X.Y.Z --app-version X.Y.Z)
+# and publishes it to oci://ghcr.io/lucaam/charts/social-media-reuploader.
+# Installing from a checkout is for development only (set image.tag).
+version: 0.0.0
+appVersion: "0.0.0"
+home: https://github.com/lucaam/social-media-reuploader
+sources:
+  - https://github.com/lucaam/social-media-reuploader
+keywords:
+  - telegram
+  - bot
+  - yt-dlp
+  - video

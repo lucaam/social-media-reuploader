@@ -1,49 +1,67 @@
-Flux/Kubernetes deployment notes
+# Note di deploy (Kubernetes / Flux)
 
-- This repository ships a Helm chart in `charts/social-media-reuploader`.
-- For Flux-based deployment, create a GitRepository + HelmRelease or a Kustomization that references the chart.
-- Secrets (BOT_TOKEN, ADMIN_TOKEN, SECRET_KEY, OAUTH_CLIENT_SECRET) must NOT be committed. Use Kubernetes Secrets managed by SealedSecrets, ExternalSecrets, or SOPS.
-- Recommended steps:
-  1. Create a Git repository (e.g. GitHub) and push the `main` branch.
-  2. Configure Flux to watch the repository and apply `charts/social-media-reuploader` as a HelmRelease.
-  3. Store secrets in the cluster via sealed-secrets or ExternalSecrets and reference them from the Helm values (`values.yaml`).
-  4. Provide image repository and tag in `values.yaml` during deployment.
-  5. Expose the GUI and bot using standard Kubernetes Services/Ingress; the chart contains templates for GUI and bot deployments.
+La guida completa è in [docs/deploy.md](docs/deploy.md); qui il riassunto delle
+regole e la checklist.
 
-## Resource Profiles
+## Regole
 
-The Helm chart supports three predefined resource profiles to handle different video workloads:
+- **Una sola replica del bot** per token (`replicaCount: 1`, il chart rifiuta
+  valori maggiori). Il bot si aggiorna con la strategia `Recreate`: il vecchio
+  pod si ferma prima che parta il nuovo, quindi non ci sono mai due processi
+  che leggono gli update o scrivono il database.
+- **Database SQLite condiviso** tra bot e GUI su un PVC `ReadWriteOnce`
+  (`db.pvc`, attivo di default e conservato da `helm uninstall`). La GUI viene
+  schedulata sullo stesso nodo del bot (`podAffinity` obbligatoria su
+  `kubernetes.io/hostname`). Usa storage a blocchi o local-path, non NFS.
+- **Segreti solo nei Secret**: token del bot (`secret.name`), credenziali della
+  GUI (`gui.existingSecret` o il Secret generato dal chart). Gestiscili con
+  SealedSecrets, External Secrets o SOPS; non committare mai segreti.
+- **GUI esposta solo in HTTPS** (Ingress o Gateway API verso il Service della
+  GUI, `SESSION_COOKIE_SECURE=true`, con OAuth anche `OAUTH_REDIRECT_URI`).
+- **Webhook**: instrada verso il bot solo `WEBHOOK_PATH`, mai `/metrics`.
 
-| Profile | CPU Req | Memory Req | CPU Limit | Memory Limit | Grace Period | Use Case |
-|---------|---------|------------|-----------|--------------|--------------|----------|
-| **small** | 100m | 256Mi | 300m | 512Mi | 60s | Videos ≤50MB |
-| **medium** | 200m | 512Mi | 1000m | 1Gi | 120s | Videos ≤100MB (default) |
-| **large** | 500m | 1Gi | 2000m | 2Gi | 300s | Videos ≤500MB |
+## Profili di risorse
 
-### Usage
+| Profilo | CPU req/limit | Memoria req/limit | Ephemeral storage req/limit | `/tmp` | Grace period | Uso |
+|---|---|---|---|---|---|---|
+| `small` | 100m / 300m | 256Mi / 512Mi | 512Mi / 3Gi | 2Gi | 60 s | clip brevi |
+| `medium` (default) | 200m / 1000m | 512Mi / 1Gi | 1Gi / 5Gi | 4Gi | 180 s | video fino a ~100 MB |
+| `large` | 500m / 2000m | 1Gi / 2Gi | 2Gi / 10Gi | 8Gi | 300 s | video fino a 500 MB |
 
-Set the profile in `values.yaml`:
 ```yaml
-resourceProfile: medium  # or: small, large
-```
-
-To override with custom values:
-```yaml
+resourceProfile: large
+# oppure valori espliciti:
 resources:
-  requests:
-    cpu: 250m
-    memory: 512Mi
-  limits:
-    cpu: 1500m
-    memory: 1.5Gi
-terminationGracePeriodSeconds: 180
+  requests: {cpu: 250m, memory: 512Mi}
+  limits: {cpu: 1500m, memory: 1536Mi}
+terminationGracePeriodSeconds: 240   # WORKER_SHUTDOWN_TIMEOUT diventa 225
+tmpVolume:
+  sizeLimit: 6Gi
 ```
 
-The `terminationGracePeriodSeconds` ensures ffmpeg subprocesses complete gracefully before pod termination (critical during video recompression).
+Il grace period lascia finire download e conversioni in corso: il chart
+imposta `WORKER_SHUTDOWN_TIMEOUT` al grace period meno 15 secondi.
 
-Checklist before push:
-- Ensure `.gitignore` excludes `data/` and local artifacts.
-- Remove any local credentials from the repo (none detected in tracked files).
-- Decide remote policy: we will force-push the rewritten `main` branch when you're ready.
+## Checklist
 
-If you want, I can generate a sample Flux `HelmRelease` manifest referencing the chart and a sample `Kustomization` for your GitRepository.
+1. Secret del token: `kubectl create secret generic smr-bot --from-literal=BOT_TOKEN=...`
+   (o la sua versione sigillata/cifrata).
+2. Facoltativo: Secret della GUI con `SECRET_KEY` e `ADMIN_TOKEN` o le
+   impostazioni OAuth (altrimenti il chart genera `SECRET_KEY` e `ADMIN_TOKEN`).
+3. Facoltativo: Secret con `cookies.txt` (`ytdlpCookies.existingSecret`).
+4. Chart OCI di una release, con la versione fissata
+   (`helm upgrade --install smr oci://ghcr.io/lucaam/charts/social-media-reuploader --version X.Y.Z`):
+   installa l'immagine della stessa versione, quindi `image.tag` resta vuoto.
+   Valori: `secret.name`, `gui.existingSecret`, `env` (limiti, provider),
+   `ingress`/`gatewayApi`.
+5. Privacy mode del bot disattivata in @BotFather se lo usi nei gruppi.
+6. Verifica: `kubectl logs deploy/<release>-social-media-reuploader`,
+   `kubectl port-forward svc/<release>-social-media-reuploader 8080:80` e
+   `curl http://127.0.0.1:8080/health`.
+
+## Flux
+
+`examples/flux/` contiene `OCIRepository` e `HelmRelease` di esempio (API
+`source.toolkit.fluxcd.io/v1` e `helm.toolkit.fluxcd.io/v2`, Flux 2.8 o
+successivo) che installano il chart OCI delle release, ne verificano la firma
+cosign e prendono i segreti da Secret esistenti.

@@ -1,20 +1,8 @@
-# Files to exclude from Docker build context
-.git
-.gitignore
-venv/
-env/
-.venv/
-__pycache__/
-*.pyc
-*.pyo
-*.pyd
-dist/
-build/
-node_modules/
-data/
-*.log
-tests/
-site/
-docs/
-.vscode/
-*.md
+# Allowlist: the image needs only requirements.txt and src/ (see Dockerfile).
+# Everything else (.git, .env files, data/, tests, docs, charts, local
+# virtualenvs, caches) stays out of the build context by default.
+*
+!requirements.txt
+!src
+**/__pycache__
+**/*.py[cod]

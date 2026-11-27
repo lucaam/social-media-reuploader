@@ -1,0 +1,3 @@
+# Typical install: token in an existing Secret, everything else default.
+secret:
+  name: smr-bot

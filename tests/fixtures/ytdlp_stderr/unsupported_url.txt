@@ -1,0 +1,5 @@
+WARNING: Your yt-dlp version (2026.07.04) is older than 90 days!
+         It is strongly recommended to always use the latest version.
+         You installed yt-dlp with pip or using the wheel from PyPi; Use that to update.
+         To suppress this warning, add --no-update to your command/config.
+ERROR: Unsupported URL: https://example.com/some/page

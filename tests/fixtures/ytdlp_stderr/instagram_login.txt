@@ -1,0 +1,3 @@
+WARNING: [Instagram] C3xYz12AbCd: Main webpage is locked behind the login page. Use --cookies or --cookies-from-browser to pass cookies for the authentication.
+WARNING: [Instagram] C3xYz12AbCd: No csrf token set by Instagram API
+ERROR: [Instagram] C3xYz12AbCd: Requested content is not available, rate-limit reached or login required. Use --cookies, --cookies-from-browser, --username and --password, --netrc-cmd, or --netrc (instagram) to provide account credentials. See  https://github.com/yt-dlp/yt-dlp/wiki/FAQ#how-do-i-pass-cookies-to-yt-dlp  for how to manually pass cookies

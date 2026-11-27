@@ -1,112 +1,198 @@
+{{- $fullname := include "social-media-reuploader.fullname" . -}}
+{{- $env := .Values.env | default dict -}}
+{{- $replicas := .Values.replicaCount | int -}}
+{{- if or (lt $replicas 0) (gt $replicas 1) -}}
+{{- fail (printf "replicaCount must be 0 or 1 (got %d): the bot is the only SQLite writer and Telegram allows one consumer of updates per token" $replicas) -}}
+{{- end -}}
+{{- $mode := include "social-media-reuploader.envString" (get $env "MODE" | default "polling") | lower -}}
+{{- if not (has $mode (list "polling" "webhook")) -}}
+{{- fail (printf "env.MODE must be polling or webhook (got %q)" $mode) -}}
+{{- end -}}
+{{- if and (eq $mode "webhook") (not (get $env "WEBHOOK_URL")) -}}
+{{- fail "env.MODE=webhook needs env.WEBHOOK_URL (the public HTTPS URL routed to the bot Service)" -}}
+{{- end -}}
+{{- $tmpDir := include "social-media-reuploader.tmpDir" . -}}
+{{- if and .Values.securityContext.readOnlyRootFilesystem (not (hasPrefix "/tmp/" $tmpDir)) -}}
+{{- fail (printf "env.TMP_DIR (%s) must be under /tmp/ (the writable emptyDir) while securityContext.readOnlyRootFilesystem is true" $tmpDir) -}}
+{{- end -}}
+{{- $profile := include "social-media-reuploader.profile" . | fromYaml -}}
+{{- $grace := include "social-media-reuploader.gracePeriod" . | int64 -}}
+{{- /* Helm drops null keys, so a missing key means "not set". */ -}}
+{{- $shutdown := include "social-media-reuploader.envString" (get $env "WORKER_SHUTDOWN_TIMEOUT") -}}
+{{- if not $shutdown -}}
+{{- $shutdown = max 0 (sub $grace 15) | toString -}}
+{{- end -}}
+{{- $useCookies := .Values.ytdlpCookies.existingSecret -}}
+{{- $cookiesPath := printf "%s/%s" (.Values.ytdlpCookies.mountPath | trimSuffix "/") .Values.ytdlpCookies.key -}}
+{{- $skip := list "WORKER_SHUTDOWN_TIMEOUT" -}}
+{{- if $useCookies -}}
+{{- $skip = append $skip "YTDLP_COOKIES_PATH" -}}
+{{- end -}}
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: {{ include "social-media-reuploader.fullname" . | default "social-media-reuploader" }}
+  name: {{ $fullname }}
   labels:
-{{ include "social-media-reuploader.labels" . | nindent 4 }}
+    {{- include "social-media-reuploader.labels" . | nindent 4 }}
+    app.kubernetes.io/component: bot
 spec:
-  replicas: {{ .Values.replicaCount }}
+  # 0 or 1: one bot process per token (see values.yaml).
+  replicas: {{ $replicas }}
+  revisionHistoryLimit: 3
+  # Recreate: the old pod stops before the new one starts, so two bot
+  # processes never poll the same token or write the same SQLite file, and the
+  # ReadWriteOnce volume is released first.
+  strategy:
+    type: Recreate
   selector:
     matchLabels:
-      app.kubernetes.io/instance: {{ .Release.Name }}
-      app.kubernetes.io/component: bot
+      {{- include "social-media-reuploader.selectorLabels" (list . "bot") | nindent 6 }}
   template:
     metadata:
       labels:
-{{ include "social-media-reuploader.labels" . | nindent 8 }}
+        {{- include "social-media-reuploader.labels" . | nindent 8 }}
         app.kubernetes.io/component: bot
+        {{- with .Values.podLabels }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
+      annotations:
+        # Restart the bot when the token Secret settings change.
+        checksum/secret: {{ list .Values.secret (get $env "BOT_TOKEN") (get $env "WEBHOOK_SECRET") | toJson | sha256sum }}
+        {{- with .Values.podAnnotations }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}
     spec:
-      serviceAccountName: '{{ if .Values.serviceAccount.name }}{{ .Values.serviceAccount.name }}{{ else if .Values.serviceAccount.create }}{{ include "social-media-reuploader.fullname" . }}-sa{{ else }}{{ "" }}{{ end }}'
-      securityContext:
-        runAsNonRoot: true
-        fsGroup: 1000
-      {{- if not (hasKey .Values.resourceProfiles .Values.resourceProfile) }}
-      {{- fail (printf "unknown resourceProfile: %s" .Values.resourceProfile) }}
+      serviceAccountName: {{ include "social-media-reuploader.serviceAccountName" . }}
+      automountServiceAccountToken: {{ .Values.serviceAccount.automountServiceAccountToken }}
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
       {{- end }}
-      {{- $profile := index .Values.resourceProfiles .Values.resourceProfile }}
-      terminationGracePeriodSeconds: {{ .Values.terminationGracePeriodSeconds | default $profile.terminationGracePeriodSeconds }}
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
+      terminationGracePeriodSeconds: {{ $grace }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with include "social-media-reuploader.botAffinity" . }}
+      affinity:
+        {{- . | nindent 8 }}
+      {{- end }}
       containers:
         - name: social-media-reuploader
-          image: "{{ .Values.image.repository }}:{{ default .Chart.AppVersion .Values.image.tag }}"
+          image: {{ include "social-media-reuploader.image" . | quote }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           ports:
-            - containerPort: 8080
+            - name: http
+              containerPort: {{ .Values.containerPort | int64 }}
+              protocol: TCP
           env:
-{{- if or .Values.secret.create .Values.secret.name }}
+            - name: PORT
+              value: {{ .Values.containerPort | int64 | toString | quote }}
+            - name: REQUESTS_DB
+              value: {{ include "social-media-reuploader.dbPath" . | quote }}
+            {{- if include "social-media-reuploader.useBotSecret" . }}
             - name: BOT_TOKEN
               valueFrom:
                 secretKeyRef:
-                  name: {{ if .Values.secret.name }}{{ .Values.secret.name }}{{ else }}{{ include "social-media-reuploader.fullname" . }}-secret{{ end }}
-                  key: {{ default "BOT_TOKEN" .Values.secret.botTokenKey }}
-{{- else if .Values.env.BOT_TOKEN }}
-            - name: BOT_TOKEN
-              value: {{ .Values.env.BOT_TOKEN | quote }}
-{{- else }}
-            # No BOT_TOKEN provided. Provide a Secret (recommended) or set `env.BOT_TOKEN` when installing the chart.
-{{- end }}
-            - name: MODE
-              value: '{{ .Values.env.MODE | default "webhook" }}'
-            - name: WEBHOOK_URL
-              value: '{{ .Values.env.WEBHOOK_URL | default "" }}'
-            - name: TMP_DIR
-              value: '{{ .Values.env.TMP_DIR | default "/tmp/telegram_downloader" }}'
-            - name: TELEGRAM_MAX_FILE_SIZE
-              value: '{{ .Values.env.TELEGRAM_MAX_FILE_SIZE | default 52428800 }}'
-            - name: WORKERS
-              value: '{{ .Values.env.WORKERS | default "2" }}'
-            - name: WORKER_SHUTDOWN_TIMEOUT
-              value: '{{ .Values.terminationGracePeriodSeconds | default $profile.terminationGracePeriodSeconds | quote }}'
-            - name: HEALTH_DEBUG
-              value: '{{ .Values.env.HEALTH_DEBUG | default "false" }}'
-            - name: YTDLP_USER_AGENT
-              value: '{{ .Values.env.YTDLP_USER_AGENT | default "" }}'
-            - name: YTDLP_COOKIES_PATH
-              value: '{{ .Values.env.YTDLP_COOKIES_PATH | default "" }}'
-            - name: YTDLP_COOKIES_FROM_BROWSER
-              value: '{{ .Values.env.YTDLP_COOKIES_FROM_BROWSER | default "" }}'
-            - name: YTDLP_HEADERS
-              value: '{{ .Values.env.YTDLP_HEADERS | default "" }}'
-            {{- if .Values.db.pvc.enabled }}
-            - name: REQUESTS_DB
-              value: '{{ .Values.db.pvc.mountPath | default "/app/data" }}/requests.db'
+                  name: {{ include "social-media-reuploader.botSecretName" . }}
+                  key: {{ .Values.secret.botTokenKey | default "BOT_TOKEN" }}
+            - name: WEBHOOK_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "social-media-reuploader.botSecretName" . }}
+                  key: {{ .Values.secret.webhookSecretKey | default "WEBHOOK_SECRET" }}
+                  optional: true
             {{- end }}
-          {{- if .Values.db.pvc.enabled }}
-          volumeMounts:
-            - name: data
-              mountPath: {{ .Values.db.pvc.mountPath | default "/app/data" }}
+            # Let running jobs finish within the pod grace period.
+            - name: WORKER_SHUTDOWN_TIMEOUT
+              value: {{ $shutdown | quote }}
+            {{- if $useCookies }}
+            - name: YTDLP_COOKIES_PATH
+              value: {{ $cookiesPath | quote }}
+            {{- end }}
+            {{- with include "social-media-reuploader.renderEnv" (dict "values" $env "source" "env" "target" "bot" "skip" $skip) }}
+            {{- . | nindent 12 }}
+            {{- end }}
+            {{- with .Values.extraEnv }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          {{- with .Values.extraEnvFrom }}
+          envFrom:
+            {{- toYaml . | nindent 12 }}
           {{- end }}
           securityContext:
-            runAsUser: 1000
-            runAsNonRoot: true
-            allowPrivilegeEscalation: false
+            {{- toYaml .Values.securityContext | nindent 12 }}
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            {{- with .Values.probes.startup }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
           livenessProbe:
             httpGet:
               path: /health
-              port: 8080
-            initialDelaySeconds: 60
-            periodSeconds: 10
-            timeoutSeconds: 5
-            failureThreshold: 5
+              port: http
+            {{- with .Values.probes.liveness }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          # /ready checks the DB, the worker heartbeat and that updates are
+          # being received; /health (liveness) only checks the process.
           readinessProbe:
             httpGet:
-              path: /health
-              port: 8080
-            initialDelaySeconds: 10
-            periodSeconds: 10
-            timeoutSeconds: 3
-            failureThreshold: 5
-          {{- if .Values.resources }}
-          resources: {{ toYaml .Values.resources | nindent 12 }}
-          {{- else }}
-          {{- if not (hasKey .Values.resourceProfiles .Values.resourceProfile) }}
-          {{- fail (printf "unknown resourceProfile: %s" .Values.resourceProfile) }}
-          {{- end }}
-          {{- $profile := index .Values.resourceProfiles .Values.resourceProfile }}
-          resources: {{ toYaml (dict "requests" $profile.requests "limits" $profile.limits) | nindent 12 }}
-          {{- end }}
-      {{- if .Values.db.pvc.enabled }}
+              path: /ready
+              port: http
+            {{- with .Values.probes.readiness }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
+          resources:
+            {{- if .Values.resources }}
+            {{- toYaml .Values.resources | nindent 12 }}
+            {{- else }}
+            {{- toYaml (dict "requests" $profile.requests "limits" $profile.limits) | nindent 12 }}
+            {{- end }}
+          volumeMounts:
+            - name: data
+              mountPath: {{ .Values.db.pvc.mountPath | default "/app/data" }}
+            - name: tmp
+              mountPath: /tmp
+            {{- if $useCookies }}
+            - name: ytdlp-cookies
+              mountPath: {{ .Values.ytdlpCookies.mountPath }}
+              readOnly: true
+            {{- end }}
+            {{- with .Values.extraVolumeMounts }}
+            {{- toYaml . | nindent 12 }}
+            {{- end }}
       volumes:
         - name: data
+          {{- if .Values.db.pvc.enabled }}
           persistentVolumeClaim:
-            claimName: {{ include "social-media-reuploader.fullname" . }}-data
-      {{- end }}
+            claimName: {{ include "social-media-reuploader.dbClaimName" . }}
+          {{- else }}
+          emptyDir: {}
+          {{- end }}
+        - name: tmp
+          emptyDir:
+            sizeLimit: {{ .Values.tmpVolume.sizeLimit | default $profile.tmpSizeLimit | default "4Gi" }}
+            {{- with .Values.tmpVolume.medium }}
+            medium: {{ . }}
+            {{- end }}
+        {{- if $useCookies }}
+        - name: ytdlp-cookies
+          secret:
+            secretName: {{ .Values.ytdlpCookies.existingSecret }}
+            defaultMode: 0440
+            items:
+              - key: {{ .Values.ytdlpCookies.key }}
+                path: {{ .Values.ytdlpCookies.key }}
+        {{- end }}
+        {{- with .Values.extraVolumes }}
+        {{- toYaml . | nindent 8 }}
+        {{- end }}

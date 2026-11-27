@@ -1,6 +1,107 @@
 {
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "description": [
+    "Every merge to main is released by .github/workflows/release.yml according to its Conventional Commit type:",
+    "fix(deps) for the runtime dependencies of the image (requirements.txt, the Dockerfile base image) releases a patch;",
+    "chore(deps) / ci(deps) for the tooling release nothing."
+  ],
   "extends": [
-    "config:recommended"
+    "config:recommended",
+    ":semanticCommits",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "timezone": "Europe/Rome",
+  "ignoreDeps": ["ghcr.io/lucaam/social-media-reuploader"],
+  "pre-commit": {
+    "enabled": true
+  },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Tool versions in the workflows, after a `# renovate: datasource=... depName=...` comment",
+      "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>\\S+) depName=(?<depName>\\S+)(?: extractVersion=(?<extractVersion>\\S+))?\\s+[A-Z0-9_]+: [\"']?(?<currentValue>[^\"'\\s]+)"
+      ]
+    },
+    {
+      "customType": "regex",
+      "description": "Build images of the workflows pinned by digest (BuildKit, its SBOM generator), after a `# renovate: datasource=docker` comment",
+      "managerFilePatterns": ["/^\\.github/workflows/[^/]+\\.ya?ml$/"],
+      "matchStrings": [
+        "# renovate: datasource=docker\\s+[A-Z0-9_]+: (?<depName>[^:\\s]+):(?<currentValue>[^@\\s]+)@(?<currentDigest>sha256:[a-f0-9]{64})"
+      ],
+      "datasourceTemplate": "docker"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "Tooling by default: chore(deps), no release",
+      "matchPackageNames": ["*"],
+      "semanticCommitType": "chore",
+      "semanticCommitScope": "deps"
+    },
+    {
+      "description": "Runtime dependencies of the image: fix(deps), merging one releases a patch with a new image",
+      "matchFileNames": ["requirements.txt", "Dockerfile"],
+      "semanticCommitType": "fix"
+    },
+    {
+      "description": "GitHub Actions and the tool versions of the workflows: ci(deps), no release",
+      "matchFileNames": [".github/workflows/**"],
+      "semanticCommitType": "ci"
+    },
+    {
+      "description": "Runtime dependencies except yt-dlp: one weekly pull request for the minor and patch updates",
+      "matchFileNames": ["requirements.txt"],
+      "matchPackageNames": ["!yt-dlp"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "runtime dependencies",
+      "schedule": ["* 0-5 * * 1"]
+    },
+    {
+      "description": "Base image digest (Debian and Python security fixes): weekly",
+      "matchManagers": ["dockerfile"],
+      "matchUpdateTypes": ["digest"],
+      "groupName": "base image",
+      "schedule": ["* 0-5 * * 1"]
+    },
+    {
+      "description": "Dev tools (requirements-dev.txt, pre-commit hooks, commitlint): one weekly pull request",
+      "matchFileNames": ["requirements-dev.txt", ".pre-commit-config.yaml", "package.json"],
+      "matchUpdateTypes": ["minor", "patch", "digest"],
+      "groupName": "dev tools",
+      "schedule": ["* 0-5 * * 1"]
+    },
+    {
+      "description": "ruff, black and isort are pinned twice (requirements-dev.txt and .pre-commit-config.yaml): always updated together",
+      "matchPackageNames": [
+        "ruff",
+        "astral-sh/ruff-pre-commit",
+        "black",
+        "psf/black-pre-commit-mirror",
+        "isort",
+        "PyCQA/isort"
+      ],
+      "groupName": "python linters",
+      "schedule": ["* 0-5 * * 1"]
+    },
+    {
+      "description": "GitHub Actions and CI tools: one weekly pull request for the non-major updates",
+      "matchFileNames": [".github/workflows/**"],
+      "matchUpdateTypes": ["minor", "patch", "digest"],
+      "groupName": "CI",
+      "schedule": ["* 0-5 * * 1"]
+    },
+    {
+      "description": "yt-dlp: sites break often and its fixes must ship without a human. Automerged (squash) once the required checks pass, which releases a patch. Its versions are dates (CalVer): the first release of a year is a 'major' update for Renovate, merged like the others",
+      "matchPackageNames": ["yt-dlp"],
+      "matchUpdateTypes": ["major", "minor", "patch"],
+      "automerge": true,
+      "automergeType": "pr",
+      "automergeStrategy": "squash",
+      "minimumReleaseAge": "6 hours",
+      "prPriority": 10
+    }
   ]
 }

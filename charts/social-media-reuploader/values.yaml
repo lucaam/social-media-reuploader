@@ -1,74 +1,447 @@
+# Default values for social-media-reuploader.
+#
+# Two workloads share one SQLite database (the only channel between them):
+#   - the bot Deployment (python -m src.bot): polling or webhook, /health and
+#     /metrics on `containerPort`;
+#   - the admin GUI Deployment (uvicorn src.gui:app) on `gui.port`.
+# The DB lives on a ReadWriteOnce PVC, so the GUI is scheduled on the same node
+# as the bot (required podAffinity) and the bot is updated with the Recreate
+# strategy.
+
+# -- Bot replicas: 0 or 1, never more. The bot is the single queue worker and
+# SQLite writer, and Telegram allows only one getUpdates consumer per token: a
+# second replica would process updates twice. 0 stops the bot (the GUI then
+# stays Pending, because it must run next to the bot).
 replicaCount: 1
 
-# Optional overrides
 nameOverride: ""
 fullnameOverride: ""
 
-serviceAccount:
-  # If true, create a ServiceAccount for the deployment. If false, set `serviceAccount.name`
-  create: true
-  # Optional: provide an existing ServiceAccount name to use instead of creating one
-  name: ""
-
 image:
   repository: ghcr.io/lucaam/social-media-reuploader
-  tag: "0.8.1"
+  # Empty: the chart appVersion, i.e. the image of the same release as the
+  # chart. Set it only to run another release (or with a chart installed from
+  # a checkout, whose appVersion 0.0.0 has no image).
+  tag: ""
   pullPolicy: IfNotPresent
 
-# Optional imagePullSecrets for private registries
 imagePullSecrets: []
 
+serviceAccount:
+  # Create a ServiceAccount; otherwise use `serviceAccount.name` (or "default").
+  create: true
+  name: ""
+  annotations: {}
+  # The app never calls the Kubernetes API.
+  automountServiceAccountToken: false
+
+podAnnotations: {}
+podLabels: {}
+
+# Pod security context (bot and GUI). uid/gid 1000 is the image's `appuser`.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  runAsGroup: 1000
+  fsGroup: 1000
+  fsGroupChangePolicy: OnRootMismatch
+  seccompProfile:
+    type: RuntimeDefault
+
+# Container security context (bot and GUI). With a read-only root filesystem
+# the writable paths are the data volume (`db.pvc.mountPath`) and the /tmp
+# emptyDir (TMP_DIR, deno and yt-dlp caches).
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+
+# HTTP port of the bot container (rendered as PORT): /health, /metrics and, in
+# webhook mode, WEBHOOK_PATH.
+containerPort: 8080
+
+# Bot Service: scraping /metrics and, in webhook mode, the target of the
+# webhook route (see `ingress` / `gatewayApi`).
 service:
   type: ClusterIP
   port: 80
+  annotations: {}
 
-ingress:
-  enabled: false
-  hosts:
-    - host: chart-example.local
-      paths: ["/"]
-  tls: []
+# Bot probes (HTTP GET /health on the container port).
+probes:
+  startup:
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 24
+  liveness:
+    periodSeconds: 20
+    timeoutSeconds: 5
+    failureThreshold: 3
+  # /ready: DB reachable (3 s internal timeout), fresh worker heartbeat and
+  # updates being received.
+  readiness:
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3
 
-# Resource profiles for different video workloads
-# Choose: small, medium, large, or custom
+# Resource profile of the bot: small, medium or large (or set `resources`).
+# tmpSizeLimit is the size limit of the /tmp emptyDir that holds the
+# downloads and conversions (MAX_DOWNLOAD_BYTES x WORKERS, plus headroom).
 resourceProfile: medium
 
-# Predefined resource profiles
 resourceProfiles:
   small:
-    # For videos ≤50MB (light processing)
+    # Short clips (<= 50 MB), light conversions.
     requests:
       cpu: 100m
       memory: 256Mi
+      ephemeral-storage: 512Mi
     limits:
       cpu: 300m
       memory: 512Mi
+      ephemeral-storage: 3Gi
     terminationGracePeriodSeconds: 60
+    tmpSizeLimit: 2Gi
 
   medium:
-    # For videos ≤100MB (standard processing + recompress)
+    # Videos up to ~100 MB, conversion/compression to fit 50 MB.
     requests:
       cpu: 200m
       memory: 512Mi
+      ephemeral-storage: 1Gi
     limits:
       cpu: 1000m
       memory: 1Gi
+      ephemeral-storage: 5Gi
     terminationGracePeriodSeconds: 180
+    tmpSizeLimit: 4Gi
 
   large:
-    # For videos ≤500MB (heavy processing, multiple compress attempts)
+    # Videos up to MAX_DOWNLOAD_BYTES (500 MB), heavy compression.
     requests:
       cpu: 500m
       memory: 1Gi
+      ephemeral-storage: 2Gi
     limits:
       cpu: 2000m
       memory: 2Gi
+      ephemeral-storage: 10Gi
     terminationGracePeriodSeconds: 300
+    tmpSizeLimit: 8Gi
 
-# Override resourceProfile by setting resources directly
-resources: null
+# Explicit bot resources (requests/limits); overrides the profile when set.
+resources: {}
+# Overrides the profile grace period. WORKER_SHUTDOWN_TIMEOUT defaults to this
+# value minus 15 seconds, so running jobs can finish before the pod is killed.
+terminationGracePeriodSeconds: null
 
-# GUI Resources (separate from bot processing)
+# emptyDir mounted on /tmp in the bot pod: TMP_DIR (must stay under /tmp when
+# the root filesystem is read-only), deno and yt-dlp caches.
+tmpVolume:
+  # Defaults to the profile tmpSizeLimit.
+  sizeLimit: ""
+  # "Memory" makes it a tmpfs (counted against the memory limit).
+  medium: ""
+
+# Bot token (and optional webhook secret) Secret.
+secret:
+  # Reference an existing Secret (recommended), e.g.
+  #   kubectl create secret generic smr-bot --from-literal=BOT_TOKEN='123:abc'
+  name: ""
+  botTokenKey: BOT_TOKEN
+  # Optional key of the same Secret with the webhook secret token (webhook
+  # mode). When missing, the bot derives a stable one from the bot token.
+  webhookSecretKey: WEBHOOK_SECRET
+  # Or let the chart create the Secret from these values
+  # (`--set-string secret.botToken=...`; Helm keeps them in its release data).
+  # A token here implies create=true unless `secret.name` is set.
+  create: false
+  botToken: ""
+  webhookSecret: ""
+
+# Application settings (src/config.py), rendered as environment variables of
+# the bot AND of the GUI (so both see the same configuration). Every key is
+# optional: `null` means "use the application default" (shown in the
+# comment). Numbers, booleans and lists are rendered as strings ("52428800",
+# "true", "a,b"). Not allowed here: PORT (`containerPort`), REQUESTS_DB
+# (`db`), BOT_TOKEN / WEBHOOK_SECRET (`secret`), ADMIN_TOKEN / SECRET_KEY /
+# OAUTH_CLIENT_SECRET (`gui.secrets`). Full reference: README.md.
+env:
+  # --- Core / Telegram -------------------------------------------------------
+  # polling (default) or webhook. Webhook needs WEBHOOK_URL and a route from
+  # the public URL to the bot Service (ingress/gatewayApi paths with
+  # `service: bot`).
+  MODE: polling
+  # Public HTTPS URL Telegram posts updates to, e.g.
+  # https://bot.example.com/webhook (webhook mode only).
+  WEBHOOK_URL: null
+  # Path served by the bot for webhook updates (default /webhook).
+  WEBHOOK_PATH: null
+  # Bind address of the bot HTTP server (default 0.0.0.0).
+  HOST: null
+  # Parallel download/processing jobs (1-32).
+  WORKERS: 2
+  # Upload limit in bytes: 50 MB with the cloud Bot API; raise it only with a
+  # local Bot API server (TELEGRAM_API_BASE).
+  TELEGRAM_MAX_FILE_SIZE: 52428800
+  # Max size Telegram fetches by URL server-side (default 20971520 = 20 MB).
+  TELEGRAM_URL_FETCH_MAX_SIZE: null
+  # Let Telegram fetch small progressive files by URL first (default true).
+  TELEGRAM_SERVER_FETCH: null
+  # Bot API timeouts in seconds (defaults 60 and 300) and retries (default 3).
+  TELEGRAM_API_TIMEOUT: null
+  TELEGRAM_UPLOAD_TIMEOUT: null
+  TELEGRAM_MAX_RETRIES: null
+  # Seconds reactions stay disabled in a chat after Telegram refuses them
+  # (default 300).
+  REACTION_DISABLE_SECONDS: null
+  # Base URL of a local Bot API server (uploads up to 2 GB).
+  TELEGRAM_API_BASE: null
+
+  # --- Logging / health ------------------------------------------------------
+  # DEBUG, INFO, WARNING, ERROR or CRITICAL.
+  LOG_LEVEL: INFO
+  # File logging (default false) to LOG_FILE (default data/telegram_downloader.log,
+  # i.e. on the data volume), rotated at LOG_MAX_BYTES (5 MB) x LOG_BACKUP_COUNT (5).
+  LOG_TO_FILE: null
+  LOG_FILE: null
+  LOG_MAX_BYTES: null
+  LOG_BACKUP_COUNT: null
+  # Diagnostic details on /health (keep false in production).
+  HEALTH_DEBUG: false
+
+  # --- Download (yt-dlp) -----------------------------------------------------
+  # Work directory for downloads and conversions (on the /tmp emptyDir).
+  TMP_DIR: /tmp/telegram_downloader
+  # Keep work directories after each request (debugging, default false).
+  KEEP_DOWNLOADED_FILES: null
+  # Upload the yt-dlp output as-is, no conversion (debugging, default false).
+  SIMPLE_YTDLP_ONLY: null
+  # Timeouts in seconds: metadata extraction (60), download per item (300).
+  EXTRACT_TIMEOUT: null
+  DOWNLOAD_TIMEOUT: null
+  # Hard cap for a raw download before compression (default 524288000 = 500 MB).
+  MAX_DOWNLOAD_BYTES: null
+  # Refuse media longer than this (default 3600 s; 0 = no limit).
+  MAX_DURATION_SECONDS: null
+  # Max media posted for a multi-item post / album (default 10, max 10).
+  MAX_ITEMS_PER_LINK: null
+  # yt-dlp format selection overrides (-f / -S).
+  YTDLP_FORMAT: null
+  YTDLP_FORMAT_SORT: null
+  YTDLP_USER_AGENT: null
+  # cookies.txt path; set automatically when `ytdlpCookies.existingSecret` is used.
+  YTDLP_COOKIES_PATH: null
+  # Needs a browser profile inside the container: prefer YTDLP_COOKIES_PATH.
+  YTDLP_COOKIES_FROM_BROWSER: null
+  # Extra headers, 'Header: Value|Other: Value'.
+  YTDLP_HEADERS: null
+  # --impersonate target (e.g. chrome) and --proxy (e.g. socks5://host:1080).
+  YTDLP_IMPERSONATE: null
+  YTDLP_PROXY: null
+
+  # --- Providers -------------------------------------------------------------
+  # Every site supported by yt-dlp is accepted unless restricted here.
+  # yt-dlp extractor names (youtube, tiktok, instagram, twitter, reddit, ...)
+  # or domains (vimeo.com); a YAML list or a comma-separated string.
+  ALLOWED_PROVIDERS: null
+  BLOCKED_PROVIDERS: null
+  # Accept profile/channel/playlist links (default false: one link = one post).
+  ALLOW_COLLECTION_LINKS: null
+  # Reply to links the bot cannot handle: private (default), always, never.
+  UNSUPPORTED_LINK_REPLY: private
+  # Links of one message that are checked and queued (default 10, max 50).
+  MAX_LINKS_PER_MESSAGE: null
+
+  # --- Media processing (ffmpeg) ----------------------------------------------
+  # Thumbnails for videos (default true).
+  WORKER_GENERATE_THUMBNAIL: null
+  # x264 preset (veryfast; ultrafast, superfast, faster, fast, medium, slow,
+  # slower, veryslow, placebo), conversion timeout (900 s), parallel
+  # conversions (1, max 8), longest side when downscaling is needed (1280 px).
+  TRANSCODE_PRESET: null
+  TRANSCODE_TIMEOUT: null
+  TRANSCODE_CONCURRENCY: null
+  TRANSCODE_MAX_SIDE: null
+
+  # --- Queue, rate limits, duplicates ------------------------------------------
+  # Queued + running requests per chat; further links are refused (only them).
+  MAX_PENDING_PER_CHAT: 3
+  # Per-chat sliding windows "<max>/<window>" (window in s, or with m/h/d).
+  # An empty string disables rate limiting.
+  RATE_LIMITS: "1/10,3/60,5/3600,20/30d"
+  # Links whose next free slot is at most this far away are queued and
+  # processed automatically later; farther ones are refused with a hint.
+  RATE_LIMIT_MAX_DEFER_SECONDS: 120
+  # Same chat + same link within this window is a duplicate (90 minutes).
+  DUPLICATE_WINDOW_SECONDS: 5400
+  # Min seconds between two rate-limit (60) / duplicate (600) notices per chat.
+  NOTIFY_RATE_THROTTLE_SECONDS: null
+  NOTIFY_DUPLICATE_THROTTLE_SECONDS: null
+  # On start, resume requests left queued (true) or mark them aborted (false).
+  WORKER_REHYDRATE_ON_START: true
+  # How often the worker polls the DB queue (default 2 s; legacy name
+  # WORKER_PERIODIC_REHYDRATE_SECONDS) and writes its heartbeat (default 5 s).
+  WORKER_POLL_SECONDS: null
+  WORKER_HEARTBEAT_SECONDS: null
+  # Seconds to let running jobs finish on shutdown before cancelling them.
+  # Default: terminationGracePeriodSeconds - 15.
+  WORKER_SHUTDOWN_TIMEOUT: null
+  # Max attempts of a request (default 3). Every run counts, also one cut short
+  # by a shutdown; then temporary errors are no longer retried and a run cut
+  # short by a crash is marked failed at the next start.
+  WORKER_MAX_ATTEMPTS: null
+  # Base of the exponential backoff for retryable failures (default 30 s).
+  WORKER_RETRY_BACKOFF_SECONDS: null
+
+  # --- Retention ------------------------------------------------------------
+  # Days of event log (default 14) / finished requests (default 0 = keep).
+  UPDATES_RETENTION_DAYS: null
+  REQUESTS_RETENTION_DAYS: null
+  # With KEEP_DOWNLOADED_FILES, hours after which work directories are still
+  # swept from TMP_DIR (default 24).
+  TMP_RETENTION_HOURS: null
+
+  # --- Admin GUI --------------------------------------------------------------
+  # How often the GUI tails the DB event log (default 1 s).
+  GUI_DB_POLL_SECONDS: null
+  # "Unlimit + requeue" only requeues refusals younger than this (default 86400 s).
+  GUI_REQUEUE_MAX_AGE_SECONDS: null
+
+# Extra bot environment entries (full EnvVar objects, e.g. valueFrom).
+extraEnv: []
+# Extra bot envFrom sources, e.g. [{secretRef: {name: proxy-credentials}}].
+extraEnvFrom: []
+# Extra volumes / mounts of the bot pod.
+extraVolumes: []
+extraVolumeMounts: []
+
+# cookies.txt for sites that need a login (Instagram, Facebook, ...): name of
+# an existing Secret holding the file under `key`. It is mounted read-only and
+# YTDLP_COOKIES_PATH is set to it (yt-dlp works on a private copy).
+#   kubectl create secret generic smr-cookies --from-file=cookies.txt
+ytdlpCookies:
+  existingSecret: ""
+  key: cookies.txt
+  mountPath: /etc/social-media-reuploader/cookies
+
+nodeSelector: {}
+tolerations: []
+# Custom affinity for the bot. When empty and the GUI is enabled, the bot
+# prefers the node of the GUI (keeps the ReadWriteOnce volume attachable).
+affinity: {}
+
+# SQLite database shared by bot and GUI (REQUESTS_DB = mountPath/fileName).
+db:
+  fileName: requests.db
+  pvc:
+    # Persistent volume for the DB. Required when the GUI is enabled. When
+    # disabled the DB lives in an emptyDir and is lost with the pod.
+    enabled: true
+    # Use an existing claim instead of creating "<fullname>-data".
+    existingClaim: ""
+    # Empty: cluster default StorageClass; "-": no StorageClass ("").
+    storageClass: ""
+    # SQLite needs a local (block) volume: keep ReadWriteOnce, no NFS.
+    accessModes:
+      - ReadWriteOnce
+    size: 1Gi
+    mountPath: /app/data
+    # Keep the DB when the release is uninstalled.
+    annotations:
+      helm.sh/resource-policy: keep
+
+# Admin GUI (FastAPI).
+gui:
+  enabled: true
+  # Same image as the bot unless overridden.
+  image:
+    repository: ""
+    tag: ""
+    pullPolicy: ""
+  port: 8081
+  # Trust X-Forwarded-* headers from these addresses (uvicorn
+  # --forwarded-allow-ips), so the GUI sees the real scheme/host/client behind
+  # the ingress. "*" is fine while the Service is only reachable inside the
+  # cluster; narrow it to the ingress controller addresses otherwise.
+  forwardedAllowIps: "*"
+  # Extra uvicorn arguments, e.g. ["--log-level", "warning"].
+  extraArgs: []
+  # Full command override (replaces the uvicorn invocation; legacy).
+  command: []
+  args: []
+  # Schedule the GUI on the node running the bot (required podAffinity on
+  # kubernetes.io/hostname): both pods mount the same ReadWriteOnce volume.
+  colocateWithBot: true
+  terminationGracePeriodSeconds: 30
+  # Existing Secret with the GUI credentials (keys: SECRET_KEY, ADMIN_TOKEN,
+  # OAUTH_CLIENT_ID, OAUTH_CLIENT_SECRET, ...), loaded with envFrom. When empty
+  # the chart creates "<fullname>-gui-secret" from `gui.secrets`, generating
+  # SECRET_KEY and (without OAuth) ADMIN_TOKEN, kept stable across upgrades:
+  #   kubectl get secret <fullname>-gui-secret -o jsonpath='{.data.ADMIN_TOKEN}' | base64 -d
+  # With `helm template` based GitOps tools (Argo CD) set them explicitly or use
+  # an existing Secret, or they change at every render.
+  existingSecret: ""
+  # Legacy name of `existingSecret`.
+  secretName: ""
+  # Legacy switch: GUI credentials are always read from a Secret now.
+  useSecret: true
+  secrets:
+    # Token login for admins.
+    adminToken: ""
+    # Session cookie signing key (>= 32 random characters).
+    secretKey: ""
+    # OAuth2 / OpenID Connect login (docs/oauth.md). With an OpenID provider
+    # prefer oauthServerMetadataUrl (discovery) over the explicit endpoints.
+    oauthClientId: ""
+    oauthClientSecret: ""
+    oauthServerMetadataUrl: ""
+    oauthAuthorizeUrl: ""
+    oauthTokenUrl: ""
+    oauthUserinfoUrl: ""
+    oauthJwksUri: ""
+    oauthScope: ""
+    # Public callback URL, e.g. https://admin.example.com/auth (recommended
+    # behind an ingress).
+    oauthRedirectUri: ""
+    # Comma-separated IdP groups that are GUI admins.
+    oauthAdminGroups: ""
+  # Extra GUI environment variables (not secrets), e.g.
+  #   SESSION_COOKIE_SECURE: true    # default auto: Secure on HTTPS (proxy trusted via forwardedAllowIps)
+  #   SESSION_MAX_AGE_SECONDS: 43200 # session lifetime (default 12 h)
+  #   GUI_TRUSTED_ORIGINS: https://admin.example.com  # proxy rewrites Host
+  #   OAUTH_ISSUER: https://idp.example.com          # without discovery
+  #   OAUTH_TIMEOUT_SECONDS: 10
+  #   OAUTH_ADMIN_GROUPS: admins
+  env: {}
+  extraEnv: []
+  extraEnvFrom: []
+  extraVolumes: []
+  extraVolumeMounts: []
+  podAnnotations: {}
+  nodeSelector: {}
+  # Defaults to the bot tolerations (the GUI runs on the bot's node).
+  tolerations: []
+  # Custom affinity (replaces the generated co-location with the bot).
+  affinity: {}
+  # Size limit of the GUI /tmp emptyDir.
+  tmpSizeLimit: 256Mi
+  probes:
+    startup:
+      periodSeconds: 5
+      timeoutSeconds: 3
+      failureThreshold: 12
+    liveness:
+      periodSeconds: 20
+      timeoutSeconds: 5
+      failureThreshold: 3
+    readiness:
+      periodSeconds: 10
+      timeoutSeconds: 3
+      failureThreshold: 3
+
+# GUI resources.
 guiResources:
   requests:
     cpu: 50m
@@ -76,120 +449,47 @@ guiResources:
   limits:
     cpu: 200m
     memory: 256Mi
-terminationGracePeriodSeconds: null
 
-# Secret handling: create or reference an existing Secret for the bot token
-secret:
-  # If true, chart will create a Secret containing the bot token
-  create: false
-  # If set, use this existing Secret name instead of creating one
-  name: ""
-  # key name to store the bot token under (defaults to BOT_TOKEN)
-  botTokenKey: BOT_TOKEN
+# Ingress: exposes the GUI. In webhook mode add a path for WEBHOOK_PATH with
+# `service: bot` (never route /metrics publicly).
+ingress:
+  enabled: false
+  className: ""
+  annotations: {}
+  hosts:
+    - host: chart-example.local
+      paths:
+        - path: /
+          pathType: Prefix
+          # gui (default) or bot
+          service: gui
+        # - path: /webhook
+        #   pathType: Prefix
+        #   service: bot
+  tls: []
+  #  - secretName: chart-example-tls
+  #    hosts:
+  #      - chart-example.local
 
-env:
-  # Do NOT place production secrets (BOT_TOKEN) directly in values.yaml.
-  # Recommended: create a Kubernetes Secret and reference it via `secret.name`.
-  # Example (manual):
-  #   kubectl create secret generic <release>-secret --from-literal=BOT_TOKEN='<your-token>'
-  # Or during helm install (not recommended to store token in values file):
-  #   helm install my-release . --set secret.create=true --set env.BOT_TOKEN='<your-token>'
-
-  # If you want to set a token via values for testing, use `env.BOT_TOKEN` when calling helm.
-  # BOT_TOKEN: ""  # <- prefer using a Secret instead of setting this here
-
-  MODE: webhook
-  WEBHOOK_URL: ""
-  TMP_DIR: /tmp/telegram_downloader
-  TELEGRAM_MAX_FILE_SIZE: 52428800
-  WORKERS: 2
-  # If true, /health endpoints return diagnostic JSON (worker counts, DB status).
-  # Keep false in production since kube probes call /health frequently.
-  HEALTH_DEBUG: false
-
-  # Worker rehydrate settings
-  # When true, the worker will rehydrate persisted queued requests on startup.
-  WORKER_REHYDRATE_ON_START: true
-  # Periodic interval (seconds) used by the worker to poll the DB for
-  # persisted queued items when GUI/operator requeues items. Set to 0 to
-  # disable periodic rehydrate. Default: 10s (responsive without spamming logs).
-  WORKER_PERIODIC_REHYDRATE_SECONDS: 10.0
-  # When true, the GUI will attempt to trigger an immediate rehydrate on
-  # unlimit operations when the worker runs in the same process.
-  WORKER_REHYDRATE_ON_UNLIMIT: "true"
-
-  # yt-dlp helper options (for sites requiring impersonation/cookies)
-  # Set to a browser-like user-agent string when necessary.
-  YTDLP_USER_AGENT: ""
-  # Path inside the pod to a cookies.txt file (mount as Secret/volume)
-  YTDLP_COOKIES_PATH: ""
-  # Alternatively, use cookies-from-browser (e.g. chrome, firefox)
-  YTDLP_COOKIES_FROM_BROWSER: ""
-  # Additional headers to pass to yt-dlp. Use '|' to separate entries:
-  # e.g. 'Referer: https://www.tiktok.com/|X-Requested-With: XMLHttpRequest'
-  YTDLP_HEADERS: ""
-
-  # Optional: comma-separated list of OAuth group names that should be
-  # considered admins by the GUI (e.g. "authentik Admins,admins").
-  # Can be set via values or injected through the GUI secret.
-  OAUTH_ADMIN_GROUPS: ""
-
-# GUI (FastAPI) settings
-gui:
-  enabled: true
-  # by default use the same image as the main app; override to a separate image if needed
-  image:
-    repository: ghcr.io/lucaam/social-media-reuploader
-    tag: "0.8.1"
-    pullPolicy: IfNotPresent
-  port: 8081
-  # Command to run in the GUI container. By default run the FastAPI app with uvicorn
-  # This prevents the GUI pod from accidentally running the bot (default image CMD)
-  command:
-    - "uvicorn"
-    - "src.gui:app"
-    - "--host"
-    - "0.0.0.0"
-    - "--port"
-    - "8081"
-  # if true, create a Kubernetes Secret and mount it into the GUI pod
-  useSecret: false
-  # custom secret name (optional). If empty, chart will use "<fullname>-gui-secret"
-  secretName: ""
-  # GUI secret values (only used if useSecret=true)
-  secrets:
-    adminToken: ""
-    secretKey: ""
-    oauthClientId: ""
-    oauthClientSecret: ""
-    oauthAuthorizeUrl: ""
-    oauthTokenUrl: ""
-    oauthUserinfoUrl: ""
-    oauthJwksUri: ""
-    oauthServerMetadataUrl: ""
-    # Comma-separated group names that should be treated as admin
-    oauthAdminGroups: ""
-  # Additional environment variables for the GUI container.
-  # Use `gui.env.OAUTH_ADMIN_GROUPS` to set admin groups without creating a Secret.
-  # WARNING: `gui.env` is rendered verbatim into the Pod spec. Do NOT place
-  # sensitive values (secrets, OAuth client secrets, BOT_TOKEN, SECRET_KEY)
-  # here — use `gui.secrets` or a Kubernetes Secret instead to avoid leaking
-  # credentials in plaintext.
-  env: {}
-
-# Database / persistence for GUI
-db:
-  pvc:
-    enabled: false
-    storageClass: ""
-    size: 1Gi
-    mountPath: /app/data
-
-# Gateway API (HTTPRoute) support
+# Gateway API HTTPRoute (gateway.networking.k8s.io/v1): exposes the GUI, and
+# the webhook path in webhook mode.
 gatewayApi:
   enabled: false
   gatewayName: ""
+  gatewayNamespace: ""
+  sectionName: ""
   hosts: []
-  # path and service port to route to
-  path: "/"
-  servicePort: 80
+  paths:
+    - path: /
+      # gui (default) or bot
+      service: gui
+    # - path: /webhook
+    #   service: bot
+
+# Prometheus Operator ServiceMonitor scraping the bot's /metrics.
+metrics:
+  serviceMonitor:
+    enabled: false
+    interval: 30s
+    scrapeTimeout: 10s
+    labels: {}

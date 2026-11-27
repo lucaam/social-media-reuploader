@@ -1,0 +1,41 @@
+suite: GUI Service
+templates:
+  - templates/gui-service.yaml
+release:
+  name: smr
+  namespace: bots
+tests:
+  - it: exposes the GUI on gui.port
+    asserts:
+      - isKind:
+          of: Service
+      - equal:
+          path: metadata.name
+          value: smr-social-media-reuploader-gui
+      - equal:
+          path: spec.ports
+          value:
+            - name: http
+              port: 8081
+              targetPort: http
+              protocol: TCP
+      - equal:
+          path: spec.selector
+          value:
+            app.kubernetes.io/instance: smr
+            app.kubernetes.io/component: gui
+
+  - it: follows a custom gui.port
+    set:
+      gui.port: 9000
+    asserts:
+      - equal:
+          path: spec.ports[0].port
+          value: 9000
+
+  - it: is not rendered without the GUI
+    set:
+      gui.enabled: false
+    asserts:
+      - hasDocuments:
+          count: 0

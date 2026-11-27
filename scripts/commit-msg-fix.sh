@@ -2,8 +2,10 @@
 set -euo pipefail
 
 # commit-msg-fix.sh
-# Tries to automatically truncate commit header longer than 100 chars
-# then runs commitlint against the message file.
+# Tries to automatically truncate commit header longer than 120 chars
+# then runs commitlint against the message file. commitlint is optional
+# locally (`npm ci`): without it the message is not checked here, the
+# commitlint workflow still checks every commit of a pull request.
 
 MSGFILE="${1:-}"
 if [ -z "$MSGFILE" ] || [ ! -f "$MSGFILE" ]; then
@@ -41,6 +43,5 @@ if [ -x ./node_modules/.bin/commitlint ]; then
     ./node_modules/.bin/commitlint --edit
   fi
 else
-  echo "commitlint not installed; run 'npm install'" >&2
-  exit 1
+  echo "commit-msg-fix: commitlint not installed (run 'npm ci'); commit message not checked" >&2
 fi

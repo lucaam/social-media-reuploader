@@ -1,0 +1,1 @@
+ERROR: [TikTok] 7300000000000000000: The extractor is attempting impersonation, but no impersonate target is available; if you encounter errors, then see  https://github.com/yt-dlp/yt-dlp#impersonation  for information on installing the required dependencies
