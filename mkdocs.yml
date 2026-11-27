@@ -13,7 +13,7 @@ nav:
   - Deploy: deploy.md
   - OAuth: oauth.md
   - Sviluppo e test in locale: local-testing.md
-  - Immagini e release: ghcr.md
+  - Immagini, chart e release: ghcr.md
 
 theme:
   name: material

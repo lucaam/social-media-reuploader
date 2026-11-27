@@ -1,0 +1,25 @@
+apiVersion: source.toolkit.fluxcd.io/v1
+kind: OCIRepository
+metadata:
+  name: social-media-reuploader
+  namespace: smr
+spec:
+  interval: 10m
+  # The chart published by every release (same version as its image).
+  url: oci://ghcr.io/lucaam/charts/social-media-reuploader
+  ref:
+    # Follows every release after v0.8.1 (the first ones published as OCI
+    # charts). While the version is 0.y.z a minor release may be breaking:
+    # for reproducible deploys pin one release instead, e.g. `tag: 0.9.0`.
+    semver: ">0.8.1"
+  # The Helm chart layer of the OCI artifact.
+  layerSelector:
+    mediaType: application/vnd.cncf.helm.chart.content.v1.tar+gzip
+    operation: copy
+  # Accept only charts signed (cosign keyless) by the release workflow of
+  # this repository on main. Needs Flux 2.8 or later (cosign v3 signatures).
+  verify:
+    provider: cosign
+    matchOIDCIdentity:
+      - issuer: ^https://token\.actions\.githubusercontent\.com$
+        subject: ^https://github\.com/lucaam/social-media-reuploader/\.github/workflows/release\.yml@refs/heads/main$

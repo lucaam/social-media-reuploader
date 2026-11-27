@@ -1,21 +1,27 @@
 # Release manager agent
 
-Usa questo agente per preparare release, changelog e immagini. Il flusso completo è in `RELEASE.md`.
+Usa questo agente per seguire le release, le immagini e i chart. Il flusso completo è in `RELEASE.md`.
 
-Checklist per una release:
+Le release sono automatiche: ogni push su `main` passa dal workflow "Release" (`.github/workflows/release.yml`), che
+ripete i controlli delle PR (`ci.yml`), calcola la versione dai Conventional Commits dall'ultimo tag
+(`scripts/release/version.py`), pubblica l'immagine `ghcr.io/<owner>/social-media-reuploader:X.Y.Z` (amd64 e arm64) e
+il chart `oci://ghcr.io/<owner>/charts/social-media-reuploader` `X.Y.Z`, li firma e attesta, poi crea il tag `vX.Y.Z`
+e la release GitHub. Nessun commit di versione, nessuna PR di bump, nessun token personale.
 
-- CI verde su `main` (`ci.yml`, `lint.yml`, `docker-pr-build.yml`).
-- `./scripts/prepare_release.sh` in locale (test, pre-commit, commitlint, helm lint).
-- Avvia "Manual Version Bump" (`gh workflow run manual-version-bump.yml --ref main`): aggiorna `src/__init__.py`,
-  `charts/social-media-reuploader/Chart.yaml` (`version`, `appVersion`) e i tag immagine in `values.yaml`, poi apre la
-  PR `chore(release): bump versions to vX.Y.Z`. Senza il secret `RELEASE_TOKEN` sulla PR parte solo la CI: chiedi
-  all'utente di chiudere e riaprire la PR per avviare gli altri check obbligatori (vedi `RELEASE.md`).
-- Dopo il merge (con conferma dell'utente) controlla "Publish Release on Bump PR Merge": tag, release GitHub e job
-  "Publish the Docker image" (`ghcr.io/<owner>/social-media-reuploader:X.Y.Z` e `:latest`).
-- Se l'immagine manca: "Manual Docker build and publish to GHCR" con `tag=vX.Y.Z`.
+Checklist:
+
+- Prima del merge: il titolo della PR (diventa il commit di squash su `main`) ha il tipo giusto; il riepilogo del
+  check `commitlint` dice che release produrrà. Anteprima locale: `python scripts/release/version.py plan`
+  (servono i tag: `git fetch --tags`) e `./scripts/prepare_release.sh` (test, pre-commit, commitlint, helm lint).
+- Dopo il merge: il run "Release" su `main` è verde (job Gate, Version, Image, Chart, GitHub release); se il job
+  Version dice "no release" il merge non conteneva commit rilasciabili.
+- Se Image o Chart falliscono non viene creato nessun tag: "Re-run failed jobs", oppure (con conferma dell'utente)
+  `gh workflow run release.yml --ref main -f tag=vX.Y.Z` per ripubblicare un tag esistente o `-f bump=patch` per
+  forzare una release.
+- Verifica degli artefatti: `docs/ghcr.md` (cosign verify, gh attestation verify).
 - Aggiorna `HISTORY.md` per le tappe importanti.
 
 Prompt suggeriti:
 
-- "Prepara la release successiva: elenca i commit dall'ultimo tag, indica il bump semantico atteso e avvia il bump."
-- "Verifica che l'immagine della release vX.Y.Z esista su GHCR per amd64 e arm64."
+- "Che release produrrà il merge di questa PR? Elenca i commit dall'ultimo tag e la versione prevista."
+- "Verifica che la release vX.Y.Z abbia l'immagine su GHCR per amd64 e arm64, il chart OCI e firme valide."

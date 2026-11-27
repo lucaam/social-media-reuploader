@@ -91,18 +91,31 @@ docker compose logs -f bot
 
 ## Kubernetes con Helm
 
-Il chart è in `charts/social-media-reuploader`. Usa quello del tag di una
-release (`git checkout v<versione>`): il chart di ogni release usa l'immagine
-della stessa versione (`image.tag`), mentre quello di `main` può richiedere
-funzioni di un'immagine non ancora pubblicata (ad esempio la readiness probe su
-`/ready`): con un'immagine più vecchia il pod del bot non diventa mai pronto.
+Ogni release pubblica il chart su GHCR come artefatto OCI, con la stessa
+versione dell'immagine: il chart `X.Y.Z` installa l'immagine `X.Y.Z`
+(`image.tag` vuoto vuol dire `appVersion`).
 
 ```bash
 kubectl create namespace smr
 kubectl -n smr create secret generic smr-bot --from-literal=BOT_TOKEN='<token>'
-helm upgrade --install smr charts/social-media-reuploader -n smr \
-  --set secret.name=smr-bot
+helm upgrade --install smr oci://ghcr.io/lucaam/charts/social-media-reuploader \
+  --version <versione> -n smr --set secret.name=smr-bot
 ```
+
+- `<versione>` è una [release](https://github.com/lucaam/social-media-reuploader/releases)
+  (ad esempio `0.9.0`): fissala per deploy riproducibili; senza `--version`
+  Helm installa l'ultima.
+- `helm show values oci://ghcr.io/lucaam/charts/social-media-reuploader --version <versione>`
+  mostra tutti i valori con i loro commenti.
+- Il `.tgz` allegato a ogni release GitHub è lo stesso chart. Firme e
+  provenienza si verificano come in [Immagini e release](ghcr.md#verificare-firme-e-provenienza).
+- Il chart nella cartella `charts/` del repository serve solo per sviluppo e
+  test: ha la versione segnaposto `0.0.0` (le versioni le assegna il workflow
+  di release) e nessuna immagine `0.0.0` esiste, quindi va installato con
+  un'immagine esplicita, ad esempio
+  `helm upgrade --install smr charts/social-media-reuploader --set image.tag=<versione> ...`
+  (le note di Helm lo ricordano). Il chart di `main` può richiedere funzioni
+  di un'immagine non ancora pubblicata.
 
 Cosa viene creato:
 
@@ -163,8 +176,8 @@ kubectl -n smr create secret generic smr-gui \
   --from-literal=OAUTH_SERVER_METADATA_URL='https://idp.example.com/.well-known/openid-configuration' \
   --from-literal=OAUTH_REDIRECT_URI='https://admin.example.com/auth' \
   --from-literal=OAUTH_ADMIN_GROUPS='admins'
-helm upgrade --install smr charts/social-media-reuploader -n smr \
-  --set secret.name=smr-bot --set gui.existingSecret=smr-gui
+helm upgrade --install smr oci://ghcr.io/lucaam/charts/social-media-reuploader \
+  --version <versione> -n smr --set secret.name=smr-bot --set gui.existingSecret=smr-gui
 ```
 
 Impostazioni della GUI che non sono segreti (es. `SESSION_COOKIE_SECURE`) vanno
@@ -254,8 +267,8 @@ richieste con `WEBHOOK_SECRET` (dal Secret del bot, oppure derivato dal token).
 
 ```bash
 kubectl -n smr create secret generic smr-cookies --from-file=cookies.txt
-helm upgrade --install smr charts/social-media-reuploader -n smr \
-  --reuse-values --set ytdlpCookies.existingSecret=smr-cookies
+helm upgrade --install smr oci://ghcr.io/lucaam/charts/social-media-reuploader \
+  --version <versione> -n smr --reuse-values --set ytdlpCookies.existingSecret=smr-cookies
 ```
 
 Il file viene montato in sola lettura in
@@ -295,7 +308,15 @@ il profilo. La GUI usa `guiResources`.
 `metrics.serviceMonitor.enabled: true` crea un `ServiceMonitor` (Prometheus
 Operator) che legge `/metrics` dal Service del bot.
 
-### Aggiornare da versioni del chart precedenti a 0.2.0
+### Aggiornare dal chart 0.1.x (release fino a v0.8.1)
+
+Fino a v0.8.1 il chart si installava dalla cartella `charts/` di un tag Git
+e aveva una propria numerazione (0.1.x). Dalle release successive il chart si
+installa da `oci://ghcr.io/lucaam/charts/social-media-reuploader` e ha la
+stessa versione dell'immagine: passa a quel riferimento con
+`helm upgrade <release> oci://ghcr.io/lucaam/charts/social-media-reuploader --version <versione>`
+(è una versione più alta di 0.1.x, quindi un normale upgrade) e togli
+`image.tag` dai tuoi valori, a meno di voler fissare un'altra immagine.
 
 !!! warning "Database su PVC (`db.pvc.enabled=true` con il chart 0.1.x)"
     Il chart 0.1.x creava il PVC `social-media-reuploader-data` (oppure
@@ -337,15 +358,19 @@ Operator) che legge `/metrics` dal Service del bot.
 
 ## Flux
 
-`examples/flux/` contiene un `GitRepository` e una `HelmRelease` di esempio:
-il chart viene preso dall'ultima release di questo repository (tag `vX.Y.Z`,
-mai `main`), il token dal Secret `smr-bot`, le credenziali della GUI dal Secret
-`smr-gui` (da creare con SealedSecrets, External Secrets o SOPS: mai segreti
-nel repository).
+`examples/flux/` contiene un `OCIRepository` e una `HelmRelease` di esempio
+(Flux 2.8 o successivo): il chart OCI viene preso dalle release
+(`ref.semver`, oppure `ref.tag` per fissare una versione) e accettato solo se
+firmato dal workflow di release di questo repository (`spec.verify` con
+cosign keyless); il token arriva dal Secret `smr-bot`, le credenziali della
+GUI dal Secret `smr-gui` (da creare con SealedSecrets, External Secrets o
+SOPS: mai segreti nel repository). Non usare un `GitRepository`: il chart del
+repository ha la versione segnaposto `0.0.0`.
 
 ```bash
-kubectl apply -f examples/flux/gitrepository.yaml
+kubectl apply -f examples/flux/ocirepository.yaml
 kubectl apply -f examples/flux/helmrelease.yaml
+flux get sources oci -n smr
 flux get helmreleases -n smr
 ```
 

@@ -2,6 +2,30 @@
 
 Questo file traccia le tappe principali del progetto in modo che sia facile riprenderlo in seguito.
 
+## 2026-11-27 — Release continue: ogni merge su `main` è una release
+
+- **Niente più passi manuali**: il workflow *Release* (`release.yml`) parte a
+  ogni push su `main`, ripete i controlli delle PR (`ci.yml` con
+  `workflow_call`), calcola la versione dai Conventional Commits
+  (`scripts/release/version.py`, testato) e pubblica immagine multi-arch e
+  chart OCI su GHCR, entrambi firmati con cosign keyless e con attestazione di
+  provenienza (più SBOM e provenance di BuildKit nell'immagine), poi crea tag
+  e release GitHub con le note raggruppate per tipo. Rimossi "Manual Version
+  Bump", la PR di bump, "Publish Release on Bump PR Merge", i workflow Docker
+  separati, gli script di bump e i secret `RELEASE_TOKEN`/`GHCR_PAT`.
+- **Versione solo nel tag**: `Chart.yaml` resta `0.0.0`, il codice legge
+  `SMR_VERSION` (impostata dal `Dockerfile` con `--build-arg VERSION`),
+  `image.tag` del chart è vuoto e segue `appVersion`.
+- **CI**: un solo `ci.yml` per PR e gate di release, azioni fissate per SHA,
+  `permissions: {}` con permessi per job, timeout ovunque, pre-commit con tutti
+  gli hook fissati (actionlint con shellcheck, zizmor, schema dei workflow e
+  di Renovate, shellcheck), smoke test dell'immagine in uno script condiviso
+  (`scripts/smoke_test_image.sh`), titolo delle PR controllato da commitlint.
+- **Renovate**: `fix(deps)` per le dipendenze runtime e l'immagine base
+  (fissata per digest), quindi una patch release al merge; `chore(deps)` /
+  `ci(deps)` per gli strumenti; yt-dlp unito in automatico; digest delle
+  azioni fissati; manager pre-commit attivo.
+
 ## 2026-11-26 — Refactor: tutti i provider di yt-dlp, coda nel database, deploy rivisto
 
 Revisione completa basata su una code review (bug critici di deploy, coda,
@@ -71,5 +95,5 @@ rate limit, GUI e CI). In sintesi:
   supportato con `TELEGRAM_API_BASE`; in alternativa link a uno storage S3/MinIO).
 - Riutilizzo dei media già inviati (`file_id`) per i link ripetuti in chat
   diverse.
-- Abilitare il manager pre-commit di Renovate (e l'automerge delle patch di
-  yt-dlp) per tenere allineati hook e dipendenze.
+- Bloccare anche le dipendenze transitive dell'immagine (lock file con hash
+  per `requirements.txt`, ad esempio con `uv pip compile --generate-hashes`).

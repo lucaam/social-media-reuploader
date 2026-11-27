@@ -15,7 +15,8 @@ Requisiti:
   insieme arrivano `curl_cffi` (impersonation) e `yt-dlp-ejs` (challenge di
   YouTube)
 - facoltativi: Docker con Compose, Helm 4 con il plugin helm-unittest,
-  actionlint, Node.js per commitlint
+  Node.js per commitlint (actionlint, shellcheck e zizmor li installa
+  pre-commit)
 
 ```bash
 python -m venv .venv
@@ -63,18 +64,29 @@ helm unittest charts/social-media-reuploader
 
 ```bash
 pre-commit run --all-files
-SKIP=helm-lint,actionlint pre-commit run --all-files   # se non hai helm o actionlint
+SKIP=helm-lint pre-commit run --all-files   # se non hai helm
 ```
+
+Tutti gli hook sono fissati a una versione in `.pre-commit-config.yaml`
+(aggiornati da Renovate); solo `helm-lint` usa lo `helm` del sistema.
 
 ## Conventional Commits
 
 I messaggi di commit seguono [Conventional Commits](https://www.conventionalcommits.org/)
-(controllati da commitlint con `commitlint.config.mjs`, in locale e sulle PR):
+(controllati da commitlint con `commitlint.config.mjs`). Le PR vengono unite
+con **squash**: il commit che arriva su `main` è il **titolo della PR**, che
+il check `commitlint` controlla e che decide la release automatica:
 
-- `feat: ...` nuova funzionalità → versione minor
-- `fix: ...` correzione → patch
-- `perf:`, `refactor:`, `docs:`, `test:`, `chore:`, `ci:`, `build:` → patch
-- breaking change: `feat!: ...` oppure `BREAKING CHANGE: ...` nel corpo → major
+- `feat: ...` nuova funzionalità → release minor
+- `fix: ...`, `perf: ...`, `revert: ...`, `fix(deps): ...` → patch
+- breaking change: `feat!: ...` (il `!` nel titolo della PR) oppure il footer
+  `BREAKING CHANGE: ...` → major, minor finché la versione è `0.y.z`
+- `refactor:`, `docs:`, `test:`, `chore:`, `ci:`, `style:`, `build:` →
+  nessuna release (arrivano con la release successiva)
+
+Il riepilogo del check `commitlint` dice che release produrrà la PR;
+`python scripts/release/version.py check-title "<titolo>"` fa lo stesso in
+locale.
 
 Lo script `scripts/commit-msg-fix.sh` (hook `commit-msg`) accorcia gli header
 oltre i 120 caratteri e lancia commitlint; `scripts/commitlint-pre-push.sh`
@@ -94,16 +106,18 @@ Riscrivi la storia solo sui tuoi branch di feature.
 
 | Workflow | Quando | Cosa |
 |---|---|---|
-| `ci.yml` (job `build`) | PR, push su `main` | test con ffmpeg installato |
-| `lint.yml` | PR, push su `main` | pre-commit, `check_docs.py`, Helm lint + unittest + kubeconform, actionlint, build della documentazione |
-| `docker-pr-build.yml` | PR | build dell'immagine e smoke test (deno, curl_cffi, ffmpeg, import con filesystem in sola lettura) |
-| `commitlint.yml` | PR | messaggi di commit |
+| `ci.yml` | PR; su `main` richiamato da `release.yml` | test con ffmpeg (job `build`), pre-commit e `check_docs.py`, Helm lint + unittest + kubeconform, actionlint + zizmor, build della documentazione, build e smoke test dell'immagine (`scripts/smoke_test_image.sh`) |
+| `pr-title.yml` | PR | titolo della PR (job `commitlint`) e release che produrrà |
+| `release.yml` | push su `main`, avvio manuale | stessi controlli di `ci.yml`, poi versione, immagine, chart, tag e release ([RELEASE.md](RELEASE.md)) |
+| `docs-deploy.yml` | push su `main` che tocca la documentazione | sito su GitHub Pages |
 
-I job che non riguardano i file modificati vengono saltati (e contano come
-superati), tranne "Python linters" (pre-commit su tutti i file e
-`check_docs.py`), che gira su ogni PR.
+Sulle PR i job che non riguardano i file modificati vengono saltati (e
+contano come superati), tranne i test (`build`) e "Python linters", che
+girano sempre. Le azioni sono fissate per commit SHA e ogni job dichiara solo
+i permessi che usa.
 
 ## Release
 
-Le release partono dal workflow "Manual Version Bump" e si concludono con il
-merge della PR di bump: vedi [RELEASE.md](RELEASE.md).
+Automatiche: ogni merge su `main` con un commit rilasciabile pubblica
+immagine, chart, tag e release GitHub, senza passi manuali. Dettagli in
+[RELEASE.md](RELEASE.md).

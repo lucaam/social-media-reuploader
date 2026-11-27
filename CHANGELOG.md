@@ -1,10 +1,10 @@
 # Changelog
 
-All notable changes to this project are documented in this file.
-
-## Unreleased
-
-- No unreleased changes recorded.
+Release notes are published with every release on
+[GitHub Releases](https://github.com/lucaam/social-media-reuploader/releases):
+they are generated from the Conventional Commits of each release by
+`scripts/release/version.py` (see RELEASE.md). This file keeps the history of
+the early releases and is no longer updated.
 
 ## [0.3.1](https://github.com/lucaam/social-media-reuploader/compare/v0.3.0...v0.3.1) (2026-05-14)
 

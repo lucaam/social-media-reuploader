@@ -14,10 +14,13 @@ Prompt suggerito:
 ## Release Manager
 Prompt suggerito:
 
-> Sei un Release Manager per `social-media-reuploader`. Controlla i commit sulla branch `main`, avvia il workflow
-> "Manual Version Bump" (`gh workflow run manual-version-bump.yml --ref main`) e verifica la PR di bump
-> `chore(release): bump versions to vX.Y.Z`. Dopo il merge, "Publish Release on Bump PR Merge" crea tag e release
-> e pubblica l'immagine su GHCR: controlla che il job Docker sia verde. Non fare merge senza conferma dell'utente.
+> Sei un Release Manager per `social-media-reuploader`. Le release sono automatiche: ogni push su `main` passa dal
+> workflow "Release" (`release.yml`), che calcola la versione dai Conventional Commits dall'ultimo tag
+> (`python scripts/release/version.py plan` in locale), pubblica immagine e chart firmati su GHCR e crea tag e release.
+> Controlla che il titolo delle PR sia del tipo giusto (decide la release), che il run "Release" su `main` sia verde e
+> che la release `vX.Y.Z` abbia immagine (amd64/arm64) e chart. Per forzare o ripubblicare usa l'avvio manuale
+> (`gh workflow run release.yml --ref main -f bump=patch` o `-f tag=vX.Y.Z`) solo con conferma dell'utente; non fare
+> merge senza conferma.
 
 ## Onboarding rapido — cosa fare localmente
 Comandi utili per l'agente umano o per esecuzione automatica:
@@ -37,9 +40,11 @@ python -m src.bot
 # avvia la GUI (stesso REQUESTS_DB del bot)
 SECRET_KEY="$(openssl rand -hex 32)" ADMIN_TOKEN="<token-admin>" ./scripts/run-dev.sh
 # build immagine localmente
-docker build -t your-registry/social-media-reuploader:dev .
+docker build -t your-registry/social-media-reuploader:dev --build-arg VERSION=0.0.0-dev .
 # chart Helm
 helm lint charts/social-media-reuploader --strict && helm unittest charts/social-media-reuploader
+# smoke test di un'immagine (gli stessi controlli della CI)
+scripts/smoke_test_image.sh your-registry/social-media-reuploader:dev 0.0.0-dev
 ```
 
 ## Note e policy
@@ -47,8 +52,12 @@ helm lint charts/social-media-reuploader --strict && helm unittest charts/social
 - `src/config.py` è l'unica fonte delle impostazioni: una nuova impostazione va anche nella tabella del README e
   nella mappa `env` di `charts/social-media-reuploader/values.yaml` (`scripts/check_docs.py` lo verifica).
 - Bot e GUI sono processi separati che condividono solo il database SQLite: una sola istanza del bot per token.
-- Per rilascio automatico e semver il repository usa gli script di bump (`scripts/release/bump_versions.py`) e i
-  workflow descritti in `RELEASE.md`.
+- Nessun commit di versione: il tag `vX.Y.Z` è l'unica fonte della versione, iniettata in fase di build (immagine:
+  `--build-arg VERSION` → `SMR_VERSION`; chart: `helm package --version --app-version`; `Chart.yaml` resta `0.0.0`).
+  Regole e workflow in `RELEASE.md`; lo script è `scripts/release/version.py` (test in
+  `tests/test_release_version.py`).
+- Le PR si uniscono con squash: il titolo della PR (Conventional Commits) diventa il commit su `main` e decide la
+  release (`feat` minor, `fix`/`perf` patch, `chore`/`docs`/`ci`/... nessuna).
 
 ***
 File agent-specific (esempi): `agents/dev.instructions.md`, `agents/release.instructions.md` (vedi cartella `agents/`).

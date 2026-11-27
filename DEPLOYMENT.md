@@ -49,8 +49,11 @@ imposta `WORKER_SHUTDOWN_TIMEOUT` al grace period meno 15 secondi.
 2. Facoltativo: Secret della GUI con `SECRET_KEY` e `ADMIN_TOKEN` o le
    impostazioni OAuth (altrimenti il chart genera `SECRET_KEY` e `ADMIN_TOKEN`).
 3. Facoltativo: Secret con `cookies.txt` (`ytdlpCookies.existingSecret`).
-4. Valori: `secret.name`, `gui.existingSecret`, `image.tag` fissato a una
-   versione, `env` (limiti, provider), `ingress`/`gatewayApi`.
+4. Chart OCI di una release, con la versione fissata
+   (`helm upgrade --install smr oci://ghcr.io/lucaam/charts/social-media-reuploader --version X.Y.Z`):
+   installa l'immagine della stessa versione, quindi `image.tag` resta vuoto.
+   Valori: `secret.name`, `gui.existingSecret`, `env` (limiti, provider),
+   `ingress`/`gatewayApi`.
 5. Privacy mode del bot disattivata in @BotFather se lo usi nei gruppi.
 6. Verifica: `kubectl logs deploy/<release>-social-media-reuploader`,
    `kubectl port-forward svc/<release>-social-media-reuploader 8080:80` e
@@ -58,6 +61,7 @@ imposta `WORKER_SHUTDOWN_TIMEOUT` al grace period meno 15 secondi.
 
 ## Flux
 
-`examples/flux/` contiene `GitRepository` e `HelmRelease` di esempio (API
-`source.toolkit.fluxcd.io/v1` e `helm.toolkit.fluxcd.io/v2`) che installano il
-chart da questo repository con i segreti presi da Secret esistenti.
+`examples/flux/` contiene `OCIRepository` e `HelmRelease` di esempio (API
+`source.toolkit.fluxcd.io/v1` e `helm.toolkit.fluxcd.io/v2`, Flux 2.8 o
+successivo) che installano il chart OCI delle release, ne verificano la firma
+cosign e prendono i segreti da Secret esistenti.

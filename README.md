@@ -127,17 +127,31 @@ nella cartella corrente).
 
 ```bash
 kubectl create secret generic smr-bot --from-literal=BOT_TOKEN='<token>'
-helm upgrade --install smr charts/social-media-reuploader --set secret.name=smr-bot
+helm upgrade --install smr oci://ghcr.io/lucaam/charts/social-media-reuploader \
+  --version <versione> --set secret.name=smr-bot
 ```
 
-Il chart crea il PVC del database, la GUI sullo stesso nodo del bot e un Secret
-con `SECRET_KEY` e `ADMIN_TOKEN` generati (vedi le note mostrate da Helm). Tutti
-i dettagli in [docs/deploy.md](docs/deploy.md).
+Il chart è pubblicato su GHCR a ogni [release](https://github.com/lucaam/social-media-reuploader/releases)
+con la stessa versione dell'immagine, che installa (`<versione>`, es. `0.9.0`;
+senza `--version` l'ultima). Crea il PVC del database, la GUI sullo stesso
+nodo del bot e un Secret con `SECRET_KEY` e `ADMIN_TOKEN` generati (vedi le
+note mostrate da Helm). Tutti i dettagli in [docs/deploy.md](docs/deploy.md).
 
-Installa il chart dal tag di una release (`git checkout v<versione>`): il chart
-di ogni release usa l'immagine della stessa versione, mentre quello di `main`
-può richiedere un'immagine non ancora pubblicata (`image.tag` viene aggiornato
-solo al rilascio).
+Il chart nella cartella `charts/` del repository è solo per lo sviluppo: ha
+la versione segnaposto `0.0.0` e va installato con
+`--set image.tag=<versione>`.
+
+### Versioni e release
+
+Le release sono automatiche: ogni merge su `main` con una correzione o una
+funzionalità ([Conventional Commits](https://www.conventionalcommits.org/))
+pubblica la versione successiva `vX.Y.Z`, cioè l'immagine
+`ghcr.io/lucaam/social-media-reuploader:X.Y.Z` (amd64/arm64, anche
+`:latest`) e il chart `X.Y.Z`, firmati con cosign e con attestazione di
+provenienza ([come verificarli](docs/ghcr.md)). L'immagine riceve la versione
+in fase di build (`SMR_VERSION`): compare nei log di avvio e in `/health`
+con `HEALTH_DEBUG=true`; un'immagine costruita in locale riporta
+`0.0.0-dev`. Dettagli in [RELEASE.md](RELEASE.md).
 
 ## Configurazione
 

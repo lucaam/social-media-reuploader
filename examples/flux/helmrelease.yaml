@@ -5,14 +5,10 @@ metadata:
   namespace: smr
 spec:
   interval: 10m
-  chart:
-    spec:
-      # Chart path inside the GitRepository
-      chart: ./charts/social-media-reuploader
-      sourceRef:
-        kind: GitRepository
-        name: social-media-reuploader-repo
-        namespace: flux-system
+  # The OCI chart of ocirepository.yaml (same namespace).
+  chartRef:
+    kind: OCIRepository
+    name: social-media-reuploader
   install:
     remediation:
       retries: 2
@@ -20,8 +16,8 @@ spec:
     remediation:
       retries: 2
   values:
-    # The image tag defaults to the chart's own version (values.yaml); set
-    # image.tag only to deploy a different release.
+    # The image tag defaults to the chart's appVersion, i.e. the image of
+    # the same release: set image.tag only to deploy a different release.
     # Existing Secrets (create them with SealedSecrets / External Secrets /
     # SOPS; never commit secrets):
     #   smr-bot: BOT_TOKEN (optional WEBHOOK_SECRET)

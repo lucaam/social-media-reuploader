@@ -33,10 +33,13 @@ REQUESTS_DB=/tmp/smr-tests/requests.db python -m pytest -q
 Lint (gli stessi controlli della CI):
 
 ```bash
-pre-commit run --all-files                 # ruff, black, isort, whitespace, YAML
-SKIP=helm-lint,actionlint pre-commit run --all-files   # senza helm / actionlint installati
+pre-commit run --all-files                 # ruff, black, isort, shellcheck, actionlint, zizmor, YAML, ...
+SKIP=helm-lint pre-commit run --all-files  # senza helm installato
 python scripts/check_docs.py               # ogni impostazione è documentata
 ```
+
+Gli hook sono fissati in `.pre-commit-config.yaml` e pre-commit li installa
+da solo; solo `helm-lint` usa lo `helm` del sistema.
 
 ## Avviare bot e GUI
 
@@ -75,6 +78,14 @@ docker compose up --build
 
 Bot e GUI condividono il volume `data`; la GUI è su <http://127.0.0.1:8081>.
 
+Lo smoke test dell'immagine che esegue la CI (runtime di yt-dlp, utente non
+privilegiato, filesystem in sola lettura, avvio della GUI):
+
+```bash
+docker build -t smr:dev --build-arg VERSION=0.0.0-dev .
+scripts/smoke_test_image.sh smr:dev 0.0.0-dev
+```
+
 ## Chart Helm
 
 ```bash
@@ -86,3 +97,14 @@ helm unittest charts/social-media-reuploader
 
 I file in `charts/social-media-reuploader/ci/` sono le combinazioni di valori
 usate dalla CI (lint, render e validazione con kubeconform).
+
+Il chart del repository ha la versione segnaposto `0.0.0`: il workflow di
+release lo pacchettizza con la versione vera. Per provarlo come verrà
+pubblicato:
+
+```bash
+helm package charts/social-media-reuploader --version 1.2.3 --app-version 1.2.3 -d /tmp
+helm template smr /tmp/social-media-reuploader-1.2.3.tgz --set secret.name=smr-bot | grep image:
+```
+
+Per installarlo da qui serve un'immagine esistente: `--set image.tag=<versione>`.

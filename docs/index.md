@@ -50,4 +50,4 @@ nodo Kubernetes).
 - [Deploy](deploy.md): Docker, Docker Compose, Kubernetes con Helm e Flux.
 - [OAuth](oauth.md): login alla GUI con un provider OAuth2/OpenID Connect.
 - [Sviluppo e test in locale](local-testing.md).
-- [Immagini GHCR e release](ghcr.md).
+- [Immagini, chart e release](ghcr.md): artefatti pubblicati, flusso di release, verifica delle firme.
