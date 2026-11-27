@@ -6,9 +6,12 @@ by every HTTP route, by the WebSocket handshake and by ``/api/me``:
 * ``Authorization: Bearer <ADMIN_TOKEN>`` (API clients). Compared in constant
   time; a wrong token is an error (401), never a fallback to the cookie.
   Tokens in query strings are never accepted.
-* A signed session cookie created by ``POST /login`` (admin token) or by the
-  OAuth/OIDC callback. The cookie only carries *identity*; admin rights are
-  re-derived on every request:
+* A server-side session created by ``POST /login`` (admin token) or by the
+  OAuth/OIDC callback. The signed cookie only carries a random session id;
+  the ``gui_sessions`` table keeps its SHA-256, the identity and the
+  lifetime, so logout and revocation (``/api/sessions``) end a session for
+  good, even if its cookie was copied. Admin rights are re-derived on every
+  request:
 
   - token sessions store an HMAC fingerprint of the token they were created
     with, so rotating ``ADMIN_TOKEN`` invalidates them;
@@ -16,7 +19,8 @@ by every HTTP route, by the WebSocket handshake and by ``/api/me``:
     ``OAUTH_ADMIN_GROUPS`` or when their verified e-mail maps to a DB user
     with role ``admin`` (looked up on every request, so demotion works).
     The groups are the ones the provider sent at login: the IdP is not asked
-    again, so a group change applies from the next login.
+    again, so a group change applies from the next login (or revoke the
+    session).
     Verified means ``email_verified`` (or Discord's ``verified``) is true;
     an e-mail without any such claim counts only with
     ``OAUTH_ASSUME_EMAIL_VERIFIED=true`` (providers like GitHub that only
@@ -28,8 +32,8 @@ Settings are read from the environment by :meth:`AuthSettings.from_env`
 variables). Without a usable ``SECRET_KEY`` a random per-process key is used:
 cookies are never signed with a public default.
 
-Everything here is synchronous: :func:`resolve_principal` may query the DB,
-so async callers run it in a worker thread.
+Everything here is synchronous: :func:`resolve_principal` and the session
+functions query the DB, so async callers run them in a worker thread.
 """
 
 from __future__ import annotations
@@ -63,7 +67,9 @@ LEGACY_DEFAULT_SECRET = "dev-secret-change-me"
 MIN_SECRET_KEY_LENGTH = 32
 MIN_ADMIN_TOKEN_LENGTH = 16
 SESSION_COOKIE_NAME = "smr_session"
-SESSION_VERSION = 1
+# 2: the cookie carries a random id of a server-side session (gui_sessions).
+SESSION_VERSION = 2
+SESSION_ID_BYTES = 32
 DEFAULT_SESSION_MAX_AGE = 12 * 3600
 MIN_SESSION_MAX_AGE = 300
 MAX_SESSION_MAX_AGE = 7 * 86400
@@ -135,7 +141,13 @@ class OAuthSettings:
             "name": OAUTH_CLIENT_NAME,
             "client_id": self.client_id,
             "client_secret": self.client_secret,
-            "client_kwargs": {"scope": self.scope, "timeout": self.timeout},
+            # PKCE (RFC 7636) on top of the client secret: an intercepted
+            # authorization code is useless without the session's verifier.
+            "client_kwargs": {
+                "scope": self.scope,
+                "timeout": self.timeout,
+                "code_challenge_method": "S256",
+            },
         }
         if self.server_metadata_url:
             kwargs["server_metadata_url"] = self.server_metadata_url
@@ -161,7 +173,10 @@ class AuthSettings:
     admin_token: str | None = None
     admin_groups: frozenset[str] = frozenset()  # casefolded
     oauth: OAuthSettings | None = None
-    cookie_secure: bool = False
+    # True/False: always/never mark the session cookie Secure; None ("auto",
+    # the default): Secure when the request arrived over HTTPS (behind a
+    # proxy, as reported by uvicorn's trusted proxy headers).
+    cookie_secure: bool | None = None
     session_max_age: int = DEFAULT_SESSION_MAX_AGE
     trusted_origins: frozenset[str] = frozenset()  # normalized origins
     # Use OAuth e-mails that come without any verification claim for the DB
@@ -201,7 +216,7 @@ class AuthSettings:
             admin_token=admin_token,
             admin_groups=frozenset(g.strip().casefold() for g in groups if g.strip()),
             oauth=oauth,
-            cookie_secure=_env_bool(env, "SESSION_COOKIE_SECURE", False, warnings),
+            cookie_secure=_cookie_secure(env, warnings),
             session_max_age=max_age,
             trusted_origins=frozenset(trusted),
             assume_email_verified=_env_bool(
@@ -240,6 +255,14 @@ def _env_bool(
         return False
     warnings.append(f"{name}={value!r} is not a boolean; using {default}")
     return default
+
+
+def _cookie_secure(env: Mapping[str, str], warnings: list[str]) -> bool | None:
+    """``SESSION_COOKIE_SECURE``: true, false or auto (default, None)."""
+    value = _env(env, "SESSION_COOKIE_SECURE")
+    if value is None or value.lower() == "auto":
+        return None
+    return _env_bool(env, "SESSION_COOKIE_SECURE", False, warnings)
 
 
 def _env_int(
@@ -375,6 +398,7 @@ class Principal:
     username: str | None = None
     groups: tuple[str, ...] = ()
     role: str | None = None
+    session_id: int | None = None  # gui_sessions.id (None: bearer or anonymous)
 
     @property
     def authenticated(self) -> bool:
@@ -409,11 +433,14 @@ class Principal:
             "auth": self.method.value if self.method else None,
             "role": self.role,
             "user": user,
+            "session_id": self.session_id,
         }
 
 
 ANONYMOUS = Principal()
 UserLookup = Callable[[str], Mapping[str, Any] | None]
+SessionLookup = Callable[[str], Mapping[str, Any] | None]
+SessionTouch = Callable[[int], None]
 
 
 def bearer_token(headers: Headers) -> str | None:
@@ -436,10 +463,14 @@ def uses_bearer(headers: Headers, settings: AuthSettings) -> bool:
 
 
 def tokens_match(candidate: str, expected: str) -> bool:
-    """Constant-time comparison (any str, even with lone surrogates from JSON)."""
+    """Constant-time comparison (any str, even with lone surrogates from JSON).
+
+    Digests of equal length are compared, so the time taken does not depend
+    on (or reveal) the length of the expected value either.
+    """
     return hmac.compare_digest(
-        candidate.encode("utf-8", "surrogatepass"),
-        expected.encode("utf-8", "surrogatepass"),
+        hashlib.sha256(candidate.encode("utf-8", "surrogatepass")).digest(),
+        hashlib.sha256(expected.encode("utf-8", "surrogatepass")).digest(),
     )
 
 
@@ -465,6 +496,8 @@ def resolve_principal(
     oauth_enabled: bool,
     limiter: FailureLimiter | None = None,
     lookup_user: UserLookup | None = None,
+    lookup_session: SessionLookup | None = None,
+    touch_session: SessionTouch | None = None,
 ) -> Principal:
     """The one admin check (HTTP routes, WebSocket and ``/api/me``).
 
@@ -478,9 +511,16 @@ def resolve_principal(
     session = conn.scope.get("session")
     if not isinstance(session, Mapping):
         return ANONYMOUS
-    return session_principal(
-        session, settings, oauth_enabled=oauth_enabled, lookup_user=lookup_user
+    principal = session_principal(
+        session,
+        settings,
+        oauth_enabled=oauth_enabled,
+        lookup_user=lookup_user,
+        lookup_session=lookup_session,
     )
+    if principal.session_id is not None:
+        (touch_session or db.touch_gui_session)(principal.session_id)
+    return principal
 
 
 def _bearer_principal(
@@ -507,73 +547,127 @@ def session_principal(
     *,
     oauth_enabled: bool,
     lookup_user: UserLookup | None = None,
+    lookup_session: SessionLookup | None = None,
 ) -> Principal:
-    """Principal of a session cookie (anonymous when invalid or expired)."""
-    if session.get("v") != SESSION_VERSION or not _session_fresh(session, settings):
+    """Principal of a session cookie: anonymous unless it names an active
+    server-side session (not revoked, not expired)."""
+    record = session_record(session, lookup_session)
+    if record is None:
         return ANONYMOUS
-    kind = session.get("auth")
+    session_id = int(record["id"])
+    kind = record.get("auth")
     if kind == AuthMethod.TOKEN.value:
         expected = token_fingerprint(settings)
-        stored = session.get("fp")
+        stored = record.get("token_fp")
         if expected and isinstance(stored, str) and tokens_match(stored, expected):
             return Principal(
-                method=AuthMethod.TOKEN, is_admin=True, subject="admin-token"
+                method=AuthMethod.TOKEN,
+                is_admin=True,
+                subject="admin-token",
+                session_id=session_id,
             )
         return ANONYMOUS
     if kind == AuthMethod.OAUTH.value and oauth_enabled:
-        return _oauth_principal(session, settings, lookup_user or db.get_user_by_email)
+        return _oauth_principal(
+            record, settings, lookup_user or db.get_user_by_email, session_id
+        )
     return ANONYMOUS
 
 
-def _session_fresh(session: Mapping[str, Any], settings: AuthSettings) -> bool:
-    issued = session.get("iat")
-    if not isinstance(issued, int | float):
-        return False
-    age = time.time() - float(issued)
-    return -300 <= age <= settings.session_max_age
+def session_record(
+    session: Mapping[str, Any], lookup_session: SessionLookup | None = None
+) -> Mapping[str, Any] | None:
+    """The active server-side session the cookie names, or None."""
+    if session.get("v") != SESSION_VERSION:
+        return None
+    sid = session.get("sid")
+    if not isinstance(sid, str) or not sid:
+        return None
+    return (lookup_session or db.get_gui_session)(session_hash(sid))
+
+
+def session_hash(sid: str) -> str:
+    """What the DB stores for a session id (a leaked DB holds no usable ids)."""
+    return hashlib.sha256(sid.encode("utf-8", "surrogatepass")).hexdigest()
 
 
 def _oauth_principal(
-    session: Mapping[str, Any], settings: AuthSettings, lookup_user: UserLookup
+    record: Mapping[str, Any],
+    settings: AuthSettings,
+    lookup_user: UserLookup,
+    session_id: int,
 ) -> Principal:
     groups = tuple(
-        group for group in session.get("groups") or () if isinstance(group, str)
+        group for group in record.get("groups") or () if isinstance(group, str)
     )
-    email = _text(session.get("email"))
+    email = _text(record.get("email"))
     by_group = any(group.casefold() in settings.admin_groups for group in groups)
     role: str | None = None
-    verified = session.get("ev")
+    verified = record.get("email_verified")
     if not by_group and email and settings.email_trusted(verified):
         user = lookup_user(email)
         role = str(user["role"]) if user and user.get("role") else None
     return Principal(
         method=AuthMethod.OAUTH,
         is_admin=by_group or role == "admin",
-        subject=_text(session.get("sub")),
+        subject=_text(record.get("subject")),
         email=email,
-        name=_text(session.get("name")),
-        username=_text(session.get("user")),
+        name=_text(record.get("name")),
+        username=_text(record.get("username")),
         groups=groups,
         role=role,
+        session_id=session_id,
     )
 
 
 # ---------------------------------------------------------------------------
 # Sessions
 # ---------------------------------------------------------------------------
-def start_token_session(
-    session: MutableMapping[str, Any], settings: AuthSettings
-) -> None:
-    """Replace the session with an admin-token session."""
+def _expires_at(settings: AuthSettings) -> str:
+    return db.iso_from_ts(time.time() + settings.session_max_age)
+
+
+def _set_cookie_session(session: MutableMapping[str, Any], sid: str) -> None:
+    """Replace the cookie content (incl. any OAuth state) with the session id."""
     session.clear()
-    session.update(
-        {
-            "v": SESSION_VERSION,
-            "auth": AuthMethod.TOKEN.value,
-            "fp": token_fingerprint(settings),
-            "iat": int(time.time()),
-        }
+    session.update({"v": SESSION_VERSION, "sid": sid})
+
+
+def start_token_session(
+    session: MutableMapping[str, Any],
+    settings: AuthSettings,
+    *,
+    client: str | None = None,
+    user_agent: str | None = None,
+) -> int:
+    """Create a server-side admin-token session; its id (blocking, DB write)."""
+    sid = secrets.token_urlsafe(SESSION_ID_BYTES)
+    session_id = db.create_gui_session(
+        session_hash(sid),
+        auth=AuthMethod.TOKEN.value,
+        expires_at=_expires_at(settings),
+        subject="admin-token",
+        token_fp=token_fingerprint(settings),
+        client=client,
+        user_agent=user_agent,
     )
+    _set_cookie_session(session, sid)
+    return session_id
+
+
+def end_session(session: MutableMapping[str, Any], *, actor: str | None) -> bool:
+    """Logout: revoke the server-side session and empty the cookie (blocking).
+
+    True when an active session was revoked.
+    """
+    sid = session.get("sid") if session.get("v") == SESSION_VERSION else None
+    revoked: list[int] = []
+    if isinstance(sid, str) and sid:
+        revoked = db.revoke_gui_sessions(
+            token_hash=session_hash(sid), actor=actor, reason="logout"
+        )
+    session.clear()
+    return bool(revoked)
 
 
 @dataclass(frozen=True)
@@ -616,29 +710,38 @@ class OAuthIdentity:
             groups=tuple(claim_groups(claims)),
         )
 
-    def session_data(self, settings: AuthSettings) -> dict[str, Any]:
-        # Only the groups that grant admin are kept: the cookie stays small.
+    def admin_groups(self, settings: AuthSettings) -> list[str]:
+        """The groups that grant admin (only those are stored)."""
         matched = [g for g in self.groups if g.casefold() in settings.admin_groups]
-        return {
-            "v": SESSION_VERSION,
-            "auth": AuthMethod.OAUTH.value,
-            "sub": self.subject,
-            "iss": self.issuer,
-            "email": self.email,
-            "ev": self.email_verified,
-            "name": self.name,
-            "user": self.username,
-            "groups": matched[:20],
-            "iat": int(time.time()),
-        }
+        return matched[:20]
 
 
 def start_oauth_session(
-    session: MutableMapping[str, Any], identity: OAuthIdentity, settings: AuthSettings
-) -> None:
-    """Replace the session (incl. any OAuth state) with the new identity."""
-    session.clear()
-    session.update(identity.session_data(settings))
+    session: MutableMapping[str, Any],
+    identity: OAuthIdentity,
+    settings: AuthSettings,
+    *,
+    client: str | None = None,
+    user_agent: str | None = None,
+) -> int:
+    """Create a server-side OAuth session for ``identity``; its id (blocking)."""
+    sid = secrets.token_urlsafe(SESSION_ID_BYTES)
+    session_id = db.create_gui_session(
+        session_hash(sid),
+        auth=AuthMethod.OAUTH.value,
+        expires_at=_expires_at(settings),
+        subject=identity.subject,
+        issuer=identity.issuer,
+        email=identity.email,
+        email_verified=identity.email_verified,
+        name=identity.name,
+        username=identity.username,
+        groups=identity.admin_groups(settings),
+        client=client,
+        user_agent=user_agent,
+    )
+    _set_cookie_session(session, sid)
+    return session_id
 
 
 def parse_verified(value: Any) -> bool | None:
@@ -898,6 +1001,41 @@ class CSRFMiddleware:
                 await response(scope, receive, send)
                 return
         await self.app(scope, receive, send)
+
+
+class SecureCookieMiddleware:
+    """``SESSION_COOKIE_SECURE=auto``: mark the session cookie ``Secure`` on
+    responses to HTTPS requests.
+
+    ``scope["scheme"]`` is ``https`` for direct TLS and, behind a reverse
+    proxy, when uvicorn trusts its ``X-Forwarded-Proto`` (``--proxy-headers``
+    with ``--forwarded-allow-ips``): a client cannot fake it.
+    """
+
+    def __init__(self, app: ASGIApp, *, cookie_name: str = SESSION_COOKIE_NAME):
+        self.app = app
+        self.prefix = f"{cookie_name}=".encode("latin-1")
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http" or scope.get("scheme") != "https":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_secure(message: MutableMapping[str, Any]) -> None:
+            if message["type"] == "http.response.start":
+                headers = []
+                for name, value in message.get("headers", []):
+                    if (
+                        name.lower() == b"set-cookie"
+                        and value.startswith(self.prefix)
+                        and b"; secure" not in value.lower()
+                    ):
+                        value = value + b"; secure"
+                    headers.append((name, value))
+                message["headers"] = headers
+            await send(message)
+
+        await self.app(scope, receive, send_secure)
 
 
 def external_base_url(conn: HTTPConnection) -> str:

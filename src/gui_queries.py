@@ -173,6 +173,28 @@ def user_view(row: Mapping[str, Any]) -> dict[str, Any]:
     }
 
 
+def session_view(
+    row: Mapping[str, Any], *, current_id: int | None = None
+) -> dict[str, Any]:
+    """An admin GUI session (``db.list_gui_sessions`` row) for the browser."""
+    who = row.get("email") or row.get("username") or row.get("subject")
+    if row.get("auth") == "token":
+        who = "Token amministratore"
+    return {
+        "id": row.get("id"),
+        "auth": row.get("auth"),
+        "who": who,
+        "name": row.get("name"),
+        "groups": list(row.get("groups") or ()),
+        "client": row.get("client"),
+        "user_agent": row.get("user_agent"),
+        "created_at": iso(row.get("created_at")),
+        "last_seen_at": iso(row.get("last_seen_at")),
+        "expires_at": iso(row.get("expires_at")),
+        "current": current_id is not None and row.get("id") == current_id,
+    }
+
+
 def event_view(event: Mapping[str, Any]) -> dict[str, Any]:
     """An event-log item (as from ``db.list_events_after``) for the browser."""
     view = {key: _clip(value, MAX_RAW) for key, value in event.items()}

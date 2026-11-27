@@ -417,10 +417,16 @@ async def login_submit(request: Request) -> Response:
         logger.warning("Failed admin-token login from %s", key)
         return _login_failure(request, 401, "Token non valido", as_json=as_json)
     state.limiter.reset(key)
-    gui_auth.start_token_session(request.session, state.settings)
-    logger.info("Admin-token login from %s", key)
+    session_id = await db.aio(
+        gui_auth.start_token_session,
+        request.session,
+        state.settings,
+        client=key,
+        user_agent=request.headers.get("user-agent"),
+    )
+    logger.info("Admin-token login from %s (session %s)", key, session_id)
     plain_http = gui_auth.external_base_url(request).startswith("http://")
-    if state.settings.cookie_secure and plain_http:
+    if state.settings.cookie_secure is True and plain_http:
         logger.warning(
             "Admin-token login from %s over plain HTTP with SESSION_COOKIE_SECURE=true:"
             " the browser will not store the session cookie (serve the GUI over HTTPS"
@@ -428,14 +434,22 @@ async def login_submit(request: Request) -> Response:
             key,
         )
     if as_json:
-        principal = Principal(method=AuthMethod.TOKEN, is_admin=True)
+        principal = Principal(
+            method=AuthMethod.TOKEN, is_admin=True, session_id=session_id
+        )
         return JSONResponse({"ok": True, "me": principal.public()})
     return RedirectResponse("./", status_code=303)
 
 
 @public.post("/logout", include_in_schema=False)
 async def logout(request: Request) -> Response:
-    request.session.clear()
+    """End the session for good: the server-side record is revoked, so even
+    a copy of the cookie stops working."""
+    try:
+        principal = await db.aio(_resolve, request)
+    except AuthError:
+        principal = gui_auth.ANONYMOUS
+    await db.aio(gui_auth.end_session, request.session, actor=principal.actor)
     if _wants_json(request):
         return JSONResponse({"ok": True})
     return RedirectResponse("./", status_code=303)
@@ -551,9 +565,18 @@ async def oauth_callback(request: Request) -> Response:
             "Accesso non riuscito",
             "Il provider non ha restituito un'identità utilizzabile.",
         )
-    gui_auth.start_oauth_session(request.session, identity, state.settings)
+    session_id = await db.aio(
+        gui_auth.start_oauth_session,
+        request.session,
+        identity,
+        state.settings,
+        client=gui_auth.client_key(request),
+        user_agent=request.headers.get("user-agent"),
+    )
     logger.info(
-        "OAuth login: %s", identity.email or identity.username or identity.subject
+        "OAuth login: %s (session %s)",
+        identity.email or identity.username or identity.subject,
+        session_id,
     )
     _warn_unusable_email(identity, state.settings)
     return RedirectResponse("./", status_code=302)
@@ -957,7 +980,9 @@ def runtime_config(request: Request) -> dict[str, Any]:
             "oauth_redirect_uri": (
                 settings.oauth.redirect_uri if settings.oauth else None
             ),
-            "session_cookie_secure": settings.cookie_secure,
+            "session_cookie_secure": (
+                "auto" if settings.cookie_secure is None else settings.cookie_secure
+            ),
             "session_max_age_seconds": settings.session_max_age,
             "secret_key_ephemeral": settings.secret_key_ephemeral,
             "trusted_origins": sorted(settings.trusted_origins),
@@ -1058,6 +1083,44 @@ def _change_user(state: GuiState, user_id: int, role: str | None) -> None:
             ) from exc
     if not found:
         raise HTTPException(404, "Utente non trovato")
+
+
+# Sessions ----------------------------------------------------------------------
+@api.get("/api/sessions")
+def list_sessions(principal: AdminPrincipal) -> dict[str, Any]:
+    """Active admin GUI sessions (the caller's is marked ``current``)."""
+    rows = db.list_gui_sessions()
+    return {
+        "items": [
+            gui_queries.session_view(row, current_id=principal.session_id)
+            for row in rows
+        ],
+        "current_session_id": principal.session_id,
+    }
+
+
+@api.post("/api/sessions/{session_id}/revoke")
+def revoke_session(session_id: DbIdPath, principal: AdminPrincipal) -> dict[str, Any]:
+    """End one session (it is logged out at its next request)."""
+    revoked = db.revoke_gui_sessions(session_ids=[session_id], actor=principal.actor)
+    if not revoked:
+        raise HTTPException(404, "Sessione non trovata o già terminata")
+    logger.warning("%s revoked GUI session %s", principal.actor, session_id)
+    return {
+        "ok": True,
+        "revoked": revoked,
+        "current": session_id == principal.session_id,
+    }
+
+
+@api.post("/api/sessions/revoke_others")
+def revoke_other_sessions(principal: AdminPrincipal) -> dict[str, Any]:
+    """End every session but the caller's (all of them for a bearer token)."""
+    revoked = db.revoke_gui_sessions(
+        all_except=principal.session_id or 0, actor=principal.actor
+    )
+    logger.warning("%s revoked %d other GUI session(s)", principal.actor, len(revoked))
+    return {"ok": True, "revoked": revoked}
 
 
 @api.get("/api/users")
@@ -1293,6 +1356,22 @@ def create_app(
             getattr(config, "GUI_REQUEUE_MAX_AGE_SECONDS", DEFAULT_REQUEUE_MAX_AGE)
         ),
     )
+    middleware = [
+        Middleware(SecurityHeadersMiddleware),
+        Middleware(gui_auth.CSRFMiddleware, settings=settings),
+    ]
+    if settings.cookie_secure is None:  # auto: Secure on HTTPS requests
+        middleware.append(Middleware(gui_auth.SecureCookieMiddleware))
+    middleware.append(
+        Middleware(
+            SessionMiddleware,
+            secret_key=settings.secret_key,
+            session_cookie=gui_auth.SESSION_COOKIE_NAME,
+            max_age=settings.session_max_age,
+            same_site="lax",
+            https_only=settings.cookie_secure is True,
+        )
+    )
     application = FastAPI(
         title="Social media reuploader - Admin GUI",
         version=__version__,
@@ -1300,18 +1379,7 @@ def create_app(
         docs_url=None,
         redoc_url=None,
         openapi_url=None,
-        middleware=[
-            Middleware(SecurityHeadersMiddleware),
-            Middleware(gui_auth.CSRFMiddleware, settings=settings),
-            Middleware(
-                SessionMiddleware,
-                secret_key=settings.secret_key,
-                session_cookie=gui_auth.SESSION_COOKIE_NAME,
-                max_age=settings.session_max_age,
-                same_site="lax",
-                https_only=settings.cookie_secure,
-            ),
-        ],
+        middleware=middleware,
     )
     application.state.gui = state
     application.add_exception_handler(sqlite3.Error, _database_error)

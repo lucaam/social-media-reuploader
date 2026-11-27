@@ -324,8 +324,8 @@
               indicato in OAUTH_ADMIN_GROUPS. Le e-mail di provider che non dichiarano la verifica
               (es. GitHub) contano solo con OAUTH_ASSUME_EMAIL_VERIFIED=true.
               Il ruolo è ricontrollato a ogni richiesta; i gruppi invece sono quelli comunicati dal
-              provider all'accesso, quindi un cambio di gruppo vale dal login successivo (o dalla
-              scadenza della sessione). Cambiare SECRET_KEY chiude subito tutte le sessioni.
+              provider all'accesso, quindi un cambio di gruppo vale dal login successivo (o termina
+              la sessione qui sotto). Cambiare SECRET_KEY chiude subito tutte le sessioni.
             </p>
             <form id="userForm" class="row g-2 align-items-end">
               <div class="col-md-5">
@@ -365,6 +365,34 @@
                   </tr>
                 </thead>
                 <tbody id="usersBody"></tbody>
+              </table>
+            </div>
+          </div></div>
+          <div class="card mt-3"><div class="card-body">
+            <div class="d-flex justify-content-between align-items-center flex-wrap gap-2">
+              <div>
+                <h2 class="h6 mb-0">Sessioni attive</h2>
+                <div id="sessionsSummary" class="small text-body-secondary"></div>
+              </div>
+              <button id="revokeOthersBtn" class="btn btn-sm btn-outline-danger" type="button">Termina le altre sessioni</button>
+            </div>
+            <p class="small text-body-secondary mt-2 mb-0">
+              Ogni accesso crea una sessione sul server: l'uscita o la chiusura da qui la terminano
+              davvero, anche se il cookie fosse stato copiato altrove.
+            </p>
+            <div class="table-responsive mt-2">
+              <table class="table table-sm align-middle mb-0">
+                <thead>
+                  <tr>
+                    <th scope="col">Chi</th>
+                    <th scope="col">Accesso</th>
+                    <th scope="col">Indirizzo e browser</th>
+                    <th scope="col">Iniziata</th>
+                    <th scope="col">Ultima attività</th>
+                    <th scope="col" class="text-end">Azioni</th>
+                  </tr>
+                </thead>
+                <tbody id="sessionsBody"></tbody>
               </table>
             </div>
           </div></div>

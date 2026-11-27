@@ -364,6 +364,8 @@ def test_token_login_json_session_and_logout():
     assert f"max-age={gui_auth.DEFAULT_SESSION_MAX_AGE}" in cookie
     assert "secure" not in cookie
     me = client.get("/api/me").json()
+    session_id = me.pop("session_id")
+    assert isinstance(session_id, int)
     assert me == {
         "authenticated": True,
         "is_admin": True,
@@ -377,6 +379,87 @@ def test_token_login_json_session_and_logout():
     assert logout.headers["location"] == "./"
     assert client.get("/api/me").json()["authenticated"] is False
     assert client.get("/api/requests").status_code == 401
+
+
+def test_logout_ends_the_session_even_for_a_copied_cookie():
+    app = gui.create_app(settings())
+    client = TestClient(app)
+    assert client.post("/login", json={"token": TOKEN}, headers=SAME).status_code == 200
+    stolen = client.cookies.get(gui_auth.SESSION_COOKIE_NAME)
+    copy = TestClient(app)
+    copy.cookies.set(gui_auth.SESSION_COOKIE_NAME, stolen)
+    assert copy.get("/api/requests").status_code == 200
+    assert (
+        client.post("/logout", headers=SAME, follow_redirects=False).status_code == 303
+    )
+    # the server-side record is revoked: the copy is logged out too
+    assert copy.get("/api/requests").status_code == 401
+    assert copy.get("/api/me").json()["authenticated"] is False
+    (logout,) = [e for e in db.list_events_after(0) if e["type"] == "gui_logout"]
+    assert logout["actor"] == "gui:token"
+
+
+def test_the_cookie_holds_only_a_random_session_id():
+    from itsdangerous import TimestampSigner
+
+    client = TestClient(gui.create_app(settings()))
+    client.post("/login", json={"token": TOKEN}, headers=SAME)
+    cookie = client.cookies.get(gui_auth.SESSION_COOKIE_NAME)
+    payload = TimestampSigner("k" * 40).unsign(cookie)
+    data = json.loads(base64.b64decode(payload))
+    assert set(data) == {"v", "sid"} and data["v"] == gui_auth.SESSION_VERSION
+    assert len(data["sid"]) >= 40
+    (row,) = db.list_gui_sessions()
+    stored = db.get_gui_session(gui_auth.session_hash(data["sid"]))
+    assert stored["id"] == row["id"]
+    with db.connect() as conn:  # only the hash of the id is stored
+        hashes = [r[0] for r in conn.execute("SELECT token_hash FROM gui_sessions")]
+    assert hashes == [gui_auth.session_hash(data["sid"])]
+    assert data["sid"] not in hashes
+
+
+def test_sessions_can_be_listed_and_revoked():
+    app = gui.create_app(settings())
+    admin, other = TestClient(app), TestClient(app)
+    admin.post("/login", json={"token": TOKEN}, headers=SAME)
+    other.post("/login", json={"token": TOKEN}, headers=SAME)
+    listing = admin.get("/api/sessions").json()
+    assert len(listing["items"]) == 2
+    current = [item for item in listing["items"] if item["current"]]
+    assert [item["id"] for item in current] == [listing["current_session_id"]]
+    other_id = next(item["id"] for item in listing["items"] if not item["current"])
+    assert listing["items"][0]["who"] == "Token amministratore"
+    revoked = admin.post(f"/api/sessions/{other_id}/revoke", headers=SAME)
+    assert revoked.json() == {"ok": True, "revoked": [other_id], "current": False}
+    assert other.get("/api/requests").status_code == 401
+    again = admin.post(f"/api/sessions/{other_id}/revoke", headers=SAME)
+    assert again.status_code == 404
+    third = TestClient(app)
+    third.post("/login", json={"token": TOKEN}, headers=SAME)
+    others = admin.post("/api/sessions/revoke_others", headers=SAME).json()
+    assert len(others["revoked"]) == 1
+    assert third.get("/api/requests").status_code == 401
+    assert admin.get("/api/requests").status_code == 200  # its own survives
+    # a bearer client (no session) ends every session
+    bearer = {"Authorization": f"Bearer {TOKEN}"}
+    assert (
+        len(admin.post("/api/sessions/revoke_others", headers=bearer).json()["revoked"])
+        == 1
+    )
+    assert admin.get("/api/requests").status_code == 401
+
+
+def test_expired_server_side_session_is_anonymous():
+    config = settings(session_max_age=600)
+    client = TestClient(gui.create_app(config))
+    client.post("/login", json={"token": TOKEN}, headers=SAME)
+    with db.write() as conn:
+        conn.execute(
+            "UPDATE gui_sessions SET expires_at = ?",
+            (db.iso_from_ts(time.time() - 1),),
+        )
+    assert client.get("/api/me").json()["authenticated"] is False
+    assert db.list_gui_sessions() == []
 
 
 def test_logout_json_and_get_not_allowed():
@@ -459,22 +542,23 @@ def test_rotating_the_admin_token_invalidates_token_sessions():
 
 def test_session_lifetime_is_bounded():
     config = settings(session_max_age=600)
-    fingerprint = gui_auth.token_fingerprint(config)
-    fresh = {"v": 1, "auth": "token", "fp": fingerprint, "iat": int(time.time())}
-    principal = gui_auth.session_principal(fresh, config, oauth_enabled=False)
-    assert principal.is_admin is True
-    old = dict(fresh, iat=int(time.time()) - 700)
-    assert (
-        gui_auth.session_principal(old, config, oauth_enabled=False).is_admin is False
-    )
-    future = dict(fresh, iat=int(time.time()) + 3600)
-    assert (
-        gui_auth.session_principal(future, config, oauth_enabled=False).is_admin
-        is False
-    )
-    assert gui_auth.session_principal(
-        dict(fresh, v=2), config, oauth_enabled=False
-    ) == (gui_auth.ANONYMOUS)
+    session: dict = {}
+    before = time.time()
+    session_id = gui_auth.start_token_session(session, config)
+    row = db.get_gui_session(gui_auth.session_hash(session["sid"]))
+    assert row["id"] == session_id
+    assert db.ts_from_iso(row["expires_at"]) == pytest.approx(before + 600, abs=5)
+    principal = gui_auth.session_principal(session, config, oauth_enabled=False)
+    assert principal.is_admin is True and principal.session_id == session_id
+    # old cookie formats and unknown ids are anonymous
+    for bad in (
+        {"v": 1, "auth": "token", "fp": "x", "iat": int(time.time())},
+        {"v": 2, "sid": "not-a-session"},
+        {"v": 2},
+    ):
+        assert gui_auth.session_principal(bad, config, oauth_enabled=False) == (
+            gui_auth.ANONYMOUS
+        )
     response = TestClient(gui.create_app(config)).post(
         "/login", json={"token": TOKEN}, headers=SAME
     )
@@ -485,6 +569,42 @@ def test_secure_cookie_flag_is_configurable():
     client = TestClient(gui.create_app(settings(cookie_secure=True)))
     response = client.post("/login", json={"token": TOKEN}, headers=SAME)
     assert "; secure" in response.headers["set-cookie"].lower()
+    plain = TestClient(gui.create_app(settings(cookie_secure=False)))
+    response = plain.post("/login", json={"token": TOKEN}, headers=SAME)
+    assert "secure" not in response.headers["set-cookie"].lower()
+
+
+def test_secure_cookie_auto_follows_the_request_scheme(monkeypatch):
+    for value, expected in (("auto", None), (None, None), ("true", True)):
+        if value is None:
+            monkeypatch.delenv("SESSION_COOKIE_SECURE", raising=False)
+        else:
+            monkeypatch.setenv("SESSION_COOKIE_SECURE", value)
+        assert AuthSettings.from_env().cookie_secure is expected
+    app = gui.create_app(settings(cookie_secure=None))
+    over_http = TestClient(app).post("/login", json={"token": TOKEN}, headers=SAME)
+    assert "secure" not in over_http.headers["set-cookie"].lower()
+    https = TestClient(app, base_url="https://testserver")
+    secure = https.post(
+        "/login",
+        json={"token": TOKEN},
+        headers={"Origin": "https://testserver"},
+    )
+    assert secure.status_code == 200
+    assert "; secure" in secure.headers["set-cookie"].lower()
+
+
+def test_oauth_uses_pkce():
+    oauth = gui_auth.OAuthSettings(
+        client_id="c", client_secret="s", server_metadata_url="https://idp/x"
+    )
+    assert oauth.register_kwargs()["client_kwargs"]["code_challenge_method"] == "S256"
+
+
+def test_token_comparison_does_not_depend_on_the_length():
+    assert gui_auth.tokens_match("same-token", "same-token")
+    assert not gui_auth.tokens_match("short", "a-much-longer-expected-token")
+    assert not gui_auth.tokens_match("", "x")
 
 
 def test_secure_cookie_over_plain_http_is_reported(caplog):
@@ -903,8 +1023,9 @@ def test_identity_from_claims():
         {"sub": "s", "groups": [f"group-{i}" for i in range(500)]}
     )
     assert len(big.groups) == 200
-    data = big.session_data(settings(admin_groups=frozenset({"group-7"})))
-    assert data["groups"] == ["group-7"]
+    assert big.admin_groups(settings(admin_groups=frozenset({"group-7"}))) == [
+        "group-7"
+    ]
 
 
 def test_real_authlib_oidc_flow_verifies_the_id_token_with_jwks():

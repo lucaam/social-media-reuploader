@@ -89,6 +89,9 @@
     chat_unlimited_all: 'Tutte le chat sbloccate',
     history_cleared: 'Storico eliminato',
     history_pruned: 'Pulizia automatica', // retention (UPDATES/REQUESTS_RETENTION_DAYS)
+    gui_login: 'Accesso alla console',
+    gui_logout: 'Uscita dalla console',
+    gui_sessions_revoked: 'Sessioni terminate',
     update_created: 'Riga non strutturata'
   }
   const FIELD_LABELS = {
@@ -773,6 +776,11 @@
         case 'history_pruned':
           ALL_RESOURCES.forEach((n) => names.add(n))
           break
+        case 'gui_login':
+        case 'gui_logout':
+        case 'gui_sessions_revoked':
+          names.add('users')
+          break
         default:
           break
       }
@@ -1433,6 +1441,12 @@
         return 'Eliminate ' + fmtNumber(e.requests) + ' richieste e ' + fmtNumber(e.updates) + ' eventi' + (e.actor ? ' da ' + e.actor : '')
       case 'history_pruned':
         return 'Retention: ' + fmtNumber(e.requests) + ' richieste e ' + fmtNumber(e.updates) + ' eventi eliminati'
+      case 'gui_login':
+        return (e.auth === 'token' ? 'Accesso con il token' : 'Accesso OAuth' + (e.who ? ' di ' + e.who : '')) + (e.client ? ' da ' + e.client : '') + ' (sessione ' + e.session_id + ')'
+      case 'gui_logout':
+        return 'Uscita (sessione ' + (e.session_ids || []).join(', ') + ')'
+      case 'gui_sessions_revoked':
+        return fmtNumber((e.session_ids || []).length) + ' sessioni terminate' + (e.actor ? ' da ' + e.actor : '')
       case 'update_created':
         return String(e.raw || '').slice(0, 300)
       default: {
@@ -1489,8 +1503,56 @@
   // Users
   // ---------------------------------------------------------------------
   loaders.users = async () => {
-    const data = await latest('users', () => api('api/users?limit=200'))
-    if (data !== STALE) renderUsers(data)
+    const data = await latest('users', () => Promise.all([api('api/users?limit=200'), api('api/sessions')]))
+    if (data === STALE) return
+    renderUsers(data[0])
+    renderSessions(data[1])
+  }
+
+  function renderSessions (data) {
+    const body = $('sessionsBody')
+    body.replaceChildren()
+    const others = data.items.filter((s) => !s.current).length
+    $('sessionsSummary').textContent = fmtNumber(data.items.length) + ' sessioni attive'
+    $('revokeOthersBtn').disabled = others === 0
+    if (!data.items.length) body.append(emptyRow(6, 'Nessuna sessione attiva.'))
+    for (const s of data.items) {
+      const who = el('td', null, el('span', { text: s.who || '—' }))
+      if (s.groups && s.groups.length) who.append(el('div', { className: 'small text-body-secondary', text: 'gruppi: ' + s.groups.join(', ') }))
+      const device = el('td', { className: 'small' },
+        el('div', { text: s.client || '—' }),
+        el('div', { className: 'text-body-secondary text-truncate session-agent', text: s.user_agent || '', title: s.user_agent || '' }))
+      const actions = el('td', { className: 'text-end' })
+      if (s.current) actions.append(el('span', { className: 'badge text-bg-success', text: 'Questa sessione' }))
+      else actions.append(button('Termina', 'btn-outline-danger', () => revokeSession(s)))
+      body.append(el('tr', null,
+        who,
+        el('td', null, el('span', { className: 'badge text-bg-light', text: s.auth === 'token' ? 'Token' : 'OAuth' })),
+        device,
+        el('td', null, timeAgo(s.created_at)),
+        el('td', null, timeAgo(s.last_seen_at)),
+        actions))
+    }
+  }
+
+  async function revokeSession (session) {
+    const ok = await confirmDialog('Terminare la sessione?', 'La sessione di ' + (session.who || session.id) + ' verrà chiusa alla sua prossima richiesta.', 'Termina', true)
+    if (!ok) return
+    try {
+      await api('api/sessions/' + encodeURIComponent(session.id) + '/revoke', { method: 'POST' })
+      toast('Sessione terminata.', 'success')
+    } catch (e) { return }
+    runLoader('users', true)
+  }
+
+  async function revokeOtherSessions () {
+    const ok = await confirmDialog('Terminare le altre sessioni?', 'Tutte le sessioni tranne questa verranno chiuse: chi le usa dovrà accedere di nuovo.', 'Termina tutte', true)
+    if (!ok) return
+    try {
+      const result = await api('api/sessions/revoke_others', { method: 'POST' })
+      toast(fmtNumber(result.revoked.length) + ' sessioni terminate.', 'success')
+    } catch (e) { return }
+    runLoader('users', true)
   }
 
   function renderUsers (data) {
@@ -1671,6 +1733,7 @@
     $('requeueRetryableBtn').addEventListener('click', requeueRetryable)
     $('unlimitAllBtn').addEventListener('click', () => unlimit(null))
     $('userForm').addEventListener('submit', createUser)
+    $('revokeOthersBtn').addEventListener('click', revokeOtherSessions)
     $('clearHistoryBtn').addEventListener('click', clearHistory)
     setupEventFilters()
 

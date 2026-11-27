@@ -51,7 +51,7 @@ from . import config
 logger = logging.getLogger(__name__)
 
 # Version written to ``PRAGMA user_version`` once every migration has run.
-SCHEMA_VERSION = 3
+SCHEMA_VERSION = 4
 # Seconds a connection waits for a lock held by another connection before
 # raising ``sqlite3.OperationalError: database is locked``. Read on every
 # connect, so tests may lower it.
@@ -134,6 +134,9 @@ class EventType(StrEnum):
     CHAT_UNLIMITED_ALL = "chat_unlimited_all"
     HISTORY_CLEARED = "history_cleared"
     HISTORY_PRUNED = "history_pruned"
+    GUI_LOGIN = "gui_login"
+    GUI_LOGOUT = "gui_logout"
+    GUI_SESSIONS_REVOKED = "gui_sessions_revoked"
     UPDATE_CREATED = "update_created"  # legacy row whose raw text is not an event
 
 
@@ -736,10 +739,43 @@ def _migration_3_rate_slots(conn: sqlite3.Connection) -> None:
     )
 
 
+def _migration_4_gui_sessions(conn: sqlite3.Connection) -> None:
+    """Server-side admin GUI sessions (logout and revocation really end them).
+
+    The cookie only carries a random session id; this table keeps its SHA-256
+    (``token_hash``), the identity and the lifetime. ``id`` is the public
+    handle shown in the GUI.
+    """
+    conn.execute("""CREATE TABLE IF NOT EXISTS gui_sessions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            token_hash TEXT NOT NULL UNIQUE,
+            auth TEXT NOT NULL,
+            subject TEXT,
+            issuer TEXT,
+            email TEXT,
+            email_verified INTEGER,
+            name TEXT,
+            username TEXT,
+            groups TEXT,
+            token_fp TEXT,
+            client TEXT,
+            user_agent TEXT,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL,
+            last_seen_at TEXT,
+            revoked_at TEXT,
+            revoked_by TEXT
+        )""")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_gui_sessions_expires ON gui_sessions(expires_at)"
+    )
+
+
 _MIGRATIONS: tuple[tuple[int, Callable[[sqlite3.Connection], None]], ...] = (
     (1, _migration_1_legacy_baseline),
     (2, _migration_2_queue_and_limits),
     (3, _migration_3_rate_slots),
+    (4, _migration_4_gui_sessions),
 )
 
 
@@ -2097,6 +2133,206 @@ def delete_user(user_id: int) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# Admin GUI sessions
+# ---------------------------------------------------------------------------
+GUI_SESSION_AUTHS = frozenset({"token", "oauth"})
+# last_seen_at is refreshed at most this often (a write per request otherwise).
+GUI_SESSION_TOUCH_SECONDS = 60.0
+# Revoked/expired sessions are kept this long for the GUI, then pruned.
+GUI_SESSION_KEEP_SECONDS = 7 * 86400
+_GUI_SESSION_PUBLIC_COLUMNS = (
+    "id, auth, subject, issuer, email, email_verified, name, username, groups,"
+    " client, user_agent, created_at, expires_at, last_seen_at, revoked_at,"
+    " revoked_by"
+)
+
+
+def _gui_session_view(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    item = _dict(row)
+    if item is None:
+        return None
+    try:
+        groups = json.loads(item.get("groups") or "[]")
+    except ValueError:
+        groups = []
+    item["groups"] = (
+        [g for g in groups if isinstance(g, str)] if isinstance(groups, list) else []
+    )
+    verified = item.get("email_verified")
+    item["email_verified"] = None if verified is None else bool(verified)
+    return item
+
+
+def create_gui_session(
+    token_hash: str,
+    *,
+    auth: str,
+    expires_at: str,
+    subject: str | None = None,
+    issuer: str | None = None,
+    email: str | None = None,
+    email_verified: bool | None = None,
+    name: str | None = None,
+    username: str | None = None,
+    groups: Iterable[str] = (),
+    token_fp: str | None = None,
+    client: str | None = None,
+    user_agent: str | None = None,
+) -> int:
+    """Store a new admin GUI session (``token_hash`` = SHA-256 of its id)."""
+    if auth not in GUI_SESSION_AUTHS:
+        raise ValueError(f"invalid session kind {auth!r}")
+    now = _utc_now()
+    verified = None if email_verified is None else int(bool(email_verified))
+    with write() as conn:
+        cur = conn.execute(
+            """INSERT INTO gui_sessions (token_hash, auth, subject, issuer, email,
+                   email_verified, name, username, groups, token_fp, client,
+                   user_agent, created_at, expires_at, last_seen_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                token_hash,
+                auth,
+                subject,
+                issuer,
+                email,
+                verified,
+                name,
+                username,
+                json.dumps(list(groups)),
+                token_fp,
+                (client or "")[:64] or None,
+                (user_agent or "")[:200] or None,
+                now,
+                _canonical_iso(expires_at),
+                now,
+            ),
+        )
+        session_id = int(cur.lastrowid)
+        _append_event(
+            conn,
+            EventType.GUI_LOGIN,
+            {
+                "session_id": session_id,
+                "auth": auth,
+                "who": email or username or subject,
+                "client": client,
+            },
+            now,
+        )
+        return session_id
+
+
+def get_gui_session(
+    token_hash: str, *, now_iso: str | None = None
+) -> dict[str, Any] | None:
+    """The active (not revoked, not expired) session with this hash, or None."""
+    now = _canonical_iso(now_iso) if now_iso is not None else _utc_now()
+    with connect() as conn:
+        row = conn.execute(
+            f"""SELECT {_GUI_SESSION_PUBLIC_COLUMNS}, token_fp FROM gui_sessions
+                WHERE token_hash = ? AND revoked_at IS NULL AND expires_at > ?""",
+            (token_hash, now),
+        ).fetchone()
+    return _gui_session_view(row)
+
+
+def touch_gui_session(session_id: int, *, now_iso: str | None = None) -> None:
+    """Record activity (at most every ``GUI_SESSION_TOUCH_SECONDS``)."""
+    now = _canonical_iso(now_iso) if now_iso is not None else _utc_now()
+    stale = iso_from_ts(ts_from_iso(now) - GUI_SESSION_TOUCH_SECONDS)
+    with write() as conn:
+        conn.execute(
+            """UPDATE gui_sessions SET last_seen_at = ?
+               WHERE id = ? AND revoked_at IS NULL
+                 AND (last_seen_at IS NULL OR last_seen_at < ?)""",
+            (now, session_id, stale),
+        )
+
+
+def list_gui_sessions(
+    *, active_only: bool = True, limit: int = 100
+) -> list[dict[str, Any]]:
+    """Sessions, newest first (never their token hash)."""
+    now = _utc_now()
+    where = "WHERE revoked_at IS NULL AND expires_at > ?" if active_only else ""
+    params: tuple[Any, ...] = (now,) if active_only else ()
+    with connect() as conn:
+        rows = conn.execute(
+            f"""SELECT {_GUI_SESSION_PUBLIC_COLUMNS} FROM gui_sessions {where}
+                ORDER BY id DESC LIMIT ?""",
+            (*params, max(0, min(int(limit), 1000))),
+        ).fetchall()
+    return [view for row in rows if (view := _gui_session_view(row)) is not None]
+
+
+def revoke_gui_sessions(
+    *,
+    session_ids: Iterable[int] | None = None,
+    token_hash: str | None = None,
+    all_except: int | None = None,
+    actor: str | None = None,
+    reason: str = "revoked",
+) -> list[int]:
+    """Revoke active sessions: by id, by hash (logout), or all but one.
+
+    Exactly one selector must be given (``all_except=0`` revokes every
+    session). Returns the ids revoked; one event per call.
+    """
+    selectors = [
+        session_ids is not None,
+        token_hash is not None,
+        all_except is not None,
+    ]
+    if sum(selectors) != 1:
+        raise ValueError("give exactly one of session_ids, token_hash, all_except")
+    now = _utc_now()
+    if session_ids is not None:
+        ids = sorted({int(item) for item in session_ids})
+        if not ids:
+            return []
+        condition, params = f"id IN ({_marks(len(ids))})", tuple(ids)
+    elif token_hash is not None:
+        condition, params = "token_hash = ?", (token_hash,)
+    else:
+        condition, params = "id != ?", (int(all_except or 0),)
+    with write() as conn:
+        revoked = [
+            int(row[0])
+            for row in conn.execute(
+                f"""UPDATE gui_sessions SET revoked_at = ?, revoked_by = ?
+                    WHERE {condition} AND revoked_at IS NULL AND expires_at > ?
+                    RETURNING id""",
+                (now, actor, *params, now),
+            ).fetchall()
+        ]
+        if revoked:
+            event = (
+                EventType.GUI_LOGOUT
+                if reason == "logout"
+                else (EventType.GUI_SESSIONS_REVOKED)
+            )
+            _append_event(
+                conn,
+                event,
+                {"session_ids": sorted(revoked), "actor": actor, "reason": reason},
+                now,
+            )
+    return sorted(revoked)
+
+
+def prune_gui_sessions(*, keep_seconds: float = GUI_SESSION_KEEP_SECONDS) -> int:
+    """Delete sessions that expired or were revoked more than ``keep_seconds`` ago."""
+    cutoff = iso_from_ts(time.time() - max(0.0, keep_seconds))
+    with write() as conn:
+        return conn.execute(
+            """DELETE FROM gui_sessions
+               WHERE expires_at < ? OR (revoked_at IS NOT NULL AND revoked_at < ?)""",
+            (cutoff, cutoff),
+        ).rowcount
+
+
+# ---------------------------------------------------------------------------
 # Maintenance
 # ---------------------------------------------------------------------------
 def _max_rate_window_seconds() -> float:
@@ -2177,6 +2413,7 @@ def prune(
         (),
         "request_events",
     )
+    counts["gui_sessions"] = prune_gui_sessions()
     if any(counts.values()):
         add_event(EventType.HISTORY_PRUNED, **counts)
     return counts

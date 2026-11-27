@@ -823,7 +823,7 @@ def test_config_endpoints(client):
     cfg = client.get("/api/config").json()
     assert cfg["auth"]["token"] is True
     assert cfg["auth"]["oauth"] is False
-    assert cfg["auth"]["session_cookie_secure"] is False
+    assert cfg["auth"]["session_cookie_secure"] == "auto"
     assert cfg["limits"]["source"] == "gui_config"
     assert cfg["settings"]["max_pending_per_chat"] == config.MAX_PENDING_PER_CHAT
     assert isinstance(cfg["warnings"], list)

@@ -198,6 +198,20 @@ def test_websocket_is_closed_when_admin_rights_are_revoked():
             assert closed.value.code == 1008
 
 
+def test_websocket_is_closed_when_its_session_is_revoked():
+    app = make_app(ws_recheck_seconds=0.05)
+    with TestClient(app) as client:
+        login = client.post("/login", json={"token": TOKEN}, headers=SAME)
+        session_id = login.json()["me"]["session_id"]
+        with client.websocket_connect("/ws/updates", headers=SAME) as ws:
+            assert recv(ws)["kind"] == "hello"
+            assert db.revoke_gui_sessions(session_ids=[session_id]) == [session_id]
+            with pytest.raises(WebSocketDisconnect) as closed:
+                while True:
+                    recv(ws)
+            assert closed.value.code == 1008
+
+
 def test_slow_clients_are_dropped_and_shutdown_closes_sockets():
     app = make_app()
     hub = app.state.gui.hub
