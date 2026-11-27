@@ -1,5 +1,3 @@
-# syntax=docker/dockerfile:1
-#
 # One image, two processes:
 #   bot (default CMD):  python -m src.bot          -> /health, /metrics on $PORT (8080)
 #   admin GUI:          uvicorn src.gui:app --host 0.0.0.0 --port 8081
@@ -9,7 +7,9 @@
 # tag) and adds the build-specific OCI labels (revision, created, version).
 # The base image is pinned by digest: Renovate proposes its updates as
 # fix(deps) pull requests, so a merged base image update ships as a patch
-# release.
+# release. No `# syntax=` line on purpose: the Dockerfile frontend built into
+# BuildKit (pinned in the workflows) is enough, and a syntax image would be
+# one more download that nothing pins.
 FROM python:3.14-slim@sha256:22eafb370920ad8b429e0aec3fff433e0669968519f5d60469d83729c138b28b
 
 LABEL org.opencontainers.image.title="social-media-reuploader" \
