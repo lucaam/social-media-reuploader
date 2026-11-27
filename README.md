@@ -89,8 +89,15 @@ gruppi esistenti) oppure rendi il bot amministratore del gruppo.
 - I link rifiutati non consumano quota e non bloccano gli altri link della chat.
   Dalla GUI si possono azzerare i limiti di una chat e rimettere in coda le
   richieste.
-- Contenuti che richiedono il login (es. molti post Instagram/Facebook)
-  funzionano solo con un file di cookie (`YTDLP_COOKIES_PATH`).
+- Contenuti che richiedono il login funzionano solo con un file di cookie
+  (`YTDLP_COOKIES_PATH`, vedi [Deploy](docs/deploy.md#cookie-per-i-siti-con-login)).
+  Instagram scarica i post pubblici anche senza, ma non quelli visibili solo da
+  loggati; **TikTok** da molti IP di server rifiuta ogni accesso anonimo
+  ("TikTok is requiring login"), quindi di fatto serve il file. Esporta il
+  `cookies.txt` (formato Netscape) da un browser loggato con un account
+  secondario: i cookie danno accesso all'account e i siti possono limitare gli
+  account usati da script. Senza cookie il bot risponde che il contenuto
+  richiede l'accesso e lo segnala nei log una volta per sito.
 
 ## Avvio rapido
 
