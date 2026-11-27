@@ -5,15 +5,30 @@ name: Release
 # breaking change: see scripts/release/version.py), released with no manual
 # step:
 #
-#   gate (ci.yml) --> version --> image --> chart --> release
-#                                 (tested, attested, signed, then tagged;
-#                                  the chart only once its image exists)
+#   gate (ci.yml) --> version --+--> image (amd64, arm64) --> index --+--> publish
+#                               +--> chart ---------------------------+
+#
+#   image    each platform built natively, with no build cache, pushed by
+#            digest only (no tag) and smoke-tested;
+#   index    one image index of both platforms, pushed by digest, attested
+#            and signed;
+#   chart    packaged with the release version, the archive attested;
+#   publish  the only job that makes anything public, once every other one
+#            succeeded: the image tags (on the signed index), the OCI chart
+#            (attested and signed), then the tag and the GitHub release.
+#
+# A failure before publish leaves nothing public but untagged digests (with
+# their signatures and attestations). Every job that pushes starts with the
+# same guard, which fails closed: it reads the release tags from GitHub and
+# stops when the planned tag, or a higher release tag, exists. "Re-run failed
+# jobs" reuses the plan of the first attempt: a run older than a release
+# publishes nothing, and never moves `latest` back.
 #
 # The tag vX.Y.Z is the only record of a release: nothing is committed back
 # to main, the version is injected at build time (image: --build-arg VERSION;
-# chart: helm package --version/--app-version). Image and chart are published
-# before the tag: a failed run leaves no tag, and the next push to main (or
-# "Re-run failed jobs" on that same run) publishes that version again. Events
+# chart: helm package --version/--app-version). publish creates the tag
+# last: after a failure no tag exists, and the next push to main (or
+# "Re-run failed jobs" on that same run) releases that version again. Events
 # of GITHUB_TOKEN start no other workflow, so everything happens in this run.
 #
 # Manual runs (Actions > Release > Run workflow, branch main):
@@ -54,6 +69,12 @@ env:
   PYTHON_VERSION: "3.14"
   # renovate: datasource=github-releases depName=helm/helm
   HELM_VERSION: v4.3.2
+  # The build tools are pinned too: BuildKit, and the SBOM generator it runs
+  # (by default the moving tag docker/buildkit-syft-scanner:stable-1).
+  # renovate: datasource=docker
+  BUILDKIT_IMAGE: moby/buildkit:v0.35.1@sha256:baf6138eb8c37644800c7c913fba051e840ebb9ba13eaf92d92ef9a1712d0b4c
+  # renovate: datasource=docker
+  SBOM_GENERATOR: docker/buildkit-syft-scanner:1.12.1@sha256:873a7458c3c8ac8e32c7b796c10e1600b07b963d2aa000a72a2d97aaaa2d6315
   CHART_PATH: charts/social-media-reuploader
   CHART_NAME: social-media-reuploader
 
@@ -85,12 +106,13 @@ jobs:
       version: ${{ steps.plan.outputs.version }}
       tag: ${{ steps.plan.outputs.tag }}
       sha: ${{ steps.plan.outputs.sha }}
-      short_sha: ${{ steps.plan.outputs.short_sha }}
       latest: ${{ steps.plan.outputs.latest }}
-      stable: ${{ steps.plan.outputs.stable }}
       image: ${{ steps.names.outputs.image }}
       chart-repo: ${{ steps.names.outputs.chart-repo }}
       chart: ${{ steps.names.outputs.chart }}
+      image-tags: ${{ steps.meta.outputs.tags }}
+      image-labels: ${{ steps.meta.outputs.labels }}
+      image-annotations: ${{ steps.meta.outputs.annotations }}
     steps:
       - name: Releases come from main only
         if: github.ref != 'refs/heads/main'
@@ -120,6 +142,8 @@ jobs:
             echo "chart=oci://ghcr.io/${GITHUB_REPOSITORY_OWNER,,}/charts/$CHART_NAME"
           } >> "$GITHUB_OUTPUT"
 
+      # Stops (publishing nothing) for a commit that a newer release already
+      # contains, and for a release tag in the way outside main.
       - name: Plan the release
         id: plan
         env:
@@ -140,6 +164,38 @@ jobs:
           echo "::error::the gate did not run: refusing to cut a new release"
           exit 1
 
+      # Computed once, for both platforms, the index and its tags (the same
+      # creation time everywhere). Tags: X.Y.Z always; X.Y, X (from 1.0.0 on)
+      # and latest only for the highest release (never when republishing an
+      # older tag); sha-<short> of the released commit, which is also the
+      # revision (with the default workflow context they would name the
+      # commit of this run).
+      - name: Image tags and OCI labels
+        id: meta
+        if: steps.plan.outputs.release == 'true'
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ steps.names.outputs.image }}
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}},value=${{ steps.plan.outputs.version }}
+            type=semver,pattern={{major}}.{{minor}},value=${{ steps.plan.outputs.version }},enable=${{ steps.plan.outputs.latest == 'true' }}
+            type=semver,pattern={{major}},value=${{ steps.plan.outputs.version }},enable=${{ steps.plan.outputs.latest == 'true' && steps.plan.outputs.stable == 'true' }}
+            type=raw,value=latest,enable=${{ steps.plan.outputs.latest == 'true' }}
+            type=raw,value=sha-${{ steps.plan.outputs.short_sha }}
+          # The repository has no description or license on GitHub: without
+          # these the generated values would blank the Dockerfile labels.
+          labels: |
+            org.opencontainers.image.revision=${{ steps.plan.outputs.sha }}
+            org.opencontainers.image.description=Telegram bot that re-posts the media behind social-network links (every site supported by yt-dlp), with an admin GUI
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.documentation=https://lucaam.github.io/social-media-reuploader/
+          annotations: |
+            org.opencontainers.image.revision=${{ steps.plan.outputs.sha }}
+            org.opencontainers.image.description=Telegram bot that re-posts the media behind social-network links (every site supported by yt-dlp), with an admin GUI
+            org.opencontainers.image.licenses=MIT
+            org.opencontainers.image.documentation=https://lucaam.github.io/social-media-reuploader/
+
       - name: Keep the release notes
         if: steps.plan.outputs.new == 'true'
         uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
@@ -152,34 +208,67 @@ jobs:
   # The jobs below test results explicitly: an implicit success() would also
   # skip them when the gate is skipped (republishing a tag).
   image:
-    name: Image
+    name: Image (${{ matrix.platform }})
     needs: version
     if: ${{ !cancelled() && needs.version.result == 'success' && needs.version.outputs.release == 'true' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 75
+    strategy:
+      matrix:
+        # Native runners (free for public repositories): no emulation, and
+        # each platform is smoke-tested on its own architecture.
+        include:
+          - platform: linux/amd64
+            arch: amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
     permissions:
-      contents: read # also: does the release tag exist yet?
-      packages: write # push to ghcr.io
-      id-token: write # keyless signature and attestation (Sigstore)
-      attestations: write # GitHub artifact attestation
+      contents: read # the release tags (guard)
+      packages: write # push the image by digest
     env:
       IMAGE: ${{ needs.version.outputs.image }}
       VERSION: ${{ needs.version.outputs.version }}
     outputs:
-      digest: ${{ steps.build.outputs.digest }}
+      # One output per platform: the outputs of the matrix jobs are merged.
+      digest-amd64: ${{ steps.digest.outputs.amd64 }}
+      digest-arm64: ${{ steps.digest.outputs.arm64 }}
     steps:
-      # "Re-run failed jobs" reuses the version of the first attempt: never
-      # publish over a release that another run has cut in the meantime.
-      - name: The release is still pending
-        if: needs.version.outputs.new == 'true'
+      # The same guard opens every job that pushes (tests/test_release_workflow.py
+      # keeps the copies equal). Fails closed: no tag list, no publishing.
+      - name: No release in the way
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ needs.version.outputs.tag }}
+          NEW: ${{ needs.version.outputs.new }}
+          LATEST: ${{ needs.version.outputs.latest }}
         run: |
-          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" > /dev/null 2>&1; then
-            echo "::error::$TAG is released already (by a newer run): nothing to publish"
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::no release tag in the plan ('$TAG')"
             exit 1
           fi
+          if ! refs="$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" --jq '.[].ref')"; then
+            echo "::error::cannot read the tags of $GITHUB_REPOSITORY: refusing to publish"
+            exit 1
+          fi
+          releases="$(sed -En 's#^refs/tags/(v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$#\1#p' <<< "$refs")"
+          highest="$(printf '%s\n' "$TAG" "$releases" | sed '/^$/d' | sort -V | tail -n 1)"
+          if [ "$NEW" = true ] && grep -qxF "$TAG" <<< "$releases"; then
+            echo "::error::$TAG exists already (released by another run): nothing to publish"
+            exit 1
+          fi
+          if [ "$NEW" != true ] && ! grep -qxF "$TAG" <<< "$releases"; then
+            echo "::error::$TAG is no longer a release tag: nothing to publish again"
+            exit 1
+          fi
+          # A new release must be the highest; a republished one only when it
+          # moves `latest`.
+          if [ "$highest" != "$TAG" ] && { [ "$NEW" = true ] || [ "$LATEST" = true ]; }; then
+            echo "::error::$highest is a higher release than $TAG (cut after this run was planned): nothing to publish"
+            exit 1
+          fi
+          echo "No release tag in the way of $TAG (highest release: $highest)"
 
       - name: Checkout the released commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -187,11 +276,13 @@ jobs:
           ref: ${{ needs.version.outputs.sha }}
           persist-credentials: false
 
-      - name: Set up QEMU (linux/arm64)
-        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
-
+      # A fresh BuildKit of a pinned version (its binary is not cached
+      # either).
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
+          cache-binary: false
 
       - name: Log in to GHCR
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
@@ -200,113 +291,43 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      # X.Y.Z always; X.Y, X (from 1.0.0 on) and latest only for the highest
-      # release (never when republishing an older tag); sha-<short> of the
-      # released commit, which is also the revision (with the default
-      # workflow context they would name the commit of this run).
-      - name: Image tags and OCI labels
-        id: meta
-        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
-        env:
-          # Annotations on the image index too (GHCR shows those).
-          DOCKER_METADATA_ANNOTATIONS_LEVELS: manifest,index
-        with:
-          images: ${{ env.IMAGE }}
-          flavor: latest=false
-          tags: |
-            type=semver,pattern={{version}},value=${{ env.VERSION }}
-            type=semver,pattern={{major}}.{{minor}},value=${{ env.VERSION }},enable=${{ needs.version.outputs.latest == 'true' }}
-            type=semver,pattern={{major}},value=${{ env.VERSION }},enable=${{ needs.version.outputs.latest == 'true' && needs.version.outputs.stable == 'true' }}
-            type=raw,value=latest,enable=${{ needs.version.outputs.latest == 'true' }}
-            type=raw,value=sha-${{ needs.version.outputs.short_sha }}
-          # The repository has no description or license on GitHub: without
-          # these the generated values would blank the Dockerfile labels.
-          labels: |
-            org.opencontainers.image.revision=${{ needs.version.outputs.sha }}
-            org.opencontainers.image.description=Telegram bot that re-posts the media behind social-network links (every site supported by yt-dlp), with an admin GUI
-            org.opencontainers.image.licenses=MIT
-            org.opencontainers.image.documentation=https://lucaam.github.io/social-media-reuploader/
-          annotations: |
-            org.opencontainers.image.revision=${{ needs.version.outputs.sha }}
-            org.opencontainers.image.description=Telegram bot that re-posts the media behind social-network links (every site supported by yt-dlp), with an admin GUI
-            org.opencontainers.image.licenses=MIT
-            org.opencontainers.image.documentation=https://lucaam.github.io/social-media-reuploader/
-
-      # Pushed by digest only: no tag points at the image before it passed
-      # the smoke test and is attested and signed.
-      - name: Build and push by digest (linux/amd64, linux/arm64)
+      # From scratch: no build cache in or out (a cache is writable by other
+      # runs). Pushed by digest only: no tag points at the image before it
+      # passed the smoke test and is signed.
+      - name: Build and push by digest (${{ matrix.platform }})
         id: build
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
-          platforms: linux/amd64,linux/arm64
+          platforms: ${{ matrix.platform }}
           tags: ${{ env.IMAGE }}
           outputs: type=image,push-by-digest=true,name-canonical=true,push=true
-          labels: ${{ steps.meta.outputs.labels }}
-          annotations: ${{ steps.meta.outputs.annotations }}
+          labels: ${{ needs.version.outputs.image-labels }}
+          annotations: ${{ needs.version.outputs.image-annotations }}
           build-args: VERSION=${{ env.VERSION }}
           provenance: mode=max
-          sbom: true
-          cache-from: |
-            type=gha,scope=release
-            type=gha,scope=ci
-          cache-to: type=gha,mode=max,scope=release
+          attests: type=sbom,generator=${{ env.SBOM_GENERATOR }}
+          no-cache: true
 
-      - name: Smoke test the pushed image (both platforms)
+      - name: Smoke test the pushed image
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
+          PLATFORM: ${{ matrix.platform }}
         run: |
-          for platform in linux/amd64 linux/arm64; do
-            docker pull --quiet --platform "$platform" "$IMAGE@$DIGEST"
-            scripts/smoke_test_image.sh "$IMAGE@$DIGEST" "$VERSION" "$platform"
-          done
+          docker pull --quiet --platform "$PLATFORM" "$IMAGE@$DIGEST"
+          scripts/smoke_test_image.sh "$IMAGE@$DIGEST" "$VERSION" "$PLATFORM"
 
-      - name: Attest the build provenance
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-name: ${{ env.IMAGE }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          push-to-registry: true
-
-      - name: Install cosign
-        uses: sigstore/cosign-installer@881c63bd87e38389154debd8331404ce7ca8a3ab # v4.1.4
-
-      - name: Sign the image (keyless)
+      - name: Digest of the platform
+        id: digest
         env:
+          ARCH: ${{ matrix.arch }}
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: cosign sign --yes "$IMAGE@$DIGEST"
+        run: echo "$ARCH=$DIGEST" >> "$GITHUB_OUTPUT"
 
-      # A single index source is copied as-is, so every tag names the very
-      # digest that was tested, attested and signed (checked below).
-      - name: Tag the image
-        env:
-          DIGEST: ${{ steps.build.outputs.digest }}
-          TAGS: ${{ steps.meta.outputs.tags }}
-        run: |
-          mapfile -t tags < <(printf '%s\n' "$TAGS" | sed '/^$/d')
-          args=()
-          for tag in "${tags[@]}"; do
-            args+=(--tag "$tag")
-          done
-          docker buildx imagetools create "${args[@]}" "$IMAGE@$DIGEST"
-          for tag in "${tags[@]}"; do
-            tagged="$(docker buildx imagetools inspect "$tag" --format '{{ .Manifest.Digest }}')"
-            if [ "$tagged" != "$DIGEST" ]; then
-              echo "::error::$tag is $tagged, not the signed $DIGEST"
-              exit 1
-            fi
-          done
-          {
-            echo "### Image \`$IMAGE@$DIGEST\`"
-            echo
-            echo '```text'
-            printf '%s\n' "${tags[@]}"
-            echo '```'
-          } >> "$GITHUB_STEP_SUMMARY"
-
-  # After the image: a published chart always has its image.
-  chart:
-    name: Chart
+  # Both platforms in one index, attested and signed: the digest the tags
+  # will name, still untagged.
+  index:
+    name: Image index
     needs: [version, image]
     if: >-
       ${{ !cancelled() && needs.version.result == 'success' &&
@@ -314,28 +335,128 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
-      contents: read # also: does the release tag exist yet?
-      packages: write # push to oci://ghcr.io/<owner>/charts
+      contents: read # the release tags (guard)
+      packages: write # push the index, its signature and attestation by digest
       id-token: write # keyless signature and attestation (Sigstore)
+      attestations: write # GitHub artifact attestation
+    env:
+      IMAGE: ${{ needs.version.outputs.image }}
+    outputs:
+      digest: ${{ steps.index.outputs.digest }}
+    steps:
+      # The same guard opens every job that pushes (tests/test_release_workflow.py
+      # keeps the copies equal). Fails closed: no tag list, no publishing.
+      - name: No release in the way
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          NEW: ${{ needs.version.outputs.new }}
+          LATEST: ${{ needs.version.outputs.latest }}
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::no release tag in the plan ('$TAG')"
+            exit 1
+          fi
+          if ! refs="$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" --jq '.[].ref')"; then
+            echo "::error::cannot read the tags of $GITHUB_REPOSITORY: refusing to publish"
+            exit 1
+          fi
+          releases="$(sed -En 's#^refs/tags/(v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$#\1#p' <<< "$refs")"
+          highest="$(printf '%s\n' "$TAG" "$releases" | sed '/^$/d' | sort -V | tail -n 1)"
+          if [ "$NEW" = true ] && grep -qxF "$TAG" <<< "$releases"; then
+            echo "::error::$TAG exists already (released by another run): nothing to publish"
+            exit 1
+          fi
+          if [ "$NEW" != true ] && ! grep -qxF "$TAG" <<< "$releases"; then
+            echo "::error::$TAG is no longer a release tag: nothing to publish again"
+            exit 1
+          fi
+          # A new release must be the highest; a republished one only when it
+          # moves `latest`.
+          if [ "$highest" != "$TAG" ] && { [ "$NEW" = true ] || [ "$LATEST" = true ]; }; then
+            echo "::error::$highest is a higher release than $TAG (cut after this run was planned): nothing to publish"
+            exit 1
+          fi
+          echo "No release tag in the way of $TAG (highest release: $highest)"
+
+      - name: Log in to GHCR
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # `imagetools create --dry-run` prints the exact index it would push,
+      # plus a newline: pushing it to IMAGE@<that digest> stores it with no
+      # tag. The platforms and the stored digest are checked.
+      - name: Push the index by digest
+        id: index
+        env:
+          AMD64: ${{ needs.image.outputs.digest-amd64 }}
+          ARM64: ${{ needs.image.outputs.digest-arm64 }}
+          ANNOTATIONS: ${{ needs.version.outputs.image-annotations }}
+        run: |
+          sources=()
+          for digest in "$AMD64" "$ARM64"; do
+            if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+              echo "::error::a platform digest is missing ('$digest'): re-run all jobs"
+              exit 1
+            fi
+            sources+=("$IMAGE@$digest")
+          done
+          # The OCI annotations on the index too (GHCR shows those).
+          annotations=()
+          while IFS= read -r annotation; do
+            if [ -n "$annotation" ]; then
+              annotations+=(--annotation "index:${annotation#manifest:}")
+            fi
+          done <<< "$ANNOTATIONS"
+          index="$RUNNER_TEMP/index.json"
+          docker buildx imagetools create --dry-run "${annotations[@]}" "${sources[@]}" > "$index"
+          digest="sha256:$(head -c -1 "$index" | sha256sum | cut -d ' ' -f 1)"
+          platforms="$(jq -r '[.manifests[] | select(.platform.os != "unknown") | "\(.platform.os)/\(.platform.architecture)"] | sort | join(" ")' "$index")"
+          if [ "$platforms" != "linux/amd64 linux/arm64" ]; then
+            echo "::error::the index has the platforms '$platforms'"
+            exit 1
+          fi
+          docker buildx imagetools create "${annotations[@]}" --tag "$IMAGE@$digest" "${sources[@]}"
+          stored="$(docker buildx imagetools inspect "$IMAGE@$digest" --format '{{ .Manifest.Digest }}')"
+          if [ "$stored" != "$digest" ]; then
+            echo "::error::$IMAGE@$digest resolves to $stored"
+            exit 1
+          fi
+          echo "digest=$digest" >> "$GITHUB_OUTPUT"
+
+      - name: Attest the build provenance
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.index.outputs.digest }}
+          push-to-registry: true
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@881c63bd87e38389154debd8331404ce7ca8a3ab # v4.1.4
+
+      - name: Sign the image (keyless)
+        env:
+          DIGEST: ${{ steps.index.outputs.digest }}
+        run: cosign sign --yes "$IMAGE@$DIGEST"
+
+  # Packaged while the image builds; publish pushes it.
+  chart:
+    name: Chart
+    needs: version
+    if: ${{ !cancelled() && needs.version.result == 'success' && needs.version.outputs.release == 'true' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write # keyless attestation of the archive (Sigstore)
       attestations: write # GitHub artifact attestation
     env:
       VERSION: ${{ needs.version.outputs.version }}
       IMAGE: ${{ needs.version.outputs.image }}
-      CHART_REPO: ${{ needs.version.outputs.chart-repo }}
-    outputs:
-      digest: ${{ steps.push.outputs.digest }}
     steps:
-      - name: The release is still pending
-        if: needs.version.outputs.new == 'true'
-        env:
-          GH_TOKEN: ${{ github.token }}
-          TAG: ${{ needs.version.outputs.tag }}
-        run: |
-          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" > /dev/null 2>&1; then
-            echo "::error::$TAG is released already (by a newer run): nothing to publish"
-            exit 1
-          fi
-
       - name: Checkout the released commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -358,8 +479,92 @@ jobs:
           grep "image: \"$IMAGE:$VERSION\"" "$RUNNER_TEMP/rendered.yaml"
           echo "tgz=$tgz" >> "$GITHUB_OUTPUT"
 
-      # Docker credentials for cosign and the attestation push; helm keeps
-      # its own.
+      - name: Attest the provenance of the chart archive (release asset)
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
+        with:
+          subject-path: ${{ steps.package.outputs.tgz }}
+
+      - name: Keep the chart archive for publish
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: chart
+          path: ${{ steps.package.outputs.tgz }}
+          if-no-files-found: error
+          retention-days: 7
+
+  # The only job that makes anything public, after every other one passed,
+  # in this order: image tags, chart (a published chart always has its
+  # image), tag and release. Every step can run again ("Re-run failed jobs").
+  publish:
+    name: Publish
+    needs: [version, index, chart]
+    if: >-
+      ${{ !cancelled() && needs.version.result == 'success' &&
+      needs.version.outputs.release == 'true' &&
+      needs.index.result == 'success' && needs.chart.result == 'success' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: write # the release tags (guard); create the tag and the release
+      packages: write # tag the image; push, sign and attest the OCI chart
+      id-token: write # keyless signature and attestation of the chart (Sigstore)
+      attestations: write # GitHub artifact attestation
+    env:
+      IMAGE: ${{ needs.version.outputs.image }}
+      IMAGE_DIGEST: ${{ needs.index.outputs.digest }}
+      VERSION: ${{ needs.version.outputs.version }}
+      CHART_REPO: ${{ needs.version.outputs.chart-repo }}
+    steps:
+      # The same guard opens every job that pushes (tests/test_release_workflow.py
+      # keeps the copies equal). Fails closed: no tag list, no publishing.
+      - name: No release in the way
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          NEW: ${{ needs.version.outputs.new }}
+          LATEST: ${{ needs.version.outputs.latest }}
+        run: |
+          if [[ ! "$TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::no release tag in the plan ('$TAG')"
+            exit 1
+          fi
+          if ! refs="$(gh api --paginate "repos/$GITHUB_REPOSITORY/git/matching-refs/tags/v" --jq '.[].ref')"; then
+            echo "::error::cannot read the tags of $GITHUB_REPOSITORY: refusing to publish"
+            exit 1
+          fi
+          releases="$(sed -En 's#^refs/tags/(v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*))$#\1#p' <<< "$refs")"
+          highest="$(printf '%s\n' "$TAG" "$releases" | sed '/^$/d' | sort -V | tail -n 1)"
+          if [ "$NEW" = true ] && grep -qxF "$TAG" <<< "$releases"; then
+            echo "::error::$TAG exists already (released by another run): nothing to publish"
+            exit 1
+          fi
+          if [ "$NEW" != true ] && ! grep -qxF "$TAG" <<< "$releases"; then
+            echo "::error::$TAG is no longer a release tag: nothing to publish again"
+            exit 1
+          fi
+          # A new release must be the highest; a republished one only when it
+          # moves `latest`.
+          if [ "$highest" != "$TAG" ] && { [ "$NEW" = true ] || [ "$LATEST" = true ]; }; then
+            echo "::error::$highest is a higher release than $TAG (cut after this run was planned): nothing to publish"
+            exit 1
+          fi
+          echo "No release tag in the way of $TAG (highest release: $highest)"
+
+      - name: Download the chart archive
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: chart
+          path: ${{ runner.temp }}/chart
+
+      - name: Download the release notes
+        if: needs.version.outputs.new == 'true'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: release-notes
+          path: ${{ runner.temp }}/notes
+
+      # Docker credentials for the image tags, cosign and the attestation
+      # push; helm keeps its own.
       - name: Log in to GHCR
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
         with:
@@ -367,15 +572,51 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Push to GHCR (OCI)
+      # A single index source is copied as-is, so every tag names the very
+      # digest that was tested, attested and signed (checked below).
+      - name: Tag the image
+        env:
+          TAGS: ${{ needs.version.outputs.image-tags }}
+        run: |
+          mapfile -t tags < <(printf '%s\n' "$TAGS" | sed '/^$/d')
+          if [ "${#tags[@]}" -eq 0 ]; then
+            echo "::error::the plan has no image tags"
+            exit 1
+          fi
+          args=()
+          for tag in "${tags[@]}"; do
+            args+=(--tag "$tag")
+          done
+          docker buildx imagetools create "${args[@]}" "$IMAGE@$IMAGE_DIGEST"
+          for tag in "${tags[@]}"; do
+            tagged="$(docker buildx imagetools inspect "$tag" --format '{{ .Manifest.Digest }}')"
+            if [ "$tagged" != "$IMAGE_DIGEST" ]; then
+              echo "::error::$tag is $tagged, not the signed $IMAGE_DIGEST"
+              exit 1
+            fi
+          done
+          {
+            echo "### Image \`$IMAGE@$IMAGE_DIGEST\`"
+            echo
+            echo '```text'
+            printf '%s\n' "${tags[@]}"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Set up Helm
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      - name: Push the chart to GHCR (OCI)
         id: push
         env:
-          TGZ: ${{ steps.package.outputs.tgz }}
           ACTOR: ${{ github.actor }}
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           printf '%s' "$TOKEN" | helm registry login ghcr.io --username "$ACTOR" --password-stdin
-          helm push "$TGZ" "oci://$CHART_REPO" 2>&1 | tee "$RUNNER_TEMP/push.log"
+          helm push "$RUNNER_TEMP/chart/$CHART_NAME-$VERSION.tgz" "oci://$CHART_REPO" 2>&1 \
+            | tee "$RUNNER_TEMP/push.log"
           digest="$(sed -n 's/^Digest: //p' "$RUNNER_TEMP/push.log")"
           if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
             echo "::error::no digest in the helm push output"
@@ -390,11 +631,6 @@ jobs:
           subject-digest: ${{ steps.push.outputs.digest }}
           push-to-registry: true
 
-      - name: Attest the provenance of the chart archive (release asset)
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-path: ${{ steps.package.outputs.tgz }}
-
       - name: Install cosign
         uses: sigstore/cosign-installer@881c63bd87e38389154debd8331404ce7ca8a3ab # v4.1.4
 
@@ -403,49 +639,15 @@ jobs:
           DIGEST: ${{ steps.push.outputs.digest }}
         run: cosign sign --yes "$CHART_REPO/$CHART_NAME@$DIGEST"
 
-      - name: Keep the chart archive for the release
-        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
-        with:
-          name: chart
-          path: ${{ steps.package.outputs.tgz }}
-          if-no-files-found: error
-          retention-days: 7
-
-  release:
-    name: GitHub release
-    needs: [version, image, chart]
-    if: >-
-      ${{ !cancelled() && needs.version.outputs.new == 'true' &&
-      needs.image.result == 'success' && needs.chart.result == 'success' }}
-    runs-on: ubuntu-latest
-    timeout-minutes: 10
-    permissions:
-      contents: write # create the tag and the release
-    env:
-      TAG: ${{ needs.version.outputs.tag }}
-      SHA: ${{ needs.version.outputs.sha }}
-      VERSION: ${{ needs.version.outputs.version }}
-      LATEST: ${{ needs.version.outputs.latest }}
-      IMAGE: ${{ needs.version.outputs.image }}
-      IMAGE_DIGEST: ${{ needs.image.outputs.digest }}
-      CHART: ${{ needs.version.outputs.chart }}
-      CHART_DIGEST: ${{ needs.chart.outputs.digest }}
-    steps:
-      - name: Download the release notes
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: release-notes
-          path: ${{ runner.temp }}/notes
-
-      - name: Download the chart archive
-        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
-        with:
-          name: chart
-          path: ${{ runner.temp }}/chart
-
       - name: Create the tag and the release
+        if: needs.version.outputs.new == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
+          TAG: ${{ needs.version.outputs.tag }}
+          SHA: ${{ needs.version.outputs.sha }}
+          LATEST: ${{ needs.version.outputs.latest }}
+          CHART: ${{ needs.version.outputs.chart }}
+          CHART_DIGEST: ${{ steps.push.outputs.digest }}
         run: |
           notes="$RUNNER_TEMP/notes/release-notes.md"
           {
@@ -458,14 +660,11 @@ jobs:
             echo "Both are signed with cosign (keyless) and attested:" \
               "[how to verify them]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/blob/$SHA/docs/ghcr.md#verificare-firme-e-provenienza)."
           } >> "$notes"
-          # A tag is never moved: with an existing tag gh would ignore --target.
-          if gh api "repos/$GITHUB_REPOSITORY/git/ref/tags/$TAG" > /dev/null 2>&1; then
-            echo "::error::the tag $TAG exists already"
-            exit 1
-          fi
           # gh uploads the assets to a draft and then publishes it, which
           # creates the tag on $SHA (compatible with immutable releases).
-          gh release create "$TAG" "$RUNNER_TEMP/chart/"*.tgz \
+          # The guard made sure that the tag does not exist: gh would ignore
+          # --target for an existing one.
+          gh release create "$TAG" "$RUNNER_TEMP/chart/$CHART_NAME-$VERSION.tgz" \
             --repo "$GITHUB_REPOSITORY" --target "$SHA" --title "$TAG" \
             --notes-file "$notes" --latest="$LATEST"
           echo "### Released [$TAG]($GITHUB_SERVER_URL/$GITHUB_REPOSITORY/releases/tag/$TAG)" >> "$GITHUB_STEP_SUMMARY"
