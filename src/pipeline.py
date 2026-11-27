@@ -65,6 +65,9 @@ logger = logging.getLogger(__name__)
 REACTION_WORKING = "👀"
 REACTION_DONE = "🏆"
 REACTION_FAILED = "🍌"
+# Interrupted during an upload whose outcome is unknown (the post may exist).
+REACTION_UNKNOWN = "🤷"
+UPLOAD_OUTCOME_UNKNOWN = "upload outcome unknown; not resent"
 
 # Work directories are created as <TMP_DIR>/smr-<request id>-<random>.
 WORKDIR_PREFIX = "smr-"
@@ -1223,6 +1226,12 @@ class RequestProcessor:
             async with asyncio.timeout(CANCEL_CLEANUP_SECONDS):
                 if self._delivered:
                     await self.feedback.finish(REACTION_DONE)
+                elif over and outcome == UPLOAD_OUTCOME_UNKNOWN:
+                    # Never resent (the post may exist), but never silent
+                    # either: 🤷, and in private chats how to get it anyway.
+                    reacted = await self.feedback.finish(REACTION_UNKNOWN)
+                    if request.is_private or not reacted:
+                        await self.feedback.say(messages.INTERRUPTED_WHILE_SENDING)
                 elif over:
                     await self.feedback.clear_reaction()  # no 👀 on a dead request
                 await self.feedback.clear_status()
@@ -1241,7 +1250,7 @@ class RequestProcessor:
                 error_code="interrupted_while_sending",
                 error_message="worker stopped during the upload; not resent",
             )
-            return "upload outcome unknown; not resent", True
+            return UPLOAD_OUTCOME_UNKNOWN, True
         if not self._sending and await db.aio(
             db.defer_request, request_id, db.now_iso(), reason="worker stopped"
         ):

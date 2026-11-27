@@ -400,23 +400,22 @@ async def login_submit(request: Request) -> Response:
             request, 400, "Accesso con token non configurato", as_json=as_json
         )
     key = gui_auth.client_key(request)
-    retry = state.limiter.retry_after(key)
-    if retry is not None:
-        seconds = max(1, int(retry + 0.999))
-        return _login_failure(
-            request,
-            429,
-            f"Troppi tentativi falliti: riprova tra {seconds} secondi",
-            as_json=as_json,
-            headers={"Retry-After": str(seconds)},
-        )
     token = await _read_login_token(request)
-    expected = state.settings.admin_token or ""
-    if not token or not gui_auth.tokens_match(token, expected):
-        state.limiter.record_failure(key)
-        logger.warning("Failed admin-token login from %s", key)
+    try:
+        gui_auth.check_admin_token(
+            token, state.settings, key, state.limiter, what="admin-token login"
+        )
+    except AuthError as exc:
+        if exc.status_code == 429:
+            seconds = max(1, int((exc.retry_after or 0) + 0.999))
+            return _login_failure(
+                request,
+                429,
+                f"Troppi tentativi falliti: riprova tra {seconds} secondi",
+                as_json=as_json,
+                headers={"Retry-After": str(seconds)},
+            )
         return _login_failure(request, 401, "Token non valido", as_json=as_json)
-    state.limiter.reset(key)
     session_id = await db.aio(
         gui_auth.start_token_session,
         request.session,
@@ -991,6 +990,11 @@ def runtime_config(request: Request) -> dict[str, Any]:
             "db_poll_seconds": state.tailer.poll_interval,
             "requeue_max_age_seconds": state.requeue_max_age,
             "history_keep_seconds": gui_queries.history_keep_seconds(limits),
+            # every request created this recently survives a clear (duplicate
+            # detection and edits of those messages need it)
+            "history_recent_seconds": float(
+                getattr(config, "DUPLICATE_WINDOW_SECONDS", 5400) or 0
+            ),
             "ws_clients": state.hub.client_count,
             "last_event_id": state.tailer.last_id,
         },

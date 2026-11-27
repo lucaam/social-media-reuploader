@@ -278,13 +278,31 @@ def test_failed_token_attempts_are_throttled():
             client.post("/login", json={"token": "bad"}, headers=SAME).status_code
             == 401
         )
-    blocked = client.post("/login", json={"token": TOKEN}, headers=SAME)
+    blocked = client.post("/login", json={"token": "bad"}, headers=SAME)
     assert blocked.status_code == 429
     assert int(blocked.headers["retry-after"]) >= 1
-    bearer = client.get("/api/requests", headers=BEARER)
-    assert bearer.status_code == 429
-    app.state.gui.limiter.reset("testclient")
+    wrong_bearer = client.get("/api/requests", headers={"Authorization": "Bearer x"})
+    assert wrong_bearer.status_code == 429
+    # A long ADMIN_TOKEN cannot be guessed: its owner is never locked out by
+    # other clients' failures (behind NAT/a Docker bridge they share an address)
+    assert client.get("/api/requests", headers=BEARER).status_code == 200
     assert client.post("/login", json={"token": TOKEN}, headers=SAME).status_code == 200
+    # ... and a success does not reset the counter of that shared address
+    assert client.post("/login", json={"token": "bad"}, headers=SAME).status_code == 429
+
+
+def test_a_short_token_stays_throttled_before_it_is_compared():
+    short = "short-token"  # below MIN_ADMIN_TOKEN_LENGTH: guessable
+    app = gui.create_app(settings(admin_token=short))
+    app.state.gui.limiter = gui_auth.FailureLimiter(max_failures=3, window_seconds=60)
+    client = TestClient(app)
+    for _ in range(3):
+        client.post("/login", json={"token": "bad"}, headers=SAME)
+    assert client.post("/login", json={"token": short}, headers=SAME).status_code == 429
+    auth = {"Authorization": f"Bearer {short}"}
+    assert client.get("/api/requests", headers=auth).status_code == 429
+    app.state.gui.limiter.reset("testclient")
+    assert client.post("/login", json={"token": short}, headers=SAME).status_code == 200
 
 
 def test_failure_limiter_window():
@@ -340,13 +358,17 @@ def test_rotating_spoofed_forwarded_addresses_are_throttled():
         for n in range(10)
     ]
     assert codes == [401] * 6 + [429] * 4
-    right = client.post("/login", json={"token": TOKEN}, headers=spoofed(50))
-    assert right.status_code == 429  # paused for everyone until the window moves
+    # wrong guesses are paused for everyone until the window moves ...
+    still = client.post("/login", json={"token": "wrong"}, headers=spoofed(50))
+    assert still.status_code == 429
     bearer = client.get(
         "/api/requests",
         headers={"Authorization": "Bearer nope", "X-Forwarded-For": "198.51.100.77"},
     )
     assert bearer.status_code == 429
+    # ... but the owner of the (long) token is not locked out
+    right = client.post("/login", json={"token": TOKEN}, headers=spoofed(51))
+    assert right.status_code == 200
 
 
 # ---------------------------------------------------------------------------

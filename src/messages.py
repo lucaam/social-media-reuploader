@@ -128,6 +128,12 @@ def duplicate(*, in_progress: bool = False) -> str:
     return "Questo link è già stato condiviso di recente."
 
 
+INTERRUPTED_WHILE_SENDING = (
+    "Il bot si è riavviato mentre inviava questo contenuto: se non lo vedi qui, "
+    "invia di nuovo il link."
+)
+
+
 def deferred(delay_seconds: float) -> str:
     """An accepted link that is processed later because of the rate limits."""
     return f"Link in coda: lo elaboro tra {duration(delay_seconds)}."

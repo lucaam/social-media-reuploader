@@ -526,19 +526,41 @@ def resolve_principal(
 def _bearer_principal(
     token: str, settings: AuthSettings, key: str, limiter: FailureLimiter | None
 ) -> Principal:
+    check_admin_token(token, settings, key, limiter, what="admin bearer token")
+    return Principal(method=AuthMethod.BEARER, is_admin=True, subject="admin-token")
+
+
+def check_admin_token(
+    token: str | None,
+    settings: AuthSettings,
+    key: str,
+    limiter: FailureLimiter | None,
+    *,
+    what: str = "admin token",
+) -> None:
+    """Accept ``token`` or raise :class:`AuthError` (401 wrong, 429 throttled).
+
+    Failed attempts are throttled. A long ``ADMIN_TOKEN`` (at least
+    ``MIN_ADMIN_TOKEN_LENGTH`` characters) cannot be guessed, so its owner is
+    never locked out by other clients' failures (behind NAT or a Docker bridge
+    every client shares one address); a short one keeps "throttled before
+    compared", which is what slows down guessing it.
+    """
+    expected = settings.admin_token or ""
+    valid = bool(token) and tokens_match(token or "", expected)
+    if valid and len(expected) >= MIN_ADMIN_TOKEN_LENGTH:
+        return
     if limiter is not None:
         retry = limiter.retry_after(key)
         if retry is not None:
             raise AuthError(
                 429, "Troppi tentativi falliti: riprova più tardi", retry_after=retry
             )
-    expected = settings.admin_token or ""
-    if not token or not tokens_match(token, expected):
+    if not valid:
         if limiter is not None:
             limiter.record_failure(key)
-        logger.warning("Rejected an invalid admin bearer token from %s", key)
+        logger.warning("Rejected an invalid %s from %s", what, key)
         raise AuthError(401, "Token non valido")
-    return Principal(method=AuthMethod.BEARER, is_admin=True, subject="admin-token")
 
 
 def session_principal(

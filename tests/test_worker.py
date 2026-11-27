@@ -1214,8 +1214,8 @@ def test_cancelled_server_side_fetch_is_never_resent(env):
     assert db.get_request(request_id)["error_code"] == "interrupted_while_sending"
 
 
-def test_interrupted_upload_does_not_keep_the_eyes(env):
-    request_id = new_request()
+def _interrupt_during_the_upload(env, **request_fields):
+    request_id = new_request(**request_fields)
     row = claim(request_id)
 
     async def scenario():
@@ -1228,8 +1228,22 @@ def test_interrupted_upload_does_not_keep_the_eyes(env):
             await task
 
     run(scenario())
-    assert status(request_id) == "failed"  # never retried: 👀 would be a lie
-    assert env.tg.reactions() == ["👀", None]
+    return request_id
+
+
+def test_interrupted_upload_is_neither_resent_nor_silent(env):
+    request_id = _interrupt_during_the_upload(env)
+    row = db.get_request(request_id)
+    # never retried (the post may exist): 👀 would be a lie, silence too
+    assert (row["status"], row["error_code"]) == ("failed", "interrupted_while_sending")
+    assert env.tg.reactions() == ["👀", "🤷"]
+    assert env.tg.texts() == [messages.INTERRUPTED_WHILE_SENDING]
+    assert len(env.tg.uploads()) == 1
+
+
+def test_interrupted_upload_in_a_group_only_shrugs(env):
+    _interrupt_during_the_upload(env, chat_id=-100123, chat_type="supergroup")
+    assert env.tg.reactions() == ["👀", "🤷"]
     assert env.tg.texts() == []
 
 

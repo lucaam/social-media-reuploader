@@ -826,3 +826,47 @@ def test_allowed_updates_cover_every_registered_handler():
     dispatcher = create_dispatcher(FakePool())
     used = set(dispatcher.resolve_used_update_types())
     assert used == set(handlers.ALLOWED_UPDATES)
+
+
+# ---------------------------------------------------------------------------
+# Ordering: one chat's updates run in arrival order
+# ---------------------------------------------------------------------------
+def test_updates_of_a_chat_are_handled_in_arrival_order(monkeypatch):
+    real_check = providers.check_link_async
+    other_chat_done = []
+
+    async def slow_first(url, *, resolve=True):
+        if url == YT:  # the first message's link check is slow
+            await asyncio.sleep(0.2)
+        return await real_check(url, resolve=resolve)
+
+    monkeypatch.setattr(providers, "check_link_async", slow_first)
+    pool = FakePool()
+    second = "https://www.youtube.com/watch?v=aaaaaaaaaaa"
+    third = "https://www.youtube.com/watch?v=bbbbbbbbbbb"
+
+    async def go():
+        bot = Bot(TOKEN)
+        dispatcher = create_dispatcher(pool)
+        raws = [
+            text_update(YT, YT, update_id=1, message_id=101),
+            text_update(second, second, update_id=2, message_id=102),
+            text_update(third, third, update_id=3, message_id=103),
+        ]
+        other = text_update(VIMEO, VIMEO, update_id=4, message_id=5, chat_id=222)
+
+        async def handle(raw):
+            parsed = Update.model_validate(raw, context={"bot": bot})
+            await dispatcher.feed_update(bot, parsed)
+
+        async def handle_other():
+            await handle(other)
+            other_chat_done.append(len(pool.calls))
+
+        await asyncio.gather(*(handle(raw) for raw in raws), handle_other())
+
+    asyncio.run(go())
+    same_chat = [c["original_message_id"] for c in pool.calls if c["chat_id"] == 111]
+    assert same_chat == [101, 102, 103]
+    # another chat is not held up by the slow one
+    assert other_chat_done == [1] or other_chat_done[0] < 4

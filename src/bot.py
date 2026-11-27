@@ -151,6 +151,54 @@ class UpdateTracker(BaseMiddleware):
         return True
 
 
+class ChatOrder(BaseMiddleware):
+    """Outer update middleware: one chat's updates are handled in arrival order.
+
+    aiogram handles the updates of a batch concurrently and link checks run in
+    threads, so a later message of a chat could be queued first (and the
+    earlier one deferred by the rate limits). The per-chat lock is acquired
+    before any other await, and asyncio locks wake their waiters in FIFO
+    order, so updates of a chat run one at a time in the order they arrived;
+    different chats still run concurrently. Idle locks are dropped.
+    """
+
+    def __init__(self) -> None:
+        self._locks: dict[int, tuple[asyncio.Lock, int]] = {}
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        chat_id = _update_chat_id(event)
+        if chat_id is None:
+            return await handler(event, data)
+        lock, users = self._locks.get(chat_id) or (asyncio.Lock(), 0)
+        self._locks[chat_id] = (lock, users + 1)
+        try:
+            async with lock:
+                return await handler(event, data)
+        finally:
+            lock, users = self._locks[chat_id]
+            if users <= 1:
+                del self._locks[chat_id]
+            else:
+                self._locks[chat_id] = (lock, users - 1)
+
+    @property
+    def chats(self) -> int:
+        """Chats with an update running or waiting (for tests and debugging)."""
+        return len(self._locks)
+
+
+def _update_chat_id(update: TelegramObject) -> int | None:
+    inner = getattr(update, "event", None)
+    chat = getattr(inner, "chat", None)
+    chat_id = getattr(chat, "id", None)
+    return chat_id if isinstance(chat_id, int) else None
+
+
 def create_dispatcher(
     pool: handlers.SubmitPool, *, bot_info: dict[str, Any] | None = None
 ) -> Dispatcher:
@@ -162,6 +210,7 @@ def create_dispatcher(
     dispatcher = Dispatcher(disable_fsm=True, pool=pool, bot_info=bot_info)
     tracker = UpdateTracker()
     dispatcher.update.outer_middleware(tracker)
+    dispatcher.update.outer_middleware(ChatOrder())
     dispatcher[TRACKER_KEY] = tracker
     dispatcher.include_router(handlers.create_router())
     return dispatcher

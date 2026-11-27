@@ -1672,16 +1672,15 @@
 
   // What a history clear keeps besides the active requests (see /api/config).
   function keptByClear () {
-    const keep = systemConfig && systemConfig.gui ? systemConfig.gui.history_keep_seconds : null
-    const base = 'Restano le richieste in coda o in corso, gli utenti e i limiti delle chat'
-    if (keep === null || keep === undefined) {
-      return base + ', oltre alle richieste recenti che servono ai limiti di frequenza e al controllo dei duplicati.'
-    }
-    if (keep > 0) {
-      return base + ', oltre alle richieste completate o fallite più recenti di ' + fmtWindow(keep) +
-        ', che servono ai limiti di frequenza e al controllo dei duplicati.'
-    }
-    return base + '.'
+    const gui = systemConfig && systemConfig.gui ? systemConfig.gui : {}
+    const keep = gui.history_keep_seconds
+    const recent = gui.history_recent_seconds
+    const parts = ['le richieste in coda o in corso']
+    if (recent) parts.push('tutte quelle degli ultimi ' + fmtWindow(recent) + ' (servono a riconoscere i duplicati e le modifiche ai messaggi)')
+    if (keep) parts.push('le completate o fallite degli ultimi ' + fmtWindow(keep) + ' (servono ai limiti di frequenza)')
+    else if (keep === null || keep === undefined) parts.push('le richieste recenti che servono ai limiti di frequenza e ai duplicati')
+    parts.push('gli utenti e i limiti delle chat')
+    return 'Restano ' + parts.join(', ') + '.'
   }
 
   async function clearHistory () {
@@ -1692,7 +1691,9 @@
     try {
       const result = await api('api/history/clear', { method: 'POST', body: {} })
       const d = result.deleted || {}
-      toast('Storico eliminato: ' + fmtNumber(d.requests) + ' richieste, ' + fmtNumber(d.updates) + ' eventi.', 'success')
+      let text = 'Storico eliminato: ' + fmtNumber(d.requests) + ' richieste, ' + fmtNumber(d.updates) + ' eventi.'
+      if (d.requests_kept) text += ' ' + fmtNumber(d.requests_kept) + ' richieste conservate: servono ancora ai limiti e al controllo dei duplicati.'
+      toast(text, 'success')
     } catch (e) { return }
     resyncAll()
   }

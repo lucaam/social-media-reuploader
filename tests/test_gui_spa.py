@@ -719,7 +719,12 @@ def test_clearing_the_history_says_which_requests_are_kept(tmp_path, api):
     routes["POST api/history/clear"] = {
         "body": {
             "ok": True,
-            "deleted": {"requests": 2, "request_events": 4, "updates": 9},
+            "deleted": {
+                "requests": 2,
+                "request_events": 4,
+                "updates": 9,
+                "requests_kept": 5,
+            },
             "kept_seconds": 30 * 86400,
         }
     }
@@ -729,13 +734,17 @@ def test_clearing_the_history_says_which_requests_are_kept(tmp_path, api):
         h.el('clearHistoryBtn').click()
         await h.settle()
         const text = h.text('modalBody')
-        h.ok(text.includes('richieste completate o fallite più recenti di 30 giorni'), text)
+        h.ok(text.includes('tutte quelle degli ultimi 90 minuti'), text)
+        h.ok(text.includes('duplicati e le modifiche ai messaggi'), text)
+        h.ok(text.includes('le completate o fallite degli ultimi 30 giorni'), text)
         h.ok(text.includes('limiti di frequenza'), text)
         h.button('modalFooter', 'Elimina lo storico').click()
         await h.settle()
         const posts = h.calls.filter((call) => call.method === 'POST').map((call) => call.path)
         h.eq(posts, ['api/history/clear'], 'one clear request')
-        h.ok(h.text('toasts').includes('Storico eliminato: 2 richieste, 9 eventi.'), h.text('toasts'))
+        const toast = h.text('toasts')
+        h.ok(toast.includes('Storico eliminato: 2 richieste, 9 eventi.'), toast)
+        h.ok(toast.includes('5 richieste conservate'), toast)
         """,
         routes=routes,
         hash="#system",
