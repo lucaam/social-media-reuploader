@@ -5,7 +5,8 @@ name: CI
 #     `main` ruleset (rename a job only together with the ruleset);
 #   - on every push to main, called by release.yml as the release gate.
 # On pull requests the jobs of the areas a change does not touch are skipped
-# (a skipped job counts as passed); called from release.yml every job runs.
+# (a skipped job counts as passed); called from release.yml every job runs,
+# except the release dry run (pull requests only, not a required check).
 on:
   pull_request:
   workflow_call:
@@ -31,6 +32,14 @@ env:
   HELM_UNITTEST_VERSION: 1.2.1
   # renovate: datasource=github-releases depName=yannh/kubeconform
   KUBECONFORM_VERSION: v0.8.0
+  # The build tools of release.yml (keep the same pins, tests/test_release_workflow.py
+  # checks them): BuildKit and the SBOM generator it runs.
+  # renovate: datasource=docker
+  BUILDKIT_IMAGE: moby/buildkit:v0.35.1@sha256:baf6138eb8c37644800c7c913fba051e840ebb9ba13eaf92d92ef9a1712d0b4c
+  # renovate: datasource=docker
+  SBOM_GENERATOR: docker/buildkit-syft-scanner:1.12.1@sha256:873a7458c3c8ac8e32c7b796c10e1600b07b963d2aa000a72a2d97aaaa2d6315
+  # Version of the release dry run (never published).
+  DRY_RUN_VERSION: 0.0.1-dryrun
 
 jobs:
   changes:
@@ -45,6 +54,7 @@ jobs:
       helm: ${{ github.event_name != 'pull_request' || steps.filter.outputs.helm == 'true' }}
       workflows: ${{ github.event_name != 'pull_request' || steps.filter.outputs.workflows == 'true' }}
       docs: ${{ github.event_name != 'pull_request' || steps.filter.outputs.docs == 'true' }}
+      release: ${{ github.event_name != 'pull_request' || steps.filter.outputs.release == 'true' }}
     steps:
       # Pull requests: the changed files come from the API, no checkout.
       - name: Filter changes
@@ -73,6 +83,12 @@ jobs:
               - scripts/mkdocs_hooks.py
               - requirements-dev.txt
               - .github/workflows/ci.yml
+            release:
+              - .github/workflows/release.yml
+              - .github/workflows/ci.yml
+              - 'scripts/release/**'
+              - Dockerfile
+              - 'charts/**'
 
   # Required status check "build": the test suite.
   build:
@@ -304,7 +320,10 @@ jobs:
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: image=${{ env.BUILDKIT_IMAGE }}
 
+      # The only image build with a cache: the release builds from scratch.
       - name: Build (linux/amd64, no push)
         uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
@@ -314,11 +333,186 @@ jobs:
           provenance: false
           tags: ${{ env.IMAGE }}
           build-args: VERSION=${{ env.VERSION }}
-          cache-from: |
-            type=gha,scope=ci
-            type=gha,scope=release
+          cache-from: type=gha,scope=ci
           # Written on main only; pull requests read the cache of main.
           cache-to: ${{ github.event_name != 'pull_request' && 'type=gha,mode=max,scope=ci' || '' }}
 
       - name: Smoke test the image
         run: scripts/smoke_test_image.sh "$IMAGE" "$VERSION"
+
+  # The release rehearsed on pull requests (release.yml only runs on main):
+  # the plan, the image metadata, the chart as published and, below, both
+  # image builds, with the actions and inputs of release.yml. So a change of
+  # the release (a Renovate ci(deps) update included) and the arm64 image
+  # are tried before a release needs them. Nothing leaves the runner: the
+  # pushes go to a throwaway local registry. Not a required check.
+  release-dry-run:
+    name: Release dry run (plan, chart)
+    needs: changes
+    if: >-
+      github.event_name == 'pull_request' &&
+      (needs.changes.outputs.release == 'true' || needs.changes.outputs.docker == 'true')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+    services:
+      registry:
+        image: registry:3.1.2@sha256:82f6ff4a7f982960c8aa51617fea3aabc485df6e55cce80d22deb1de36f1bc3c
+        ports:
+          - 5000:5000
+    outputs:
+      labels: ${{ steps.meta.outputs.labels }}
+      annotations: ${{ steps.meta.outputs.annotations }}
+    steps:
+      - name: Checkout (every commit and tag)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      # On the merge of the pull request into main, so the tags of main are
+      # in its history. (The "commitlint" check tells what the squash merge
+      # releases: this plan counts every commit of the branch.)
+      - name: Plan the release (dry run)
+        id: plan
+        run: |
+          python scripts/release/version.py plan --summary-file "$GITHUB_STEP_SUMMARY"
+          echo "image=ghcr.io/${GITHUB_REPOSITORY,,}" >> "$GITHUB_OUTPUT"
+
+      # The tags of release.yml, for a stable release that moves `latest`.
+      - name: Image tags and OCI labels (as release.yml)
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: ${{ steps.plan.outputs.image }}
+          flavor: latest=false
+          tags: |
+            type=semver,pattern={{version}},value=1.2.3
+            type=semver,pattern={{major}}.{{minor}},value=1.2.3,enable=true
+            type=semver,pattern={{major}},value=1.2.3,enable=true
+            type=raw,value=latest,enable=true
+            type=raw,value=sha-0123456
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT
+          annotations: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.licenses=MIT
+
+      - name: Set up Helm
+        uses: azure/setup-helm@2f5e7bc67f1f9972ab16657bb795f36d8f04de0e # v5.1.0
+        with:
+          version: ${{ env.HELM_VERSION }}
+
+      # The steps of release.yml (jobs chart and publish), pushed to the
+      # local registry.
+      - name: Package and push the chart (local registry)
+        env:
+          CHART: charts/social-media-reuploader
+          IMAGE: ${{ steps.plan.outputs.image }}
+        run: |
+          helm package "$CHART" --version "$DRY_RUN_VERSION" --app-version "$DRY_RUN_VERSION" \
+            --destination "$RUNNER_TEMP/chart"
+          tgz="$RUNNER_TEMP/chart/social-media-reuploader-$DRY_RUN_VERSION.tgz"
+          helm template smr "$tgz" --set secret.name=smr-bot > "$RUNNER_TEMP/rendered.yaml"
+          grep "image: \"$IMAGE:$DRY_RUN_VERSION\"" "$RUNNER_TEMP/rendered.yaml"
+          helm push "$tgz" oci://localhost:5000/charts --plain-http 2>&1 | tee "$RUNNER_TEMP/push.log"
+          digest="$(sed -n 's/^Digest: //p' "$RUNNER_TEMP/push.log")"
+          if [[ ! "$digest" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+            echo "::error::no digest in the helm push output"
+            exit 1
+          fi
+          helm show chart oci://localhost:5000/charts/social-media-reuploader \
+            --version "$DRY_RUN_VERSION" --plain-http
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@881c63bd87e38389154debd8331404ce7ca8a3ab # v4.1.4
+
+      # Signing needs the OIDC token of a release: only the install is tried.
+      - name: cosign is installed
+        run: cosign version
+
+  release-dry-run-image:
+    name: Release dry run (image ${{ matrix.platform }})
+    needs: release-dry-run
+    strategy:
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-24.04
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 40
+    permissions:
+      contents: read
+    services:
+      registry:
+        image: registry:3.1.2@sha256:82f6ff4a7f982960c8aa51617fea3aabc485df6e55cce80d22deb1de36f1bc3c
+        ports:
+          - 5000:5000
+    env:
+      IMAGE: localhost:5000/social-media-reuploader
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Host network: BuildKit reaches the local registry on localhost.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+        with:
+          driver-opts: |
+            image=${{ env.BUILDKIT_IMAGE }}
+            network=host
+          cache-binary: false
+
+      - name: Log in to the local registry
+        uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
+        with:
+          registry: localhost:5000
+          username: dry-run
+          password: dry-run
+
+      # The inputs of release.yml (tests/test_release_workflow.py compares
+      # them), except where it pushes to.
+      - name: Build and push by digest (${{ matrix.platform }})
+        id: build
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          tags: ${{ env.IMAGE }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          labels: ${{ needs.release-dry-run.outputs.labels }}
+          annotations: ${{ needs.release-dry-run.outputs.annotations }}
+          build-args: VERSION=${{ env.DRY_RUN_VERSION }}
+          provenance: mode=max
+          attests: type=sbom,generator=${{ env.SBOM_GENERATOR }}
+          no-cache: true
+
+      - name: Smoke test the pushed image
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          docker pull --quiet --platform "$PLATFORM" "$IMAGE@$DIGEST"
+          scripts/smoke_test_image.sh "$IMAGE@$DIGEST" "$DRY_RUN_VERSION" "$PLATFORM"
+
+      - name: The image has its SBOM and provenance
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          for kind in SBOM Provenance; do
+            docker buildx imagetools inspect "$IMAGE@$DIGEST" --format "{{ json .$kind }}" \
+              > "$RUNNER_TEMP/$kind.json"
+          done
+          jq -e '.SPDX.spdxVersion' "$RUNNER_TEMP/SBOM.json"
+          jq -e '.SLSA.buildDefinition.buildType' "$RUNNER_TEMP/Provenance.json"

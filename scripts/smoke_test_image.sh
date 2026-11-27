@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
-# Smoke test of a built image, as CI runs it on every pull request and the
-# release workflow on each platform of the published image:
+# Smoke test of a built image, as CI runs it on pull requests and the release
+# workflow on each platform of the image, pushed by digest (every platform on
+# a runner of its own architecture):
 #
 #   scripts/smoke_test_image.sh IMAGE [VERSION] [PLATFORM]
 #
 # VERSION: the expected src.__version__ (the build's --build-arg VERSION).
 # PLATFORM: e.g. linux/arm64, to test one platform of a multi-platform image
-# (other architectures need QEMU, e.g. docker/setup-qemu-action).
+# (locally, another architecture than the host's needs QEMU).
 #
 # Checks: the runtime pieces of yt-dlp (deno, curl_cffi, yt-dlp-ejs), ffmpeg,
 # the unprivileged user, every entrypoint importing on a read-only root
