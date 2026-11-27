@@ -78,11 +78,12 @@ con **squash**: il commit che arriva su `main` è il **titolo della PR**, che
 il check `commitlint` controlla e che decide la release automatica:
 
 - `feat: ...` nuova funzionalità → release minor
-- `fix: ...`, `perf: ...`, `revert: ...`, `fix(deps): ...` → patch
+- `fix: ...`, `perf: ...`, `revert: ...`, `fix(deps): ...`, `build(deps): ...`
+  → patch
 - breaking change: `feat!: ...` (il `!` nel titolo della PR) oppure il footer
   `BREAKING CHANGE: ...` → major, minor finché la versione è `0.y.z`
-- `refactor:`, `docs:`, `test:`, `chore:`, `ci:`, `style:`, `build:` →
-  nessuna release (arrivano con la release successiva)
+- `refactor:`, `docs:`, `test:`, `chore:`, `ci:`, `style:`, `build:` (tranne
+  `build(deps)`) → nessuna release (arrivano con la release successiva)
 
 Il riepilogo del check `commitlint` dice che release produrrà la PR;
 `python scripts/release/version.py check-title "<titolo>"` fa lo stesso in
@@ -106,9 +107,9 @@ Riscrivi la storia solo sui tuoi branch di feature.
 
 | Workflow | Quando | Cosa |
 |---|---|---|
-| `ci.yml` | PR; su `main` richiamato da `release.yml` | test con ffmpeg (job `build`), pre-commit e `check_docs.py`, Helm lint + unittest + kubeconform, actionlint + zizmor, build della documentazione, build e smoke test dell'immagine (`scripts/smoke_test_image.sh`) |
+| `ci.yml` | PR; su `main` richiamato da `release.yml` | test con ffmpeg (job `build`), pre-commit e `check_docs.py`, Helm lint + unittest + kubeconform, actionlint + zizmor, build della documentazione, build e smoke test dell'immagine (`scripts/smoke_test_image.sh`); solo sulle PR che toccano immagine o release, la *Release dry run* (piano, chart e immagine `linux/amd64` e `linux/arm64` costruiti come nella release, su un registry locale; check non obbligatori) |
 | `pr-title.yml` | PR | titolo della PR (job `commitlint`) e release che produrrà |
-| `release.yml` | push su `main`, avvio manuale | stessi controlli di `ci.yml`, poi versione, immagine, chart, tag e release ([RELEASE.md](RELEASE.md)) |
+| `release.yml` | push su `main`, avvio manuale | stessi controlli di `ci.yml`, poi versione, immagine (amd64 e arm64 su runner nativi), indice firmato e chart; infine un solo job pubblica tag dell'immagine, chart, tag e release ([RELEASE.md](RELEASE.md)) |
 | `docs-deploy.yml` | push su `main` che tocca la documentazione | sito su GitHub Pages |
 
 Sulle PR i job che non riguardano i file modificati vengono saltati (e

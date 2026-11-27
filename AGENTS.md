@@ -57,7 +57,7 @@ scripts/smoke_test_image.sh your-registry/social-media-reuploader:dev 0.0.0-dev
   Regole e workflow in `RELEASE.md`; lo script è `scripts/release/version.py` (test in
   `tests/test_release_version.py`).
 - Le PR si uniscono con squash: il titolo della PR (Conventional Commits) diventa il commit su `main` e decide la
-  release (`feat` minor, `fix`/`perf` patch, `chore`/`docs`/`ci`/... nessuna).
+  release (`feat` minor, `fix`/`perf`/`revert`/`fix(deps)`/`build(deps)` patch, `chore`/`docs`/`ci`/... nessuna).
 
 ***
 File agent-specific (esempi): `agents/dev.instructions.md`, `agents/release.instructions.md` (vedi cartella `agents/`).

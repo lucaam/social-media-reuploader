@@ -13,11 +13,14 @@ Checklist:
 - Prima del merge: il titolo della PR (diventa il commit di squash su `main`) ha il tipo giusto; il riepilogo del
   check `commitlint` dice che release produrrà. Anteprima locale: `python scripts/release/version.py plan`
   (servono i tag: `git fetch --tags`) e `./scripts/prepare_release.sh` (test, pre-commit, commitlint, helm lint).
-- Dopo il merge: il run "Release" su `main` è verde (job Gate, Version, Image, Chart, GitHub release); se il job
-  Version dice "no release" il merge non conteneva commit rilasciabili.
-- Se Image o Chart falliscono non viene creato nessun tag: "Re-run failed jobs", oppure (con conferma dell'utente)
-  `gh workflow run release.yml --ref main -f tag=vX.Y.Z` per ripubblicare un tag esistente o `-f bump=patch` per
-  forzare una release.
+- Dopo il merge: il run "Release" su `main` è verde (job Gate, Version, Image per amd64 e arm64, Image index, Chart,
+  Publish); se il job Version dice "no release" il merge non conteneva commit rilasciabili.
+- Solo Publish rende pubblico qualcosa: se fallisce un job precedente restano solo digest senza tag e nessun tag Git.
+  "Re-run failed jobs", oppure (con conferma dell'utente) `gh workflow run release.yml --ref main -f tag=vX.Y.Z` per
+  ripubblicare un tag di `main` o `-f bump=patch` per forzare una release.
+- Un run più vecchio di una release già uscita si ferma da solo (piano o controllo dei tag): non c'è niente da
+  correggere. Non cancellare mai il tag di una release pubblicata; per i tag fuori da `main` vedi "Problemi frequenti"
+  in `RELEASE.md`.
 - Verifica degli artefatti: `docs/ghcr.md` (cosign verify, gh attestation verify).
 - Aggiorna `HISTORY.md` per le tappe importanti.
 

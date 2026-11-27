@@ -29,16 +29,21 @@ Automatico, a ogni push su `main` (workflow *Release*,
 
 1. **gate**: gli stessi controlli delle pull request (`ci.yml`).
 2. **version**: la versione successiva dai Conventional Commits dall'ultimo
-   tag (`feat` → minor; `fix`, `perf`, `revert`, `fix(deps)` → patch;
-   breaking → major, minor finché la versione è `0.y.z`; gli altri tipi non
-   rilasciano). Senza commit rilasciabili il workflow si ferma: non esistono
-   immagini `edge` o di sviluppo.
-3. **image**: build e push per digest, smoke test dell'immagine pubblicata
-   su entrambe le piattaforme, attestazione e firma; solo allora i tag, che
-   puntano al digest firmato.
-4. **chart** (dopo l'immagine): pacchetto con la versione della release,
-   push OCI, attestazioni e firma.
-5. **release**: tag `vX.Y.Z` e release GitHub con le note raggruppate per tipo.
+   tag (`feat` → minor; `fix`, `perf`, `revert`, `fix(deps)`, `build(deps)` →
+   patch; breaking → major, minor finché la versione è `0.y.z`; gli altri
+   tipi non rilasciano). Senza commit rilasciabili il workflow si ferma: non
+   esistono immagini `edge` o di sviluppo.
+3. **image**: una build per piattaforma sul suo runner nativo (amd64 e
+   arm64), senza cache, push solo per digest e smoke test dell'immagine
+   scaricata.
+4. **index**: l'indice delle due piattaforme, anch'esso senza tag, con
+   attestazione e firma.
+5. **chart** (in parallelo all'immagine): pacchetto con la versione della
+   release e attestazione del `.tgz`.
+6. **publish**, solo se tutto il resto è riuscito: i tag dell'immagine, che
+   puntano all'indice firmato, poi il chart OCI (attestato e firmato), infine
+   il tag `vX.Y.Z` e la release GitHub con le note raggruppate per tipo.
+   Prima di questo job nulla è pubblico, a parte digest senza tag.
 
 Nel repository le versioni restano segnaposto (`Chart.yaml` `0.0.0`, codice
 `0.0.0-dev`): il tag è l'unica fonte della versione, nessun commit di bump.
@@ -85,9 +90,9 @@ vedi `examples/flux/` e [Deploy](deploy.md#flux).
 
 | Workflow | Quando | Cosa |
 |---|---|---|
-| `ci.yml` | pull request; richiamato da `release.yml` | test, lint, chart, documentazione, build e smoke test dell'immagine |
+| `ci.yml` | pull request; richiamato da `release.yml` | test, lint, chart, documentazione, build e smoke test dell'immagine; sulle PR anche la prova della release (piano, chart, immagine amd64 e arm64) |
 | `pr-title.yml` | pull request | titolo della PR in formato Conventional Commits e release che produrrà |
-| `release.yml` | push su `main`; avvio manuale | versione, immagine, chart, tag e release |
+| `release.yml` | push su `main`; avvio manuale | versione, immagine, indice firmato, chart; poi un solo job pubblica tag dell'immagine, chart, tag e release |
 | `docs-deploy.yml` | push su `main` che tocca la documentazione | sito su GitHub Pages |
 
 Tutti i workflow usano solo `GITHUB_TOKEN`, con permessi minimi per job, e

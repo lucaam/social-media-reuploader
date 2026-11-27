@@ -23,8 +23,17 @@ Questo file traccia le tappe principali del progetto in modo che sia facile ripr
   (`scripts/smoke_test_image.sh`), titolo delle PR controllato da commitlint.
 - **Renovate**: `fix(deps)` per le dipendenze runtime e l'immagine base
   (fissata per digest), quindi una patch release al merge; `chore(deps)` /
-  `ci(deps)` per gli strumenti; yt-dlp unito in automatico; digest delle
-  azioni fissati; manager pre-commit attivo.
+  `ci(deps)` per gli strumenti; yt-dlp unito in automatico (anche il cambio
+  d'anno); digest delle azioni fissati; manager pre-commit attivo.
+- **Pubblicazione blindata** (dopo una revisione della pipeline): un solo
+  job finale (*Publish*) rende pubblici tag dell'immagine, chart, tag e
+  release; prima restano solo digest senza tag. Ogni job che carica rilegge i
+  tag e si ferma se esiste già una release uguale o più alta (un run vecchio
+  rilanciato non riporta indietro `latest`); il piano rifiuta i commit già
+  rilasciati e i tag fuori da `main`, anche per la ripubblicazione. Immagine
+  costruita da zero su runner nativi amd64 e arm64, con BuildKit e generatore
+  di SBOM fissati per digest; sulle PR una prova della release (piano, chart,
+  immagine per entrambe le architetture).
 
 ## 2026-11-26 — Refactor: tutti i provider di yt-dlp, coda nel database, deploy rivisto
 
