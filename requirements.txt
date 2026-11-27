@@ -7,7 +7,7 @@ httpx==0.28.1
 itsdangerous==2.2.0
 prometheus-client==0.26.0
 uvicorn==0.51.0
-websockets==16.1.1
+websockets==17.4
 # yt-dlp with the runtime pieces it needs to work well:
 # - default:   yt-dlp-ejs (YouTube JS challenge solver), brotli, mutagen,
 #              pycryptodomex, requests, certifi, websockets
