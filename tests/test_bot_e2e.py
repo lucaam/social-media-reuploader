@@ -61,12 +61,24 @@ class FakeBotAPI:
             params = dict(await request.post())
         self.calls.append((method, params))
         if method == "getMe":
+            # BotFullInfo (Bot API 10.5): aiogram's polling parses it strictly
             result = {
                 "id": 123456789,
                 "is_bot": True,
                 "first_name": "Test",
                 "username": "t_bot",
+                "can_join_groups": True,
                 "can_read_all_group_messages": True,
+                "supports_inline_queries": False,
+                "supports_guest_queries": False,
+                "supports_join_request_queries": False,
+                "needs_inline_query_location": False,
+                "can_connect_to_business": False,
+                "has_main_web_app": False,
+                "has_topics_enabled": False,
+                "allows_users_to_create_topics": False,
+                "has_topic_sidebar": False,
+                "can_manage_bots": False,
             }
         elif method == "getUpdates":
             if self.updates:

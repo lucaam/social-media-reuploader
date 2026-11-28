@@ -203,6 +203,7 @@ def member_update(chat_type="group", old="left", new="member", chat_id=-100):
                     "can_post_stories": False,
                     "can_edit_stories": False,
                     "can_delete_stories": False,
+                    "can_send_welcome_messages": False,  # Bot API 10.5
                 }
             )
         if status == "kicked":
