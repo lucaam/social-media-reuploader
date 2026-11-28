@@ -2,7 +2,7 @@
 # the matching hooks in .pre-commit-config.yaml (ruff, black, isort).
 ruff==0.17.6
 black==26.10.1
-isort==8.0.1
+isort==9.0.2
 pre-commit==4.7.0
 pytest==9.2.0
 # Documentation site (mkdocs build --strict) and scripts/check_docs.py
