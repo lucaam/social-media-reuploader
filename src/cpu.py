@@ -56,7 +56,9 @@ def cgroup_cpu_limit(
         parts = _v2_path(proc_cgroup)
         limits = []
         for depth in range(len(parts), -1, -1):
-            fields = (_read(os.path.join(root, *parts[:depth], "cpu.max")) or "").split()
+            fields = (
+                _read(os.path.join(root, *parts[:depth], "cpu.max")) or ""
+            ).split()
             limit = _quota(fields[0], fields[1]) if len(fields) == 2 else None
             if limit is not None:
                 limits.append(limit)
