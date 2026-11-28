@@ -19,3 +19,6 @@ node_modules/
 npm-debug.log
 package-lock.json
 /.vscode/
+# yt-dlp cookies: they give access to the account
+cookies.txt
+*.cookies.txt
