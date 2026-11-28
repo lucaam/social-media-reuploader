@@ -2,7 +2,8 @@
   "$schema": "https://docs.renovatebot.com/renovate-schema.json",
   "description": [
     "Every merge to main is released by .github/workflows/release.yml according to its Conventional Commit type:",
-    "fix(deps) for the runtime dependencies of the image (requirements.txt, the Dockerfile base image) releases a patch;",
+    "fix(deps) for the runtime dependencies of the image (requirements.txt, the Dockerfile base image) releases a patch:",
+    "their minor/patch/digest updates come as one weekly pull request (one release a week at most), majors one by one, yt-dlp as soon as it is out;",
     "chore(deps) / ci(deps) for the tooling release nothing."
   ],
   "extends": [
@@ -52,7 +53,7 @@
       "semanticCommitType": "ci"
     },
     {
-      "description": "Runtime dependencies except yt-dlp: one weekly pull request for the minor and patch updates",
+      "description": "Runtime dependencies except yt-dlp: the minor and patch updates of requirements.txt join the weekly runtime pull request, so they ship in one release",
       "matchFileNames": ["requirements.txt"],
       "matchPackageNames": ["!yt-dlp"],
       "matchUpdateTypes": ["minor", "patch"],
@@ -60,10 +61,10 @@
       "schedule": ["* 0-5 * * 1"]
     },
     {
-      "description": "Base image digest (Debian and Python security fixes): weekly",
+      "description": "Base image digest (Debian and Python security fixes): same weekly runtime pull request and release as requirements.txt",
       "matchManagers": ["dockerfile"],
       "matchUpdateTypes": ["digest"],
-      "groupName": "base image",
+      "groupName": "runtime dependencies",
       "schedule": ["* 0-5 * * 1"]
     },
     {
