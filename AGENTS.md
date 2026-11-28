@@ -58,6 +58,7 @@ scripts/smoke_test_image.sh your-registry/social-media-reuploader:dev 0.0.0-dev
   `tests/test_release_version.py`).
 - Le PR si uniscono con squash: il titolo della PR (Conventional Commits) diventa il commit su `main` e decide la
   release (`feat` minor, `fix`/`perf`/`revert`/`fix(deps)`/`build(deps)` patch, `chore`/`docs`/`ci`/... nessuna).
+  Per più PR in una sola release: `[skip ci]` nel corpo del commit di squash di tutte tranne l'ultima (`RELEASE.md`).
 
 ***
 File agent-specific (esempi): `agents/dev.instructions.md`, `agents/release.instructions.md` (vedi cartella `agents/`).

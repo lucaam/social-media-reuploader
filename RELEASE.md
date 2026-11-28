@@ -143,9 +143,14 @@ quando non ci sono release in corso.
 
 ## Dipendenze (Renovate)
 
-- `requirements.txt` e immagine base del `Dockerfile` (fissata per digest,
-  aggiornata ogni settimana): PR `fix(deps): ...`, il merge rilascia una
-  patch con la nuova immagine.
+- `requirements.txt` (aggiornamenti minor e patch) e immagine base del
+  `Dockerfile` (fissata per digest): una sola PR a settimana, il lunedì fra
+  le 0 e le 5, `fix(deps): update runtime dependencies`. Il merge rilascia una
+  patch con la nuova immagine, quindi per le dipendenze esce al massimo una
+  release a settimana.
+- Aggiornamenti major (una libreria a una nuova major, Python a una nuova
+  versione): una PR per ciascuno, da provare a parte. Il merge rilascia una
+  patch, oppure la release esce insieme ad altre PR (vedi sotto).
 - yt-dlp: unione automatica (squash) dopo 6 ore dalla sua pubblicazione e
   con i check verdi, quindi una patch release senza intervento. Vale anche
   per la prima versione di ogni anno: le versioni di yt-dlp sono date
@@ -158,6 +163,23 @@ quando non ci sono release in corso.
   run* di `ci.yml`; solo una release esercita `actions/attest`, la firma
   cosign e il passaggio di artefatti fra i job (`upload-artifact` /
   `download-artifact`).
+
+### Più merge in una sola release
+
+Ogni merge rilasciabile su `main` fa partire una release. Per far uscire più
+PR in una sola versione, aggiungi `[skip ci]` alla descrizione del commit di
+squash (il campo sotto il titolo) di tutte le PR tranne l'ultima. GitHub non
+avvia workflow per quei push, e la release dell'ultimo merge contiene tutti i
+commit dall'ultimo tag. Quei commit non passano il gate su `main`: lo passa il
+run della release, sullo stato finale.
+
+```bash
+gh pr merge <numero> --squash --body "[skip ci]"   # tutte tranne l'ultima
+gh pr merge <numero> --squash                      # l'ultima: parte la release
+```
+
+Se hai messo `[skip ci]` anche nell'ultimo merge, avvia la release a mano:
+`gh workflow run release.yml --ref main -f bump=auto`.
 
 ## Impostazioni una tantum su GitHub
 
