@@ -1723,7 +1723,9 @@ def test_duplicate_of_a_waiting_link_and_notice_throttling(env):
     assert second.status == third.status == SubmitStatus.DUPLICATE
     [(_, _, args, kwargs)] = env.tg.of("send_message")  # throttled: one notice
     assert args[0] == messages.duplicate(in_progress=True)
-    assert kwargs["reply_to_message_id"] == 8
+    # both notices race for the throttle (db.should_notify runs in a worker
+    # thread): the one notice may answer either duplicate
+    assert kwargs["reply_to_message_id"] in (8, 9)
 
 
 def test_duplicates_in_groups_are_silent(env):

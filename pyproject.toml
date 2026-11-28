@@ -3,10 +3,11 @@
 
 [tool.black]
 line-length = 88
-# The runtime is Python 3.14 (Dockerfile, CI). py313 is listed as well so black
-# keeps the parenthesized `except (A, B):` form instead of rewriting it into
-# the 3.14-only unparenthesized syntax (PEP 758).
-target-version = ["py313", "py314"]
+# The runtime is Python 3.15 (Dockerfile, CI); the code also runs on 3.14.
+# py313 is listed as well so black keeps the parenthesized `except (A, B):`
+# form instead of rewriting it into the unparenthesized syntax of 3.14+
+# (PEP 758).
+target-version = ["py313", "py314", "py315"]
 
 [tool.isort]
 # Same layout as black (and as ruff's own import sorting).

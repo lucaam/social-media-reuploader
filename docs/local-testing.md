@@ -2,7 +2,7 @@
 
 ## Requisiti
 
-- Python 3.14
+- Python 3.15 (va anche la 3.14)
 - ffmpeg e ffprobe nel `PATH` (`apt install ffmpeg`, `brew install ffmpeg`):
   servono per convertire i media e per i test dei media (senza, quei test
   vengono saltati)

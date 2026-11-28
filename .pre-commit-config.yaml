@@ -4,7 +4,7 @@
 # (actionlint)" runs.
 # Every hook is pinned (Renovate keeps the revs up to date). Keep the ruff /
 # black / isort revs equal to the pins in requirements-dev.txt.
-# No `language_version` pins: hooks use the default `python3` (3.14 in CI).
+# No `language_version` pins: hooks use the default `python3` (3.15 in CI).
 minimum_pre_commit_version: "4.0.0"
 default_language_version:
   python: python3
