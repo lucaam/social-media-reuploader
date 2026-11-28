@@ -113,7 +113,7 @@ Il bot gira in polling; la GUI è su <http://127.0.0.1:8081> (login con
 
 ### Python (sviluppo)
 
-Servono Python 3.14 e ffmpeg (`deno`, `curl_cffi` e `yt-dlp-ejs` arrivano con
+Servono Python 3.15 (va anche la 3.14) e ffmpeg (`deno`, `curl_cffi` e `yt-dlp-ejs` arrivano con
 `requirements.txt`).
 
 ```bash

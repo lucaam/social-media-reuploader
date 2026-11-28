@@ -7,7 +7,7 @@ l'ambiente, le convenzioni e come funzionano CI e release.
 
 Requisiti:
 
-- **Python 3.14**
+- **Python 3.15** (va anche la 3.14, la versione minima)
 - **ffmpeg e ffprobe** nel `PATH` (`sudo apt install ffmpeg`,
   `brew install ffmpeg`): servono al bot e ai test dei media
 - **deno**: arriva con `requirements.txt` (`yt-dlp[default,curl-cffi,deno]`
@@ -45,7 +45,8 @@ helm unittest charts/social-media-reuploader
 
 ## Stile del codice
 
-- `ruff` (regole predefinite di ruff 0.16, `target-version = "py314"`),
+- `ruff` (le regole predefinite della versione fissata;
+  `target-version = "py314"`, la versione minima di Python),
   `black` e `isort` (profilo black), configurati in `.ruff.toml` e
   `pyproject.toml`. Le versioni sono fissate in `requirements-dev.txt` e negli
   hook di `.pre-commit-config.yaml`: aggiornale insieme.
