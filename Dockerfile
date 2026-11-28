@@ -10,7 +10,7 @@
 # release. No `# syntax=` line on purpose: the Dockerfile frontend built into
 # BuildKit (pinned in the workflows) is enough, and a syntax image would be
 # one more download that nothing pins.
-FROM python:3.14-slim@sha256:22eafb370920ad8b429e0aec3fff433e0669968519f5d60469d83729c138b28b
+FROM python:3.14-slim@sha256:f57c4c23b985d95deea5bc5249e2f9c8a512b4cc9d5d3fd31900cbd2f5f0a604
 
 LABEL org.opencontainers.image.title="social-media-reuploader" \
       org.opencontainers.image.description="Telegram bot that re-posts the media behind social-network links (every site supported by yt-dlp: YouTube, TikTok, Instagram, Facebook, X, Reddit, Vimeo, Twitch and many more) back into the chat, with an admin GUI" \
