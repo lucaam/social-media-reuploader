@@ -74,7 +74,7 @@ env:
   # renovate: datasource=docker
   BUILDKIT_IMAGE: moby/buildkit:v0.35.1@sha256:baf6138eb8c37644800c7c913fba051e840ebb9ba13eaf92d92ef9a1712d0b4c
   # renovate: datasource=docker
-  SBOM_GENERATOR: docker/buildkit-syft-scanner:1.12.1@sha256:873a7458c3c8ac8e32c7b796c10e1600b07b963d2aa000a72a2d97aaaa2d6315
+  SBOM_GENERATOR: docker/buildkit-syft-scanner:1.13.0@sha256:a190379321cf51fba8c284a1834555b55e7bf58d577d574db23370461defc430
   CHART_PATH: charts/social-media-reuploader
   CHART_NAME: social-media-reuploader
 
