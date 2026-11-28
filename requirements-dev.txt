@@ -1,7 +1,7 @@
 # Development and CI tools. Keep the linter pins in sync with the `rev:` of
 # the matching hooks in .pre-commit-config.yaml (ruff, black, isort).
-ruff==0.16.0
-black==26.5.1
+ruff==0.17.6
+black==26.10.1
 isort==8.0.1
 pre-commit==4.7.0
 pytest==9.2.0
