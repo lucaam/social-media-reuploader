@@ -279,6 +279,48 @@ Il file viene montato in sola lettura in
 lì; yt-dlp lavora su una copia per ogni richiesta. Per montaggi diversi ci sono
 `extraVolumes` / `extraVolumeMounts`.
 
+#### Ottenere il `cookies.txt` (es. TikTok)
+
+yt-dlp non fa il login con utente e password: usa i cookie di una sessione già
+aperta in un browser. Esempio con TikTok:
+
+1.  Crea un profilo del browser dedicato al bot e accedi a tiktok.com con un
+    **account secondario**. Chi ha il file controlla l'account, e TikTok può
+    limitare gli account usati da script. Nello stesso profilo accedi anche agli
+    altri siti che servono (Instagram, ...): il file è uno solo per tutti.
+2.  Esporta i cookie in formato Netscape con un'estensione che lavora in locale,
+    «Get cookies.txt LOCALLY» (Chrome/Firefox) o «cookies.txt» (Firefox), dalla
+    pagina di tiktok.com. In alternativa usa yt-dlp sul PC: esporta tutti i
+    cookie del profilo, quindi usa il profilo dedicato. Su Windows yt-dlp non
+    riesce a leggere i cookie di Chrome: usa Firefox.
+
+    ```bash
+    yt-dlp --cookies-from-browser "firefox:<profilo>" --cookies cookies.txt \
+      --skip-download "https://www.tiktok.com/@<utente>/video/<id>"
+    ```
+
+3.  Chiudi la finestra **senza fare logout**: il logout invalida la sessione e
+    quindi anche il file.
+4.  Prova il file con l'immagine del bot (yt-dlp riscrive il file per
+    aggiornare i cookie, quindi la cartella non è montata in sola lettura):
+
+    ```bash
+    docker run --rm --user "$(id -u)" -v "$PWD:/w" -w /w --entrypoint yt-dlp \
+      ghcr.io/lucaam/social-media-reuploader:<versione> --cookies cookies.txt \
+      --simulate "https://www.tiktok.com/@<utente>/video/<id>"
+    ```
+
+5.  Crea il Secret come sopra (con Docker Compose, il mount commentato in
+    `docker-compose.yml`). Quando la sessione scade, il bot risponde che il
+    contenuto richiede l'accesso e lo scrive nei log: esporta di nuovo il file.
+    Con Kubernetes basta aggiornare il Secret: il kubelet aggiorna il file
+    montato entro un paio di minuti e il bot lo rilegge a ogni richiesta. Con
+    Docker Compose esegui `docker compose restart bot`: il bind mount di un
+    singolo file sostituito mostra ancora quello vecchio.
+
+Il file dà accesso all'account: tienilo con permessi `600` e fuori dai commit
+(`cookies.txt` è in `.gitignore`).
+
 ### Persistenza e scheduling
 
 - Il PVC è `ReadWriteOnce`: lo usano due pod, quindi devono stare sullo stesso
@@ -305,6 +347,15 @@ lì; yt-dlp lavora su una copia per ogni richiesta. Per montaggi diversi ci sono
 
 `resources`, `terminationGracePeriodSeconds` e `tmpVolume.sizeLimit` scavalcano
 il profilo. La GUI usa `guiResources`.
+
+Le conversioni ffmpeg leggono il limite CPU del container (cgroup) e dividono
+quella quota fra le `TRANSCODE_CONCURRENCY` conversioni contemporanee
+(`TRANSCODE_THREADS=0`, il default). Con `small` e `medium` ogni conversione
+usa quindi un thread per decoder, filtri e x264, con `large` due. Senza questo
+calcolo ffmpeg conterebbe tutti i core del nodo: in un pod da una CPU
+partirebbero decine di thread che esauriscono la quota, rallentano anche il bot
+e occupano memoria. Per conversioni più rapide alza `limits.cpu`. Alza
+`TRANSCODE_CONCURRENCY` solo quando le CPU sono più di una.
 
 ### Metriche
 

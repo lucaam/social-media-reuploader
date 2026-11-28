@@ -343,6 +343,9 @@ if TRANSCODE_PRESET not in X264_PRESETS:
 TRANSCODE_TIMEOUT: int = env_int("TRANSCODE_TIMEOUT", 900, minimum=30)
 # Max concurrent ffmpeg transcodes (CPU heavy).
 TRANSCODE_CONCURRENCY: int = env_int("TRANSCODE_CONCURRENCY", 1, minimum=1, maximum=8)
+# Threads of each conversion; 0 = auto: the container's CPU budget (CPU limit
+# included) split across TRANSCODE_CONCURRENCY, at most 16.
+TRANSCODE_THREADS: int = env_int("TRANSCODE_THREADS", 0, minimum=0, maximum=64)
 # Longest side (pixels) used when a size-targeted re-encode needs downscaling.
 TRANSCODE_MAX_SIDE: int = env_int("TRANSCODE_MAX_SIDE", 1280, minimum=240)
 
@@ -490,6 +493,7 @@ def summary() -> dict:
         "simple_ytdlp_only": SIMPLE_YTDLP_ONLY,
         "keep_downloaded_files": KEEP_DOWNLOADED_FILES,
         "transcode_concurrency": TRANSCODE_CONCURRENCY,
+        "transcode_threads": TRANSCODE_THREADS or "auto",
         "worker_poll_seconds": WORKER_POLL_SECONDS,
         "sqlite_journal_mode": SQLITE_JOURNAL_MODE,
         "cookies_configured": bool(YTDLP_COOKIES_PATH or YTDLP_COOKIES_FROM_BROWSER),

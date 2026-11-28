@@ -14,8 +14,10 @@
 
 Every output is re-probed, so the returned metadata (dimensions, codecs,
 size) describes the file that will actually be sent. CPU-heavy encodes are
-limited by a module-wide semaphore (``TRANSCODE_CONCURRENCY``) and every
-ffmpeg run is killed with its process group on timeout or cancellation.
+limited by a module-wide semaphore (``TRANSCODE_CONCURRENCY``), each one
+sized to its share of the container's CPU budget (:func:`encode_threads`),
+and every ffmpeg run is killed with its process group on timeout or
+cancellation.
 ``TRANSCODE_TIMEOUT`` bounds the whole conversion; the time spent waiting
 for a semaphore slot is not counted.
 """
@@ -35,6 +37,7 @@ from dataclasses import dataclass, replace
 from enum import StrEnum
 from typing import Any
 
+from . import cpu
 from .downloader import (
     ConversionFailed,
     ConversionTimeout,
@@ -402,6 +405,8 @@ async def _render_thumbnail(
         "-v",
         "error",
         "-y",
+        "-threads",
+        str(encode_threads()),
         "-ss",
         f"{seek:.3f}",
         "-i",
@@ -723,18 +728,12 @@ def plan_audio_encode(
 # ---------------------------------------------------------------------------
 
 
-def _ffmpeg_head(ffmpeg: str, src: str) -> list[str]:
-    return [
-        ffmpeg,
-        "-nostdin",
-        "-hide_banner",
-        "-nostats",
-        "-v",
-        "error",
-        "-y",
-        "-i",
-        _ff_path(src),
-    ]
+def _ffmpeg_head(ffmpeg: str, src: str, *, threads: int | None = None) -> list[str]:
+    head = [ffmpeg, "-nostdin", "-hide_banner", "-nostats", "-v", "error", "-y"]
+    if threads:
+        # filter graph and decoder pools; the encoder gets its own -threads
+        head += ["-filter_threads", str(threads), "-threads", str(threads)]
+    return [*head, "-i", _ff_path(src)]
 
 
 def _ffmpeg_tail(dst: str, muxer: str) -> list[str]:
@@ -780,14 +779,23 @@ def audio_fix_argv(
 
 
 def video_encode_argv(
-    ffmpeg: str, src: str, dst: str, p: ProbeResult, plan: VideoPlan, *, preset: str
+    ffmpeg: str,
+    src: str,
+    dst: str,
+    p: ProbeResult,
+    plan: VideoPlan,
+    *,
+    preset: str,
+    threads: int | None = None,
 ) -> list[str]:
     """H.264 (high profile, yuv420p) + AAC MP4 following ``plan``.
 
     ffmpeg auto-rotates while decoding, so ``plan`` dimensions are display
     dimensions; ``setsar=1`` makes pixels square (no padding, ever).
+    ``threads`` caps the decoder, filter and x264 thread pools (``None``:
+    ffmpeg's default, sized from every core of the machine).
     """
-    argv = _ffmpeg_head(ffmpeg, src)
+    argv = _ffmpeg_head(ffmpeg, src, threads=threads)
     argv += _map(p.video_index, "0:v:0")
     has_audio = p.has_audio and (plan.copy_audio or plan.audio_kbps is not None)
     if has_audio:
@@ -800,6 +808,7 @@ def video_encode_argv(
         ",".join(filters),
         "-c:v",
         "libx264",
+        *(["-threads", str(threads)] if threads else []),
         "-preset",
         preset,
         "-profile:v",
@@ -869,6 +878,35 @@ def transcode_semaphore() -> asyncio.Semaphore:
         current = (limit, asyncio.Semaphore(limit))
         _SLOTS[loop] = current
     return current[1]
+
+
+# x264 gains little past 16 frame threads, and every thread holds frames.
+MAX_AUTO_THREADS = 16
+
+
+def _int_or(name: str, default: int) -> int:
+    try:
+        return int(setting(name, default))
+    except (TypeError, ValueError):
+        return default
+
+
+def encode_threads() -> int:
+    """Threads for one ffmpeg conversion (decoder, filters and x264).
+
+    ``TRANSCODE_THREADS`` when set; otherwise the CPU budget (affinity capped
+    by the container's CPU limit, :func:`src.cpu.cpu_budget`) split across
+    ``TRANSCODE_CONCURRENCY`` encodes, rounded down, between 1 and
+    :data:`MAX_AUTO_THREADS`. Left alone, ffmpeg sizes each pool from the
+    node's core count: in a container limited to a fraction of the node the
+    extra threads only add memory and burn the CPU quota on contention.
+    """
+    configured = _int_or("TRANSCODE_THREADS", 0)
+    if configured > 0:
+        return configured
+    concurrency = max(1, _int_or("TRANSCODE_CONCURRENCY", 1))
+    share = int(cpu.cpu_budget() // concurrency)
+    return max(1, min(MAX_AUTO_THREADS, share))
 
 
 def _last_lines(text: str, count: int = 3) -> str:
@@ -975,6 +1013,9 @@ class _Job:
     def preset(self) -> str:
         return str(setting("TRANSCODE_PRESET", "veryfast") or "veryfast")
 
+    def threads(self) -> int:
+        return encode_threads()
+
     @contextlib.asynccontextmanager
     async def encode_slot(self) -> AsyncIterator[None]:
         """Hold one ``TRANSCODE_CONCURRENCY`` slot for an encode.
@@ -1006,7 +1047,13 @@ class _Job:
             return cheap if self.fits(cheap) else await self.compress_video(dst)
         plan = plan_video_encode(p, self.max_bytes, size_targeted=False)
         argv = video_encode_argv(
-            self.ffmpeg, self.src, dst, p, plan, preset=self.preset()
+            self.ffmpeg,
+            self.src,
+            dst,
+            p,
+            plan,
+            preset=self.preset(),
+            threads=self.threads(),
         )
         async with self.encode_slot():
             prepared = await self.run(argv, dst, Action.TRANSCODE, "transcode")
@@ -1040,6 +1087,7 @@ class _Job:
                         self.probe,
                         plan,
                         preset=self.preset(),
+                        threads=self.threads(),
                     )
                     label = f"compress (attempt {attempt})"
                 else:
